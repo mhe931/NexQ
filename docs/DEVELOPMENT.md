@@ -136,9 +136,15 @@ staging hook; Tauri still requires and copies the staged resource files:
 Push-Location src-tauri
 cargo check --locked --offline --target x86_64-pc-windows-gnu
 Pop-Location
-npm run tauri -- build --debug --no-bundle --target x86_64-pc-windows-gnu `
-  --config src-tauri\tauri.conda.conf.json -- --locked --offline
+npx tauri build --debug --no-bundle --target x86_64-pc-windows-gnu `
+  --config src-tauri\tauri.conda.conf.json '--' --locked
 ```
+
+In PowerShell the bare `--` separator is swallowed, so quote it (`'--'`) as above;
+npm 12 otherwise rejects `--target`/`--config`. Set `CARGO_NET_OFFLINE=true` for an
+offline build. `. .\scripts\native-env.ps1` performs the whole toolchain activation
+above in one step (Node comes from the `nexq` environment, the GNU tools from
+`nexq-native`).
 
 This builds the native application with embedded frontend assets, not an
 installer or a browser preview. Omit `--debug` for an optimized release build,

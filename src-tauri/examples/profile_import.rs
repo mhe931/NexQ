@@ -5,8 +5,10 @@
 //! ```text
 //! cargo run --example profile_import -- --db-dir "%APPDATA%\com.nexq.app" \
 //!     --name "My meeting" --template academic_qa --profile-json my-meeting.local.json \
-//!     --file notes.docx --file paper.pdf --instruction style.md --presentation deck.pptx
+//!     --file notes.docx --file paper.pdf --instruction style.md --presentation deck.pptx \
+//!     --query "What is the main limitation?"
 //! ```
+//! `--query` times local retrieval over the imported index (a real, offline benchmark).
 //! `--profile-json` holds a partial profile (same camelCase fields the app saves)
 //! that is merged over the template. Re-running with the same `--name` updates
 //! that meeting instead of creating a duplicate.
@@ -34,6 +36,7 @@ fn main() -> Result<(), String> {
     let mut db_dir = None;
     let (mut name, mut template, mut json) = (None, "custom".to_string(), None);
     let (mut files, mut instructions, mut presentation) = (Vec::new(), Vec::new(), None);
+    let mut queries: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
@@ -45,6 +48,7 @@ fn main() -> Result<(), String> {
             "--file" => files.push(PathBuf::from(value()?)),
             "--instruction" => instructions.push(PathBuf::from(value()?)),
             "--presentation" => presentation = Some(PathBuf::from(value()?)),
+            "--query" => queries.push(value()?),
             other => return Err(format!("Unknown option {other}")),
         }
     }
@@ -102,6 +106,23 @@ fn main() -> Result<(), String> {
     );
     for f in &total.failed {
         println!("  FAILED {}: {}", f.path, f.reason);
+    }
+    // Local retrieval benchmark on the real index: no network, no provider.
+    for q in &queries {
+        let mut timings = Vec::new();
+        let mut hits = Vec::new();
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            hits = nexq_lib::profiles::retrieval::search(conn, &profile.id, q, 5)?;
+            timings.push(t.elapsed().as_micros());
+        }
+        timings.sort_unstable();
+        println!(
+            "Query \"{q}\": {} hit(s), median {:.2} ms over 20 runs; top: {}",
+            hits.len(),
+            timings[timings.len() / 2] as f64 / 1000.0,
+            hits.first().map(|h| h.citation()).unwrap_or_else(|| "(none)".into())
+        );
     }
     Ok(())
 }

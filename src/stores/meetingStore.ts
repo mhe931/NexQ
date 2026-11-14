@@ -269,11 +269,12 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         }
       } catch { /* non-critical */ }
 
-      // 2. Sync recording toggle to backend before capture starts
+      // 2. Sync recording toggle to backend before capture starts. A profile
+      // meeting never records audio automatically.
       const config = useConfigStore.getState();
       try {
         const { setRecordingEnabled } = await import("../lib/ipc");
-        await setRecordingEnabled(config.recordingEnabled);
+        await setRecordingEnabled(options.profileId ? false : config.recordingEnabled);
       } catch { /* non-critical */ }
 
       // 3. Start audio capture — use per-party config if available, else legacy.

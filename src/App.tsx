@@ -142,8 +142,15 @@ function App() {
   // the meeting first; with no meeting running, show the launcher instead.
   useEffect(() => {
     if (windowLabel !== "overlay") return;
-    const show = () => {
+    const show = async () => {
+      // The launcher asks for the overlay right after it starts a meeting, which
+      // can be before this window finished processing nexq:meeting_started.
+      // Give that a moment instead of falling back to the launcher.
+      for (let waited = 0; !useMeetingStore.getState().activeMeeting && waited < 800; waited += 50) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       const store = useMeetingStore.getState();
+      logToFile("info", "overlay", `Overlay requested; meeting ${store.activeMeeting ? "present" : "missing"}, view ${store.currentView}`);
       if (!store.activeMeeting) {
         showLauncherWindow().catch(() => {});
         return;
@@ -217,13 +224,12 @@ function App() {
       "nexq:meeting_started",
       async (e) => {
         const { meeting, audioMode, aiScenario, profileId = null, listening = true, sttOverride = null } = e.payload;
+        logToFile("info", "overlay", `Meeting started in overlay window (profile: ${profileId ?? "none"})`);
         const startedAt = Date.now();
         // A profile meeting shows the presenter view with its own slides/notes.
-        if (profileId) {
-          await usePresenterStore.getState().load(profileId);
-        } else {
-          usePresenterStore.getState().clear();
-        }
+        // Cleared now, loaded after the meeting is published below so the
+        // overlay can appear without waiting for the profile round trip.
+        usePresenterStore.getState().clear();
         // Reset ALL per-meeting stores in THIS (overlay) window first. Each Tauri
         // webview has its own Zustand instances, so the launcher clearing its
         // copies is not enough. Publishing the meeting before the reset would let
@@ -256,6 +262,7 @@ function App() {
           settingsOpen: false,
         });
         useMeetingStore.getState().startTimer();
+        if (profileId) void usePresenterStore.getState().load(profileId);
         // Then tell the launcher this window owns the meeting's speaker/bookmark data.
         emitOverlayMeetingReady(meeting.id).catch(() => {});
       }
