@@ -672,7 +672,9 @@ mod tests {
     fn a_moved_file_is_found_by_name_in_a_known_folder_only_when_unique() {
         let a = TempFile::new("Thesis.pptx");
         let b = TempFile::new("Thesis.pptx");
-        let ghost = Path::new("Z:\\gone\\Thesis.pptx");
+        let ghost_dir = a.0.parent().unwrap().join("nexq-no-such-folder");
+        let ghost = ghost_dir.join("Thesis.pptx");
+        let ghost = ghost.as_path();
         let dir_a = a.0.parent().unwrap().to_path_buf();
         let dir_b = b.0.parent().unwrap().to_path_buf();
         assert_eq!(resolve_source(ghost, &[dir_a.clone()]), Resolved::Moved(a.0.clone()));
