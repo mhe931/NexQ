@@ -11,6 +11,7 @@ use std::path::PathBuf;
 /// Database manager with rusqlite connection and auto-migration.
 pub struct DatabaseManager {
     conn: Connection,
+    path: PathBuf,
 }
 
 impl DatabaseManager {
@@ -34,7 +35,19 @@ impl DatabaseManager {
             DatabaseError::Migration(format!("Migration failed: {}", e))
         })?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, path: db_path })
+    }
+
+    /// A separate connection to the same database file, for long work (such as
+    /// importing documents) that must not hold the shared connection's lock.
+    pub fn open_connection(&self) -> Result<Connection, DatabaseError> {
+        let conn = Connection::open(&self.path)
+            .map_err(|e| DatabaseError::Init(format!("Failed to open database: {}", e)))?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(|e| DatabaseError::Init(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| DatabaseError::Init(e.to_string()))?;
+        Ok(conn)
     }
 
     /// Returns a reference to the underlying SQLite connection.

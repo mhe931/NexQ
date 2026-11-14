@@ -18,6 +18,13 @@ use transcript_buffer::TranscriptBuffer;
 
 use crate::llm::provider::{CancelToken, GenerationParams};
 
+/// A meeting's consented failover: the policy plus an already-built fallback provider.
+pub struct Failover {
+    pub policy: crate::profiles::routing::RoutingPolicy,
+    pub book: Arc<Mutex<crate::profiles::routing::LatencyBook>>,
+    pub fallback: Option<Arc<tokio::sync::Mutex<Box<dyn crate::llm::provider::LLMProvider>>>>,
+}
+
 /// Event payload for question detection events emitted to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionDetectedPayload {
@@ -143,6 +150,7 @@ impl IntelligenceEngine {
         scope_label: Option<String>,
         app_handle: tauri::AppHandle,
         cancel_token: Arc<CancelToken>,
+        failover: Option<Failover>,
     ) -> Result<(), String> {
         // The token is created by `begin_generation` (before the guard is handed out),
         // so a Stop pressed while the prompt is still being assembled is not lost.
@@ -209,10 +217,47 @@ impl IntelligenceEngine {
         );
 
         // Call the LLM provider's stream_completion
-        let provider_guard = llm_provider.lock().await;
-        let result = provider_guard
-            .stream_completion(messages, &model, params, app_handle.clone(), None)
-            .await;
+        let result = match failover {
+            Some(plan) if plan.fallback.is_some() => {
+                // Routed request: attempts stream silently into a publisher that
+                // allows at most one consented fallback and never a duplicate answer.
+                let publisher = Arc::new(crate::profiles::failover::TauriPublisher {
+                    app: app_handle.clone(),
+                    params: params.clone(),
+                });
+                let silent = GenerationParams { silent: true, ..params.clone() };
+                let primary_ref = plan.policy.primary.clone();
+                let fallback = plan.fallback.clone().expect("checked above");
+                let fallback_model = plan.policy.fallback.as_ref().map(|f| f.model.clone()).unwrap_or_default();
+                let outcome = crate::profiles::failover::run(
+                    &plan.policy,
+                    &plan.book,
+                    0.0,
+                    publisher,
+                    &cancel_token,
+                    |who, sink| {
+                        let (provider, model) = if who == primary_ref {
+                            (llm_provider.clone(), model.clone())
+                        } else {
+                            (fallback.clone(), fallback_model.clone())
+                        };
+                        let (messages, silent, app) = (messages.clone(), silent.clone(), app_handle.clone());
+                        async move {
+                            let guard = provider.lock().await;
+                            guard.stream_completion(messages, &model, silent, app, Some(sink)).await
+                        }
+                    },
+                )
+                .await;
+                return outcome;
+            }
+            _ => {
+                let provider_guard = llm_provider.lock().await;
+                provider_guard
+                    .stream_completion(messages, &model, params, app_handle.clone(), None)
+                    .await
+            }
+        };
 
         // The provider already emitted llm_stream_end / llm_stream_error for this request.
         // A cancelled stream is a normal stop: `cancel_generation` emitted the end event.

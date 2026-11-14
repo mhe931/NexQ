@@ -9,6 +9,7 @@ pub mod rag;
 pub mod llm;
 pub mod meeting_detect;
 pub mod ort_runtime;
+pub mod profiles;
 pub mod state;
 pub mod stt;
 pub mod translation;
@@ -47,6 +48,7 @@ use commands::stealth_commands;
 use commands::gemini_cache_commands;
 // == MODULE COMMANDS: rag ==
 use commands::rag_commands;
+use commands::profile_commands;
 // == MODULE COMMANDS: recording ==
 use commands::recording_commands;
 // == MODULE COMMANDS: translation ==
@@ -179,7 +181,13 @@ pub fn run() {
             log::info!("Context manager initialized");
 
             // -- Initialize RagManager --
-            let rag_config = rag::config::RagConfig::default();
+            let rag_config = match rag::config::RagConfig::load_from_store(&app_data_dir.join("config.json")) {
+                Ok(config) => config,
+                Err(e) => {
+                    log::error!("Using default retrieval settings: {}", e);
+                    rag::config::RagConfig::default()
+                }
+            };
             let rag_mgr = rag::RagManager::new(rag_config);
             app_state.rag = Some(Arc::new(Mutex::new(rag_mgr)));
             log::info!("RAG manager initialized");
@@ -574,6 +582,33 @@ pub fn run() {
             intelligence_commands::update_action_configs,
             intelligence_commands::get_action_configs,
             intelligence_commands::set_active_scenario,
+            profile_commands::profile_catalog,
+            profile_commands::profile_list,
+            profile_commands::profile_create,
+            profile_commands::profile_get,
+            profile_commands::profile_save,
+            profile_commands::profile_duplicate,
+            profile_commands::profile_delete,
+            profile_commands::profile_documents,
+            profile_commands::profile_add_files,
+            profile_commands::profile_add_folder,
+            profile_commands::profile_remove_folder,
+            profile_commands::profile_refresh,
+            profile_commands::profile_remove_document,
+            profile_commands::profile_set_document_role,
+            profile_commands::profile_set_presentation,
+            profile_commands::profile_slides,
+            profile_commands::profile_set_slide_notes,
+            profile_commands::profile_search,
+            profile_commands::profile_preview_prompt,
+            profile_commands::profile_activate,
+            profile_commands::profile_deactivate,
+            profile_commands::profile_link_meeting,
+            profile_commands::profile_latency_stats,
+            profile_commands::profile_sessions,
+            profile_commands::profile_clear_sessions,
+            profile_commands::list_displays,
+            profile_commands::place_overlay,
             intelligence_commands::update_speaker_context,
             // == COMMANDS: context ==
             context_commands::load_context_file,

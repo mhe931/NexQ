@@ -415,5 +415,6 @@ pub async fn test_rag_answer(
         None,                       // scope_label
         app_handle,
         cancel_flag,
+        None,
     ).await
 }
