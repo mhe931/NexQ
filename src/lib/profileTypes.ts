@@ -12,6 +12,11 @@ export type ResponseLength = "short" | "medium" | "long";
 export type ResponseFormat = "plain" | "action_answer";
 export type PresentationSource = "none" | "pptx" | "google_slides";
 export type DocumentRole = "reference" | "instruction";
+export type TextDirection = "auto" | "ltr" | "rtl";
+export type ColorPreset = "auto" | "white_on_black" | "yellow_on_black" | "green_on_black" | "black_on_white";
+export type NotesPriority = "external_first" | "embedded_first";
+export type BoundKind = "powerpoint" | "google_slides" | "other";
+export type ConnectionState = "connected" | "disconnected" | "unsupported" | "out_of_sync";
 
 export interface SourceFolder {
   id: string;
@@ -48,11 +53,18 @@ export interface AudioSettings {
   micDeviceId: string | null;
   outputDeviceId: string | null;
   outputMode: OutputMode;
+  /** Asked once per meeting and kept; never repeated on pause/resume or phase changes. */
   listeningConsentConfirmed: boolean;
+  listeningAcknowledgedAt: string | null;
 }
 
 export interface TeleprompterSettings {
   fontSize: number;
+  /** Preferred font; empty = built-in stack. Always rendered with fallbacks. */
+  fontFamily: string;
+  textDirection: TextDirection;
+  colorPreset: ColorPreset;
+  lineSpacing: number;
   lineChars: number;
   opacity: number;
   scrollSpeed: number;
@@ -74,11 +86,31 @@ export interface EnvironmentSettings {
   teleprompter: TeleprompterSettings;
 }
 
+export interface PresentationBinding {
+  id: string;
+  title: string;
+  kind: BoundKind;
+  boundAt: string;
+}
+
+/** `KeyboardEvent.key` values for each presenter action. */
+export interface Shortcuts {
+  next: string[];
+  prev: string[];
+  first: string[];
+  last: string[];
+  startQa: string[];
+}
+
 export interface PresentationSettings {
   source: PresentationSource;
   googleSlidesUrl: string;
+  /** Follow slide changes made directly in the bound presentation. */
   autoFollow: boolean;
   currentSlide: number;
+  notesPriority: NotesPriority;
+  binding: PresentationBinding | null;
+  shortcuts: Shortcuts;
 }
 
 export interface MeetingProfile {
@@ -157,6 +189,12 @@ export interface SlideRow {
   body: string;
   notesOriginal: string;
   notesEdited: string | null;
+  /** Notes from a separately imported speaker-notes document mapped to this slide. */
+  notesExternal?: string | null;
+  /** What the presenter view shows (edited > external/embedded by the meeting priority). */
+  effectiveNotes?: string;
+  notesSource?: "edited" | "external" | "embedded" | "none";
+  notesStatus?: "ok" | "differ" | "duplicate" | "missing";
 }
 
 export interface SearchHit {
@@ -249,3 +287,75 @@ export const PLATFORM_LABELS: Record<Platform, string> = {
   meet: "Google Meet",
   other: "Other / custom",
 };
+
+// ── presenting: binding, sources, notes mapping ─────────────────────────────
+
+export interface PresentationTarget {
+  id: string;
+  kind: BoundKind;
+  title: string;
+  detail: string;
+  /** False when NexQ can only list it (Google Slides in a browser). */
+  supportsControl: boolean;
+  slideshowRunning: boolean;
+  slideCount: number | null;
+  currentSlide: number | null;
+}
+
+export interface BindingStatus {
+  state: ConnectionState;
+  targetTitle: string | null;
+  targetId: string | null;
+  kind: BoundKind | null;
+  targetSlide: number | null;
+  slideCount: number | null;
+  slideshowRunning: boolean;
+  message: string;
+}
+
+export interface NavResult {
+  confirmedSlide: number;
+  status: BindingStatus;
+}
+
+export interface PresentationInfo {
+  documentId: string;
+  name: string;
+  path: string;
+  slideCount: number;
+  indexedAt: string;
+  /** The file changed on disk after it was imported. */
+  stale: boolean;
+  sourceMissing: boolean;
+  origin: "local" | "synced_cloud";
+}
+
+export interface PresentationImport {
+  report: IngestReport;
+  info: PresentationInfo;
+}
+
+export interface NotesBlock {
+  id: string;
+  documentId: string;
+  ordinal: number;
+  label: string;
+  detectedSlide: number | null;
+  assignedSlide: number | null;
+  text: string;
+  manual: boolean;
+  status: "ok" | "unassigned" | "duplicate" | "out_of_range";
+}
+
+export interface NotesImportSummary {
+  documentId: string;
+  blocks: number;
+  matched: number;
+  unassigned: number;
+  duplicates: number;
+}
+
+export interface NotesImportResult {
+  report: IngestReport;
+  summary: NotesImportSummary;
+}

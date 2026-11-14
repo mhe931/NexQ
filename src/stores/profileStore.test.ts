@@ -106,4 +106,17 @@ describe("profile store isolation", () => {
     expect(useProfileStore.getState().error).toContain("API key");
     expect(useProfileStore.getState().dirty).toBe(true);
   });
+
+  it("reloadSources re-reads documents and slides without dropping unsaved edits", async () => {
+    await useProfileStore.getState().open("A");
+    useProfileStore.getState().patch({ name: "Edited name" });
+    ipc.documents.mockResolvedValue([docA, { id: "dA2", profileId: "A", name: "notes.docx" }]);
+    ipc.slides.mockResolvedValue([makeSlide(1, "A notes"), makeSlide(2, "More")]);
+    await useProfileStore.getState().reloadSources();
+    const s = useProfileStore.getState();
+    expect(s.documents).toHaveLength(2);
+    expect(s.slides).toHaveLength(2);
+    expect(s.current?.name).toBe("Edited name");
+    expect(s.dirty).toBe(true);
+  });
 });

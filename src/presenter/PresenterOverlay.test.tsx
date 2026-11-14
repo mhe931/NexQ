@@ -13,11 +13,13 @@ vi.mock("@tauri-apps/api/event", async (importOriginal) => ({
   emit: () => Promise.resolve(),
 }));
 
+vi.mock("../lib/profileIpc", async () => ({ profileIpc: (await import("../test/profileFixtures")).profileIpcMock }));
+
 import { PresenterOverlay } from "./PresenterOverlay";
 import { useMeetingStore } from "../stores/meetingStore";
 import { usePresenterStore } from "../stores/presenterStore";
 import { useStreamStore } from "../stores/streamStore";
-import { makeProfile, makeSlide } from "../test/profileFixtures";
+import { makeProfile, makeSlide, profileIpcMock as ipc, resetProfileIpcMock } from "../test/profileFixtures";
 import type { MeetingProfile } from "../lib/profileTypes";
 
 /** Every Tauri command the overlay sent. */
@@ -27,6 +29,14 @@ const DECK = [makeSlide(1, "Notes for the first slide"), makeSlide(3, "Notes for
 
 function present(profile: MeetingProfile, over: Partial<ReturnType<typeof usePresenterStore.getState>> = {}) {
   usePresenterStore.setState({ profile, slides: DECK, currentSlide: 3, phase: "presentation", hidden: false, speechMuted: false, error: null, ...over });
+  return render(<PresenterOverlay />);
+}
+
+/** Like `present`, but loads the meeting through the store so slide navigation is wired up. */
+async function presentLoaded(profile: MeetingProfile, currentSlide = 3) {
+  ipc.get.mockResolvedValue({ ...profile, presentation: { ...profile.presentation, currentSlide } });
+  ipc.slides.mockResolvedValue(DECK);
+  await usePresenterStore.getState().load(profile.id);
   return render(<PresenterOverlay />);
 }
 
@@ -43,6 +53,7 @@ beforeAll(() => {
 beforeEach(() => {
   invoked = [];
   listeners.clear();
+  resetProfileIpcMock();
   useMeetingStore.setState({
     listening: false,
     startListening: vi.fn().mockResolvedValue(undefined),
@@ -71,8 +82,8 @@ describe("PresenterOverlay slides", () => {
     expect(screen.queryByText("Notes for slide three")).toBeNull();
   });
 
-  it("steps over a gap in the slide numbers with the keyboard", () => {
-    present(makeProfile());
+  it("steps over a gap in the slide numbers with the keyboard", async () => {
+    await presentLoaded(makeProfile());
     fireEvent.keyDown(window, { key: "ArrowRight" });
     expect(screen.getByRole("heading", { name: "Slide 4 / 4" })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "p" });
@@ -85,15 +96,15 @@ describe("PresenterOverlay slides", () => {
     expect(screen.getByRole("heading", { name: "Slide 1 / 4" })).toBeInTheDocument();
   });
 
-  it("has buttons and a slide selector as the manual fallback", () => {
-    present(makeProfile());
+  it("has buttons and a slide selector as the manual fallback", async () => {
+    await presentLoaded(makeProfile());
     fireEvent.click(screen.getByRole("button", { name: "Next slide" }));
     expect(screen.getByRole("heading", { name: "Slide 4 / 4" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Go to slide"), { target: { value: "1" } });
     expect(screen.getByRole("heading", { name: "Slide 1 / 4" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Previous slide" }));
     expect(screen.getByRole("button", { name: "Previous slide" })).toBeDisabled();
-    expect(screen.getByText(/do not follow automatically/)).toBeInTheDocument();
+    expect(screen.queryByText(/do not follow automatically/)).toBeNull();
   });
 
   it("ignores slide keys typed into a text field", () => {
@@ -132,8 +143,8 @@ describe("PresenterOverlay badges and focus", () => {
     expect(screen.getByText("LISTENING")).toBeInTheDocument();
   });
 
-  it("never steals focus or focuses an input by itself", () => {
-    present(makeProfile());
+  it("never steals focus or focuses an input by itself", async () => {
+    await presentLoaded(makeProfile());
     fireEvent.click(screen.getByRole("button", { name: "Next slide" }));
     fireEvent.keyDown(window, { key: "q" });
     expect(invoked.filter((c) => /set_focus|setFocus/i.test(c))).toEqual([]);
@@ -147,28 +158,95 @@ describe("PresenterOverlay badges and focus", () => {
   });
 });
 
-describe("PresenterOverlay Start Q&A", () => {
-  it("asks for confirmation before listening when consent was not given", async () => {
-    present(makeProfile({ audio: { ...makeProfile().audio, listeningConsentConfirmed: false } }));
+describe("PresenterOverlay Start Q&A and listening", () => {
+  const consented = (v: boolean) => makeProfile({ audio: { ...makeProfile().audio, listeningConsentConfirmed: v } });
+  const NOTICE = /Listening transcribes everyone on this call/;
+  const CONFIRM = { name: "Start listening and remember for this meeting" };
+
+  it("shows one inline notice (not a dialog) when listening was never confirmed", async () => {
+    await presentLoaded(consented(false));
     fireEvent.click(screen.getByRole("button", { name: /Start Q&A/ }));
-    const dialog = screen.getByRole("alertdialog", { name: "Confirm listening" });
-    expect(dialog).toHaveTextContent("Listening captures audio of the people in this meeting. Confirm everyone agreed.");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("dialog", { name: /listening/i })).toBeNull();
+    expect(screen.getAllByText(NOTICE)).toHaveLength(1);
+    expect(screen.getByText(NOTICE).closest("[role=status]")).not.toBeNull();
+    expect(screen.getByText(NOTICE).closest("[role=status]")).toHaveTextContent("make sure that is allowed");
     expect(useMeetingStore.getState().startListening).not.toHaveBeenCalled();
     expect(usePresenterStore.getState().phase).toBe("presentation");
-
-    fireEvent.click(within(dialog).getByRole("button", { name: /Everyone agreed/ }));
-    await waitFor(() => expect(usePresenterStore.getState().phase).toBe("qa"));
-    expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("button", { name: "Back to slides" })).toBeInTheDocument();
+    // Not blocking: nothing took focus and the slides still work.
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(screen.getByRole("button", { name: "Next slide" }));
+    expect(screen.getByRole("heading", { name: "Slide 4 / 4" })).toBeInTheDocument();
   });
 
-  it("can be cancelled without listening", () => {
-    present(makeProfile());
+  it("confirming saves the choice once, starts listening and Q&A, and never asks again", async () => {
+    present(consented(false));
+    fireEvent.click(screen.getByRole("button", { name: /Start Q&A/ }));
+    fireEvent.click(screen.getByRole("button", CONFIRM));
+    await waitFor(() => expect(usePresenterStore.getState().phase).toBe("qa"));
+    expect(ipc.setListeningConsent).toHaveBeenCalledTimes(1);
+    expect(ipc.setListeningConsent).toHaveBeenCalledWith("p1", true);
+    expect(usePresenterStore.getState().profile?.audio.listeningConsentConfirmed).toBe(true);
+    expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(NOTICE)).toBeNull();
+
+    // Pause, resume, back to slides and Q&A again: no second question.
+    act(() => useMeetingStore.setState({ listening: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Pause listening" }));
+    act(() => useMeetingStore.setState({ listening: false }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume listening" }));
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Back to slides" }));
     fireEvent.keyDown(window, { key: "q" });
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(ipc.setListeningConsent).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks on Resume listening too, and only once when confirmed there", async () => {
+    present(consented(false), { phase: "qa" });
+    fireEvent.click(screen.getByRole("button", { name: "Resume listening" }));
+    expect(screen.getAllByText(NOTICE)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", CONFIRM));
+    await waitFor(() => expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(1));
+    expect(ipc.setListeningConsent).toHaveBeenCalledTimes(1);
+    act(() => useMeetingStore.setState({ listening: false }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume listening" }));
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(2);
+    expect(ipc.setListeningConsent).toHaveBeenCalledTimes(1);
+  });
+
+  it("'Not now' switches to Q&A in text mode without listening or saving anything", () => {
+    present(consented(false));
+    fireEvent.keyDown(window, { key: "q" });
+    expect(screen.getAllByText(NOTICE)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Not now" }));
+    expect(screen.queryByText(NOTICE)).toBeNull();
     expect(useMeetingStore.getState().startListening).not.toHaveBeenCalled();
-    expect(usePresenterStore.getState().phase).toBe("presentation");
+    expect(ipc.setListeningConsent).not.toHaveBeenCalled();
+    expect(usePresenterStore.getState().phase).toBe("qa");
+    expect(screen.getByText("NOT LISTENING")).toBeInTheDocument();
+  });
+
+  it("still starts listening when saving the choice fails", async () => {
+    ipc.setListeningConsent.mockRejectedValueOnce(new Error("disk full"));
+    present(consented(false));
+    fireEvent.click(screen.getByRole("button", { name: /Start Q&A/ }));
+    fireEvent.click(screen.getByRole("button", CONFIRM));
+    await waitFor(() => expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(NOTICE)).toBeNull();
+  });
+
+  it("never shows the notice when listening was confirmed, also for the keyboard shortcut", async () => {
+    present(consented(true));
+    fireEvent.keyDown(window, { key: "q" });
+    await waitFor(() => expect(usePresenterStore.getState().phase).toBe("qa"));
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(useMeetingStore.getState().startListening).toHaveBeenCalledTimes(1);
+    expect(ipc.setListeningConsent).not.toHaveBeenCalled();
   });
 
   it("starts at once when everyone already agreed in the meeting setup, and can go back to slides", async () => {

@@ -13,6 +13,15 @@ import type {
   TemplateCatalog,
   DocumentRole,
   LatencySnapshot,
+  BindingStatus,
+  NavResult,
+  NotesBlock,
+  NotesImportResult,
+  PresentationImport,
+  PresentationInfo,
+  PresentationSettings,
+  PresentationTarget,
+  TeleprompterSettings,
 } from "./profileTypes";
 
 export const profileIpc = {
@@ -50,6 +59,34 @@ export const profileIpc = {
   sessions: (profileId: string) => invoke<SessionRef[]>("profile_sessions", { profileId }),
   clearSessions: (profileId: string) => invoke<number>("profile_clear_sessions", { profileId }),
   latencyStats: () => invoke<LatencySnapshot[]>("profile_latency_stats"),
+
+  // Presenting: binding and synchronised navigation (never calls an LLM or the network)
+  presentTargets: () => invoke<PresentationTarget[]>("present_list_targets"),
+  presentBind: (profileId: string, targetId: string) => invoke<BindingStatus>("present_bind", { profileId, targetId }),
+  presentDisconnect: (profileId: string) => invoke<void>("present_disconnect", { profileId }),
+  presentRevalidate: (profileId: string) => invoke<BindingStatus>("present_revalidate", { profileId }),
+  presentStatus: (expectedSlide: number | null) => invoke<BindingStatus>("present_status", { expectedSlide }),
+  presentGoto: (slide: number) => invoke<NavResult>("present_goto", { slide }),
+  presentTestNavigation: () => invoke<NavResult>("present_test_navigation"),
+
+  // Presentation and external speaker-notes sources
+  addPresentation: (profileId: string, path: string) =>
+    invoke<PresentationImport>("profile_add_presentation", { profileId, path }),
+  presentationInfo: (profileId: string) =>
+    invoke<PresentationInfo | null>("profile_presentation_info", { profileId }),
+  addNotes: (profileId: string, path: string) => invoke<NotesImportResult>("profile_add_notes", { profileId, path }),
+  notesBlocks: (profileId: string) => invoke<NotesBlock[]>("profile_notes_blocks", { profileId }),
+  assignNotes: (profileId: string, blockId: string, slide: number | null) =>
+    invoke<void>("profile_notes_assign", { profileId, blockId, slide }),
+
+  // Per-meeting presenter preferences (narrow writes: they never overwrite other settings)
+  updateTeleprompter: (profileId: string, settings: TeleprompterSettings) =>
+    invoke<TeleprompterSettings>("profile_update_teleprompter", { profileId, settings }),
+  updatePresentation: (profileId: string, settings: PresentationSettings) =>
+    invoke<PresentationSettings>("profile_update_presentation", { profileId, settings }),
+  setListeningConsent: (profileId: string, confirmed: boolean) =>
+    invoke<void>("profile_set_listening_consent", { profileId, confirmed }),
+  systemFonts: () => invoke<string[]>("list_system_fonts"),
   displays: () => invoke<DisplayInfo[]>("list_displays"),
   placeOverlay: (x: number, y: number, width: number, height: number) =>
     invoke<void>("place_overlay", { x, y, width, height }),

@@ -9,6 +9,16 @@ export async function pickFiles(extensions: string[] = SUPPORTED_EXTENSIONS): Pr
   return Array.isArray(selected) ? selected : [selected];
 }
 
+/** One file chosen in the system dialog (null when cancelled). */
+export async function pickFile(name: string, extensions: string[]): Promise<string | null> {
+  const selected = await open({ multiple: false, filters: [{ name, extensions }] });
+  if (selected == null) return null;
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected;
+}
+
+export const PRESENTATION_EXTENSIONS = ["pptx", "pptm", "ppsx"];
+export const NOTES_EXTENSIONS = ["docx", "pdf", "txt", "md"];
+
 /** A folder chosen in the system dialog (null when cancelled). */
 export async function pickFolder(title: string): Promise<string | null> {
   const selected = await open({ directory: true, multiple: false, title });

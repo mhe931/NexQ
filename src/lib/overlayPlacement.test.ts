@@ -9,7 +9,10 @@ const d = (index: number, x: number, width = 1920, height = 1080): DisplayInfo =
 const env = (over: Partial<EnvironmentSettings> = {}): EnvironmentSettings => ({
   monitorCount: 2, autoDetectDisplays: true, primaryMonitor: 0, presentationMonitor: 1, nexqMonitor: 0,
   webcamPosition: "top_center", screenShare: "display",
-  teleprompter: { fontSize: 28, lineChars: 60, opacity: 0.9, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220 },
+  teleprompter: {
+    fontSize: 28, fontFamily: "", textDirection: "auto", colorPreset: "auto", lineSpacing: 1.45,
+    lineChars: 60, opacity: 0.9, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220,
+  },
   ...over,
 });
 

@@ -1,9 +1,15 @@
 import { Suspense, lazy, useCallback, useRef, useState } from "react";
 import { ArrowLeft, EyeOff, Eye, GripHorizontal, Mic, MicOff, Square } from "lucide-react";
 import { AnswerPanel } from "./AnswerPanel";
+import { BindStatusChip } from "./BindPresentation";
+import { ListeningNotice } from "./ListeningNotice";
+import { PresenterToolbar } from "./PresenterToolbar";
 import { SlideNotes } from "./SlideNotes";
 import { palette, type Palette } from "./theme";
+import { usePresentationSync } from "./usePresentationSync";
 import { usePresenterKeys } from "./usePresenterKeys";
+import { useWindowGeometry } from "./useWindowGeometry";
+import { profileIpc } from "../lib/profileIpc";
 import type { MeetingProfile } from "../lib/profileTypes";
 import { useMeetingStore } from "../stores/meetingStore";
 import { usePresenterStore } from "../stores/presenterStore";
@@ -13,10 +19,10 @@ import { showToast } from "../stores/toastStore";
 const SpokenControls = lazy(() => import("./SpokenControls"));
 
 const ctl =
-  "inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-semibold cursor-pointer " +
+  "inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs font-semibold cursor-pointer " +
   "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40";
 
-type PendingListen = null | "qa" | "resume";
+type AskingToListen = null | "qa" | "resume";
 
 /** The overlay window for a meeting that runs under a profile: a minimal, high-contrast teleprompter. */
 export function PresenterOverlay() {
@@ -54,9 +60,12 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
   const t = profile.environment.teleprompter;
   const colors = palette(t);
   const notesRef = useRef<HTMLDivElement>(null);
-  const [pending, setPending] = useState<PendingListen>(null);
-  const [consentGiven, setConsentGiven] = useState(false);
-  const consented = profile.audio.listeningConsentConfirmed || consentGiven;
+  const [asking, setAsking] = useState<AskingToListen>(null);
+  // Asked at most once per meeting: after the user agreed it is saved with the profile.
+  const consented = profile.audio.listeningConsentConfirmed;
+
+  usePresentationSync();
+  useWindowGeometry();
 
   const listen = useCallback(async (andQa: boolean) => {
     try {
@@ -67,17 +76,28 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
     if (andQa) usePresenterStore.getState().startQa();
   }, []);
 
-  /** Listening needs the user's confirmation that everyone agreed, once per meeting. */
+  /** Listening starts at once when the user already agreed for this meeting; otherwise one inline notice asks. */
   const request = useCallback((what: "qa" | "resume") => {
     if (consented) void listen(what === "qa");
-    else setPending(what);
+    else setAsking(what);
   }, [consented, listen]);
 
-  const confirm = () => {
-    const what = pending;
-    setPending(null);
-    setConsentGiven(true);
-    if (what) void listen(what === "qa");
+  const confirm = async () => {
+    const what = asking;
+    setAsking(null);
+    usePresenterStore.getState().markListeningConsented();
+    try {
+      await profileIpc.setListeningConsent(profile.id, true);
+    } catch (e) {
+      showToast(`Couldn't save your choice for this meeting: ${e instanceof Error ? e.message : String(e)}`, "error");
+    }
+    await listen(what === "qa");
+  };
+
+  const decline = () => {
+    const what = asking;
+    setAsking(null);
+    if (what === "qa") usePresenterStore.getState().startQa();
   };
 
   const pause = () => { void useMeetingStore.getState().pauseListening(); };
@@ -108,7 +128,7 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
       {listening ? "LISTENING" : "NOT LISTENING"}
     </span>
   );
-  const frame = "flex h-full flex-col overflow-hidden rounded-xl border shadow-xl";
+  const frame = "relative flex h-full flex-col overflow-hidden rounded-xl border shadow-xl";
   const frameStyle = { background: colors.bg, color: colors.fg, borderColor: colors.border };
 
   if (hidden) {
@@ -132,7 +152,7 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
       <Header
         colors={colors}
         name={profile.name}
-        badges={<>{sessionBadge}{listeningBadge}</>}
+        badges={<>{sessionBadge}{listeningBadge}<BindStatusChip colors={colors} /></>}
       >
         {phase === "qa" && (
           listening ? (
@@ -150,19 +170,11 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
         <EndButton onClick={end} />
       </Header>
 
-      {pending && (
-        <div role="alertdialog" aria-label="Confirm listening" className="mx-3 mt-2 rounded-lg border px-3 py-2 text-sm" style={{ borderColor: colors.accent }}>
-          <p>Listening captures audio of the people in this meeting. Confirm everyone agreed.</p>
-          <div className="mt-2 flex gap-2">
-            <button type="button" className={ctl} style={{ borderColor: colors.accent, background: colors.accent, color: colors.onAccent }} onClick={confirm}>
-              {pending === "qa" ? "Everyone agreed — start Q&A" : "Everyone agreed — resume"}
-            </button>
-            <button type="button" className={ctl} style={{ borderColor: colors.border }} onClick={() => setPending(null)}>Cancel</button>
-          </div>
-        </div>
-      )}
+      <PresenterToolbar t={t} colors={colors} />
 
-      <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
+      {asking && <ListeningNotice colors={colors} onConfirm={() => void confirm()} onDecline={decline} />}
+
+      <div className="flex min-h-0 flex-1 flex-col gap-1.5 p-2">
         {phase === "presentation" ? (
           <SlideNotes profile={profile} colors={colors} scrollRef={notesRef} onRequestQa={() => request("qa")} />
         ) : (

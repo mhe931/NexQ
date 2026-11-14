@@ -16,9 +16,6 @@ export function startBlockers(profile: MeetingProfile): string[] {
   if (profile.sessionKind === "live" && !profile.assistancePermittedConfirmed) {
     out.push("Confirm that AI assistance is permitted for this meeting before a live session.");
   }
-  if (profile.meetingType !== "presentation_qa" && !profile.audio.listeningConsentConfirmed) {
-    out.push("Confirm that everyone whose audio is captured has agreed to it.");
-  }
   if (profile.ai.fallbackProvider && profile.ai.automaticFallback && profile.ai.fallbackConsentProvider !== profile.ai.fallbackProvider) {
     out.push(`Allow ${profile.ai.fallbackProvider} to receive this meeting's context, or turn automatic fallback off.`);
   }
@@ -69,7 +66,9 @@ export async function startProfileMeeting(profileId: string): Promise<{ notice: 
   const title = profile.meetingDate ? `${profile.name} — ${profile.meetingDate}` : profile.name;
   await useMeetingStore.getState().startMeetingFlow(title, "online", undefined, {
     profileId: profile.id,
-    deferCapture: profile.meetingType === "presentation_qa",
+    // Listening starts when the presenter asks for it. A meeting whose transcription was never
+    // acknowledged is asked once, inline, in the presenter view rather than blocking the start.
+    deferCapture: profile.meetingType === "presentation_qa" || !profile.audio.listeningConsentConfirmed,
     sttProvider: profile.audio.transcriptionEngine === "whisper" && !notice ? "whisper_cpp" : undefined,
   });
   const meeting = useMeetingStore.getState().activeMeeting;

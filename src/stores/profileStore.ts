@@ -49,6 +49,8 @@ interface ProfileState {
   addFiles: (paths: string[], role?: DocumentRole) => Promise<void>;
   addFolder: (path: string, kind: "local" | "cloud", label?: string) => Promise<void>;
   refreshSources: () => Promise<void>;
+  /** Re-reads documents, source folders, presentation source and slides after an import done elsewhere. */
+  reloadSources: () => Promise<void>;
   removeDocument: (documentId: string) => Promise<void>;
   setDocumentRole: (documentId: string, role: DocumentRole) => Promise<void>;
   setPresentation: (documentId: string) => Promise<void>;
@@ -282,6 +284,16 @@ export const useProfileStore = create<ProfileState>((set, get) => {
         },
         (lastReport) => set({ lastReport }),
       ),
+
+    reloadSources: async () => {
+      const profile = get().current;
+      if (!profile) return;
+      try {
+        await reloadDocuments(profile.id);
+      } catch (e) {
+        set({ error: errorText(e) });
+      }
+    },
 
     removeDocument: (documentId) =>
       forCurrent(

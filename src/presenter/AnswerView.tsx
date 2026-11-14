@@ -1,7 +1,9 @@
 import { useMemo } from "react";
 import { HelpCircle } from "lucide-react";
 import { parseAnswer } from "../lib/answerFormat";
+import { directionProps } from "../lib/presenterTypography";
 import type { TeleprompterSettings } from "../lib/profileTypes";
+import { DirectedText } from "./DirectedText";
 import { textColumn, type Palette } from "./theme";
 
 interface Props {
@@ -29,12 +31,19 @@ export function AnswerView({ content, streaming, t, colors }: Props) {
   const answers = parsed.blocks.filter((b) => b.kind === "answer" || b.kind === "text");
   const sources = parsed.blocks.filter((b) => b.kind === "source");
   const column = textColumn(t);
-  const small = { fontSize: `${Math.max(12, Math.round(t.fontSize * 0.55))}px`, maxWidth: column.maxWidth, overflowWrap: "anywhere" as const };
+  const small = {
+    fontSize: `${Math.max(12, Math.round(t.fontSize * 0.55))}px`,
+    fontFamily: column.fontFamily,
+    lineHeight: column.lineHeight,
+    maxWidth: column.maxWidth,
+    overflowWrap: "anywhere" as const,
+  };
+  const dirProps = directionProps(t.textDirection);
 
   return (
     <div className="space-y-3" aria-live="polite" aria-busy={streaming}>
       {answers.map((b, i) => (
-        <p key={`a-${i}`} className="font-semibold" style={column}>{b.text}</p>
+        <DirectedText key={`a-${i}`} text={b.text} direction={t.textDirection} style={column} className="font-semibold" />
       ))}
 
       {parsed.actions.length > 0 && (
@@ -51,7 +60,7 @@ export function AnswerView({ content, streaming, t, colors }: Props) {
               <HelpCircle className="h-3.5 w-3.5" aria-hidden="true" />
             </span>
           </p>
-          <ol className="space-y-1.5" aria-label="Steps for you to do">
+          <ol className="space-y-1.5" aria-label="Steps for you to do" dir={dirProps.container.dir} style={dirProps.container.style}>
             {parsed.actions.map((a) => (
               <li
                 key={`act-${a.step}`}
@@ -60,7 +69,7 @@ export function AnswerView({ content, streaming, t, colors }: Props) {
                 style={{ borderColor: colors.accent, background: "rgba(127,127,127,0.12)", ...small }}
               >
                 <span className="font-bold tabular-nums" style={{ color: colors.accent }}>{a.step}.</span>
-                <span>{a.text}</span>
+                <span dir={dirProps.paragraph.dir} className="whitespace-pre-wrap" style={dirProps.paragraph.style}>{a.text}</span>
               </li>
             ))}
           </ol>

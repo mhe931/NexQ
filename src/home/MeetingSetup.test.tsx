@@ -78,7 +78,8 @@ describe("MeetingSetup layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Connect Cloud Folder" }));
     expect(screen.getByText(/Direct Google Drive/)).toBeInTheDocument();
     expect(screen.getByText(/never reads browser tokens/)).toBeInTheDocument();
-    expect(screen.getByText(/needs Google API sign-in/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Google Slides / OneDrive / SharePoint" }));
+    expect(screen.getByText(/needs your own OAuth registration/)).toBeInTheDocument();
   });
 });
 

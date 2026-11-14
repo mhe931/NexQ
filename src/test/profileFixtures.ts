@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import type { MeetingProfile, ProfileSummary, SlideRow, TemplateCatalog } from "../lib/profileTypes";
+import type { BindingStatus, MeetingProfile, ProfileSummary, SlideRow, TemplateCatalog } from "../lib/profileTypes";
 
 /** Every `profileIpc` command as a vi.fn(), for `vi.mock("../lib/profileIpc", ...)`. */
 export const profileIpcMock = {
@@ -29,6 +29,23 @@ export const profileIpcMock = {
   clearSessions: vi.fn(),
   displays: vi.fn(),
   placeOverlay: vi.fn(),
+  latencyStats: vi.fn(),
+  presentTargets: vi.fn(),
+  presentBind: vi.fn(),
+  presentDisconnect: vi.fn(),
+  presentRevalidate: vi.fn(),
+  presentStatus: vi.fn(),
+  presentGoto: vi.fn(),
+  presentTestNavigation: vi.fn(),
+  addPresentation: vi.fn(),
+  presentationInfo: vi.fn(),
+  addNotes: vi.fn(),
+  notesBlocks: vi.fn(),
+  assignNotes: vi.fn(),
+  updateTeleprompter: vi.fn(),
+  updatePresentation: vi.fn(),
+  setListeningConsent: vi.fn(),
+  systemFonts: vi.fn(),
 };
 
 export function resetProfileIpcMock() {
@@ -38,9 +55,23 @@ export function resetProfileIpcMock() {
   profileIpcMock.slides.mockResolvedValue([]);
   profileIpcMock.sessions.mockResolvedValue([]);
   profileIpcMock.displays.mockResolvedValue([]);
+  profileIpcMock.presentTargets.mockResolvedValue([]);
+  profileIpcMock.presentRevalidate.mockResolvedValue(DISCONNECTED);
+  profileIpcMock.presentStatus.mockResolvedValue(DISCONNECTED);
+  profileIpcMock.presentationInfo.mockResolvedValue(null);
+  profileIpcMock.notesBlocks.mockResolvedValue([]);
+  profileIpcMock.systemFonts.mockResolvedValue(["Segoe UI", "Tahoma", "Vazirmatn"]);
+  profileIpcMock.updateTeleprompter.mockImplementation(async (_id: string, s: unknown) => s);
+  profileIpcMock.updatePresentation.mockImplementation(async (_id: string, s: unknown) => s);
+  profileIpcMock.setListeningConsent.mockResolvedValue(undefined);
   profileIpcMock.catalog.mockResolvedValue(CATALOG);
   profileIpcMock.save.mockImplementation(async (p: MeetingProfile) => p);
 }
+
+export const DISCONNECTED: BindingStatus = {
+  state: "disconnected", targetTitle: null, targetId: null, kind: null, targetSlide: null,
+  slideCount: null, slideshowRunning: false, message: "No presentation is bound.",
+};
 
 export const CATALOG: TemplateCatalog = {
   templates: [
@@ -87,6 +118,7 @@ export function makeProfile(over: Partial<MeetingProfile> = {}): MeetingProfile 
       outputDeviceId: null,
       outputMode: "text",
       listeningConsentConfirmed: false,
+      listeningAcknowledgedAt: null,
     },
     environment: {
       monitorCount: 1,
@@ -96,9 +128,18 @@ export function makeProfile(over: Partial<MeetingProfile> = {}): MeetingProfile 
       nexqMonitor: 0,
       webcamPosition: "top_center",
       screenShare: "none",
-      teleprompter: { fontSize: 28, lineChars: 60, opacity: 0.92, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220 },
+      teleprompter: {
+        fontSize: 28, fontFamily: "", textDirection: "auto", colorPreset: "auto", lineSpacing: 1.45,
+        lineChars: 60, opacity: 0.92, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220,
+      },
     },
-    presentation: { source: "none", googleSlidesUrl: "", autoFollow: false, currentSlide: 1 },
+    presentation: {
+      source: "none", googleSlidesUrl: "", autoFollow: true, currentSlide: 1, notesPriority: "external_first", binding: null,
+      shortcuts: {
+        next: ["ArrowRight", "PageDown", "n"], prev: ["ArrowLeft", "PageUp", "p"],
+        first: ["Home"], last: ["End"], startQa: ["q"],
+      },
+    },
     feedback: "",
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-01-01T00:00:00Z",

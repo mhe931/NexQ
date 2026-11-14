@@ -42,8 +42,14 @@ export function PrivacySection({ profile, onDelete }: { profile: MeetingProfile;
           checked={profile.audio.listeningConsentConfirmed}
           onChange={(e) => patch((p) => ({ ...p, audio: { ...p.audio, listeningConsentConfirmed: e.target.checked } }))}
         />
-        <label htmlFor="listening-consent">Everyone whose audio is captured has agreed to listening/transcription</label>
+        <label htmlFor="listening-consent">
+          I will make sure everyone on this meeting knows it is transcribed or that it is permitted (asked once per meeting)
+        </label>
       </div>
+      <p className={hintCls}>
+        Optional here: you can start the meeting without ticking this. If it is left unchecked, the presenter asks once before listening
+        starts. Once confirmed it is saved with this meeting and not asked again.
+      </p>
       <ul className="list-disc space-y-1 pl-5 text-xs leading-relaxed text-muted-foreground">
         <li>Nothing is recorded or uploaded automatically.</li>
         <li>Folders and files are indexed locally on this computer.</li>
