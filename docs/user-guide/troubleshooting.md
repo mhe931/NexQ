@@ -178,6 +178,17 @@ This only appears the first time you install. Subsequent launches will not trigg
 - Try running your meeting application in windowed mode instead of full-screen
 - Check that no other always-on-top application is competing for the topmost position
 
+### NexQ Does Not Close, or Is Still Running After I Closed It
+
+**Problem**: After closing the main window NexQ is still in Task Manager or the tray.
+
+**Solution**:
+
+1. Closing the main window (X or `Alt+F4`) quits NexQ. If a meeting is running or the meeting setup has unsaved changes, a **Quit NexQ?** question appears first -- choose **Save and quit** or **Quit without saving**.
+2. If that window does not answer, NexQ quits by itself after about 2.5 seconds. Releasing the microphone and helper programs then takes at most about four seconds, after which the process ends regardless.
+3. Closing the overlay with `Alt+F4` only hides it and brings the main window back -- that is intended.
+4. If NexQ is still running after more than ten seconds, [collect the log](#collecting-logs-for-a-bug-report): the lines "Main window close requested", "NexQ is shutting down" and "Shutdown step ..." show what held it up.
+
 ## Performance Issues
 
 ### High CPU Usage

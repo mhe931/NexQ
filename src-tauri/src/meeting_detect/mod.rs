@@ -62,6 +62,12 @@ fn with_detector<T>(f: impl FnOnce(&mut Detector) -> T) -> T {
     f(det)
 }
 
+/// Stop sampling for good (NexQ is quitting): the thread keeps sleeping but
+/// no longer reads the microphone sessions or window titles.
+pub fn stop_sampling() {
+    with_detector(|d| d.config.enabled = false);
+}
+
 /// Start the background detector (once, from setup).
 pub fn start(app: &AppHandle) {
     let app = app.clone();

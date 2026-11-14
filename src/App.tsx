@@ -17,6 +17,8 @@ import { useTranslation } from "./hooks/useTranslation";
 import { useTraySync } from "./hooks/useTraySync";
 import { useStealthCursor } from "./hooks/useStealthCursor";
 import { useUpdater } from "./hooks/useUpdater";
+import { useAppCloseGuard } from "./hooks/useAppCloseGuard";
+import { AppCloseDialog } from "./components/AppCloseDialog";
 import { useAgentFallbackToast } from "./hooks/useAgentFallbackToast";
 import { refreshClaudeModelsOnStart } from "./stores/agentStore";
 import { useTranslationStore } from "./stores/translationStore";
@@ -125,6 +127,10 @@ function App() {
   }, []);
   // OVERLAY window: stealth mode keeps the arrow cursor across the whole window.
   useStealthCursor(windowLabel);
+
+  // LAUNCHER window: closing it quits NexQ. The backend asks first; this answers
+  // at once, or shows the dialog when a meeting runs / the setup is unsaved.
+  const appCloseGuard = useAppCloseGuard(windowLabel);
 
   // LAUNCHER window: the meeting runs in the overlay window. When a meeting
   // starts (or anything asks this window for the meeting view), bring the
@@ -468,6 +474,8 @@ function App() {
       <UpdateReadyToast />
       <UpdateDialog />
 
+      {/* Closing the window with a meeting running or unsaved setup edits */}
+      <AppCloseDialog guard={appCloseGuard} />
       {/* Demo mode — scenario picker modal + floating exit badge */}
       <DemoPicker />
       <DemoBadge />

@@ -4,6 +4,7 @@ pub mod context;
 pub mod credentials;
 pub mod db;
 pub mod intelligence;
+pub mod lifecycle;
 pub mod logging;
 pub mod rag;
 pub mod llm;
@@ -11,6 +12,7 @@ pub mod meeting_detect;
 pub mod ort_runtime;
 pub mod presentation;
 pub mod profiles;
+pub mod startup;
 pub mod state;
 pub mod stt;
 pub mod translation;
@@ -23,6 +25,8 @@ use tauri::{
     Emitter, Manager,
 };
 
+// == MODULE COMMANDS: app lifecycle ==
+use commands::app_commands;
 // == MODULE COMMANDS: audio ==
 use commands::audio_commands;
 // == MODULE COMMANDS: stt ==
@@ -107,18 +111,14 @@ fn show_for_second_launch(app: &tauri::AppHandle) {
     }
 }
 
-/// Hide all windows (minimize to tray).
-fn hide_all(app: &tauri::AppHandle) {
-    if let Some(launcher) = app.get_webview_window("launcher") {
-        let _ = launcher.hide();
-    }
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.hide();
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // A binary without its bundled interface (plain `cargo build`) would only show
+    // "localhost refused to connect": explain it instead and leave. Also answers `--self-test`.
+    if let Some(code) = startup::early_exit(std::env::args_os()) {
+        std::process::exit(code);
+    }
+
     // Relaunched by the installer of an update installed on quit: the user
     // quit NexQ, so exit before anything (single-instance hand-off, windows,
     // tray) happens.
@@ -456,7 +456,9 @@ pub fn run() {
                         show_launcher(&app_handle);
                     }
                     "quit" => {
-                        _app.exit(0);
+                        // Asks first when a meeting or unsaved edits would be lost, then
+                        // ExitRequested -> Exit -> shutdown (same as the title-bar X).
+                        lifecycle::request_close(&app_handle);
                     }
                     _ => {
                         // Check for recent meeting clicks (id format: "recent_{id}")
@@ -514,16 +516,18 @@ pub fn run() {
             // -- Stealth mode saved on: hide windows from capture before the webviews load --
             stealth_commands::restore_on_startup(app.handle());
 
-            // -- Intercept launcher window close: hide instead of quit --
-            if let Some(launcher) = app.get_webview_window("launcher") {
-                let close_app = app.handle().clone();
-                launcher.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        hide_all(&close_app);
-                    }
-                });
+            // -- Closing the main window quits NexQ (after asking the window
+            //    whether anything would be lost); the overlay only hides --
+            for label in [lifecycle::LAUNCHER_LABEL, lifecycle::OVERLAY_LABEL] {
+                if let Some(window) = app.get_webview_window(label) {
+                    let close_app = app.handle().clone();
+                    window.on_window_event(move |event| {
+                        lifecycle::on_window_event(&close_app, label, event);
+                    });
+                }
             }
+            // Windows ending the session makes tao call process::exit: shut down there too.
+            lifecycle::install_exit_hook(app.handle());
 
             // -- Live blur-behind on the overlay (real desktop passthrough), only while shown --
             #[cfg(target_os = "windows")]
@@ -541,6 +545,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // == COMMANDS: app lifecycle ==
+            app_commands::confirm_app_close,
+            app_commands::cancel_app_close,
+            app_commands::ack_app_close_prompt,
             // == COMMANDS: audio ==
             audio_commands::list_audio_devices,
             audio_commands::start_capture,
@@ -770,15 +778,14 @@ pub fn run() {
                     updater_commands::on_exit_requested(app, api);
                 }
             }
-            // Close Claude CLI sessions (each gets 2 s, in parallel). If the
-            // process exits elsewhere (e.g. inside an update install), the
-            // children still see stdin EOF and exit on their own.
+            // Every way of quitting (the main window's X / Alt+F4, the tray's
+            // Quit, the last window closing) ends here: release what NexQ owns
+            // (requests, microphone, the CLI processes it started, the database)
+            // within one deadline, with a watchdog ending the process if
+            // anything hangs. If the process exits elsewhere (an update
+            // install), the CLI children still see stdin EOF and exit on their own.
             if let tauri::RunEvent::Exit = &event {
-                let meeting_active = app.state::<AppState>().meeting_active.load(std::sync::atomic::Ordering::SeqCst);
-                log::info!("NexQ is exiting (meeting active: {meeting_active})");
-                let sessions = app.state::<AppState>().agent_sessions.clone();
-                tauri::async_runtime::block_on(sessions.close_all());
-                logging::flush(std::time::Duration::from_millis(500));
+                lifecycle::shutdown(app, lifecycle::ExitContext::EventLoop);
             }
         });
 }
