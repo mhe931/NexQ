@@ -26,8 +26,14 @@ vi.mock("../stores/configStore", () => ({
 
 vi.mock("./logger", () => ({ logToFile: () => {} }));
 
+let activeProfileId: string | null = null;
+vi.mock("../stores/meetingStore", () => ({
+  useMeetingStore: { getState: () => ({ profileId: activeProfileId }) },
+}));
+
 beforeEach(() => {
   calls.length = 0;
+  activeProfileId = null;
   overlay.show.mockClear();
   overlay.unminimize.mockClear();
   overlay.setFocus.mockClear();
@@ -58,6 +64,18 @@ describe("showOverlayWindow", () => {
     expect(overlay.show).toHaveBeenCalledTimes(1);
     expect(calls[0]).toBe("launcher.hide");
     expect(calls.indexOf("overlay.show")).toBeGreaterThan(calls.indexOf("launcher.hide"));
+  });
+
+  it("a profile meeting shows the overlay without taking keyboard focus; the classic flow still focuses", async () => {
+    const { showOverlayWindow } = await import("./windows");
+    activeProfileId = "profile-1";
+    await showOverlayWindow();
+    expect(overlay.show).toHaveBeenCalledTimes(1);
+    expect(overlay.setFocus).not.toHaveBeenCalled();
+
+    activeProfileId = null;
+    await showOverlayWindow();
+    expect(overlay.setFocus).toHaveBeenCalledTimes(1);
   });
 
   it("stealth: never calls launcher.hide more than once", async () => {

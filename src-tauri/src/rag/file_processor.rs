@@ -83,7 +83,13 @@ fn parse_docx_xml(xml: &str) -> String {
             // Extract text after the closing '>'
             if let Some(pos) = fragment.find('>') {
                 let text = &fragment[pos + 1..];
-                result.push_str(text);
+                let decoded = text
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&apos;", "'")
+                    .replace("&amp;", "&");
+                result.push_str(&decoded);
             }
         }
     }
@@ -140,6 +146,15 @@ mod tests {
     fn test_parse_docx_xml_empty() {
         let text = parse_docx_xml("");
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_docx_scientific_comparisons_decode_xml_entities_once() {
+        let xml = r#"<w:p><w:r><w:t>NIR &lt; 0.04 &amp; NDSI &gt; 0.4; &quot;ice&quot; &apos;proxy&apos; &amp;lt;</w:t></w:r></w:p>"#;
+        assert_eq!(
+            parse_docx_xml(xml),
+            "NIR < 0.04 & NDSI > 0.4; \"ice\" 'proxy' &lt;",
+        );
     }
 
     #[test]

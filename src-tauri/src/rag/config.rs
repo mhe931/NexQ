@@ -50,3 +50,65 @@ impl Default for RagConfig {
         }
     }
 }
+
+impl RagConfig {
+    /// Reads the retrieval settings the frontend saved in the app's settings
+    /// store (`config.json`). A missing file or missing key yields the
+    /// defaults; a present but invalid `ragConfig` is an error, not a silent reset.
+    pub fn load_from_store(path: &std::path::Path) -> Result<Self, String> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+        };
+        let store: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("Settings file {} is not valid JSON: {e}", path.display()))?;
+        let Some(saved) = store.get("ragConfig").filter(|v| !v.is_null()) else {
+            return Ok(Self::default());
+        };
+        let mut config: Self = serde_json::from_value(saved.clone())
+            .map_err(|e| format!("Saved retrieval settings are invalid: {e}"))?;
+        if store.get("contextStrategy").and_then(|v| v.as_str()) == Some("local_rag") {
+            config.enabled = true;
+        }
+        Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cold_start_restores_saved_keyword_retrieval() {
+        let path = std::env::temp_dir().join(format!("nexq-rag-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{
+                "contextStrategy": "local_rag",
+                "ragConfig": {
+                    "enabled": true, "embedding_model": "unused",
+                    "ollama_url": "http://127.0.0.1:1", "batch_size": 32,
+                    "chunk_size": 384, "chunk_overlap": 48,
+                    "splitting_strategy": "recursive", "top_k": 6,
+                    "search_mode": "keyword", "similarity_threshold": 0.0,
+                    "semantic_weight": 0.0, "include_transcript": false,
+                    "embedding_dimensions": 768
+                }
+        }"#).unwrap();
+        let loaded = RagConfig::load_from_store(&path);
+        std::fs::remove_file(&path).unwrap();
+        let manager = super::super::RagManager::new(loaded.unwrap());
+        assert_eq!(manager.config().search_mode, "keyword");
+        assert_eq!(manager.config().top_k, 6);
+        assert!(manager.config().enabled);
+        assert!(!manager.config().include_transcript);
+    }
+
+    #[test]
+    fn invalid_saved_retrieval_config_is_not_silently_discarded() {
+        let path = std::env::temp_dir().join(format!("nexq-rag-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{"ragConfig":{"top_k":"invalid"}}"#).unwrap();
+        let loaded = RagConfig::load_from_store(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(loaded.is_err());
+    }
+}

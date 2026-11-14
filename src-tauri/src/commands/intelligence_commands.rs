@@ -141,6 +141,82 @@ struct RagRetrieval {
     total_candidates: usize,
 }
 
+/// Retrieval for a profile meeting: only that meeting's reference documents,
+/// presented to the model strictly as untrusted data with source locators.
+fn retrieve_profile_context(
+    state: &AppState,
+    profile_id: &str,
+    question_text: Option<String>,
+    transcript_excerpt: String,
+    top_k: usize,
+) -> RagRetrieval {
+    let mut out = RagRetrieval::default();
+    let query = question_text
+        .filter(|q| !q.trim().is_empty())
+        .or_else(|| Some(transcript_excerpt).filter(|t| !t.trim().is_empty()));
+    let (Some(query), Some(db)) = (query, state.database.as_ref()) else {
+        return out;
+    };
+    let started = std::time::Instant::now();
+    let hits = match db.lock() {
+        Ok(guard) => crate::profiles::retrieval::search(guard.connection(), profile_id, &query, top_k),
+        Err(e) => Err(e.to_string()),
+    };
+    let hits = hits.unwrap_or_else(|e| {
+        log::warn!("Meeting document search failed: {e}");
+        Vec::new()
+    });
+    log::info!(
+        "Meeting retrieval: {} hit(s) in {} ms",
+        hits.len(),
+        started.elapsed().as_millis()
+    );
+    out.query = Some(query);
+    out.total_candidates = top_k;
+    out.filtered = top_k.saturating_sub(hits.len());
+    for (i, hit) in hits.iter().enumerate() {
+        out.chunks.push(RagChunkInfo {
+            source: hit.citation(),
+            chunk_index: i,
+            text: hit.text.clone(),
+            normalized_score: hit.score,
+            raw_score: hit.score,
+        });
+    }
+    if !hits.is_empty() {
+        let sections: Vec<(String, String)> =
+            hits.iter().map(|h| (h.citation(), h.text.clone())).collect();
+        out.context_text = crate::profiles::prompt::wrap_reference_context(&sections);
+    }
+    out
+}
+
+/// A provider instance for a consented fallback, with its key from the credential store.
+fn build_provider(
+    state: &AppState,
+    target: &crate::profiles::routing::ModelRef,
+) -> Result<Arc<tokio::sync::Mutex<Box<dyn LLMProvider>>>, String> {
+    let provider_type = ProviderType::from_str(&target.provider).map_err(|e| e.to_string())?;
+    let api_key = state
+        .credentials
+        .as_ref()
+        .and_then(|c| c.lock().ok())
+        .and_then(|c| c.get_key(&target.provider).ok().flatten());
+    if provider_type.requires_api_key() && api_key.as_deref().map_or(true, str::is_empty) {
+        return Err(format!("no credential stored for {}", provider_type.display_name()));
+    }
+    let config = ProviderConfig {
+        provider_type: target.provider.clone(),
+        api_key,
+        base_url: None,
+        auth_type: None,
+        auth_value: None,
+        auth_header: None,
+    };
+    let provider = create_provider(&config).map_err(|e| e.to_string())?;
+    Ok(Arc::new(tokio::sync::Mutex::new(provider)))
+}
+
 /// Search the indexed documents for `question_text` and the recent
 /// transcript (`transcript_excerpt`), keeping the `top_k` best chunks.
 async fn retrieve_rag(
@@ -802,6 +878,12 @@ pub async fn generate_assist(
     let (scope, epoch) = request_scope(&state, past_meeting_id.as_deref());
     let mut route = request_route(&state, &mode, &scope);
 
+    // A meeting profile owns its context: the Claude session path reads the
+    // global document index, so profile meetings use the stateless path.
+    let active_profile = state.active_profile.read().ok().and_then(|g| g.clone());
+    if active_profile.is_some() && matches!(route, Route::ClaudeSession(_)) {
+        route = Route::Stateless;
+    }
     if let Route::ClaudeSession(key) = &route {
         // The action's own prompt (or the mode template) and presets travel in
         // the user message; the scenario prompt is the session's system prompt.
@@ -919,18 +1001,26 @@ pub async fn generate_assist(
 
     // Resolve base system prompt: per-action config > active scenario > hardcoded template.
     // Active scenario is set by the frontend at meeting start based on the selected AI scenario.
-    let base_system_prompt = action_cfg
-        .as_ref()
-        .map(|c| c.system_prompt.clone())
-        .unwrap_or_else(|| {
-            // Check if the active scenario has a system prompt set
-            let scenario_prompt = state.active_scenario.read().ok().and_then(|s| {
-                if s.system_prompt.is_empty() { None } else { Some(s.system_prompt.clone()) }
-            });
-            scenario_prompt.unwrap_or_else(|| {
-                crate::intelligence::prompt_templates::get_system_prompt(&mode).to_string()
-            })
-        });
+    let scenario_prompt = state.active_scenario.read()
+        .map_err(|e| format!("Failed to read active scenario: {e}"))?
+        .system_prompt.clone();
+    let base_system_prompt = {
+        let resolved = crate::intelligence::prompt_templates::resolve_system_prompt(
+            &mode, action_cfg.as_ref(), Some(&scenario_prompt),
+        );
+        // A customised action prompt replaces the scenario; the meeting's own
+        // instructions still lead so they always reach the model.
+        match &active_profile {
+            Some(p)
+                if include_instructions
+                    && crate::intelligence::prompt_templates::is_scenario_guided(&mode)
+                    && !resolved.contains(&p.system_prompt) =>
+            {
+                format!("{}\n\n{}", p.system_prompt, resolved)
+            }
+            _ => resolved,
+        }
+    };
 
     // Append composed instructions (tone + format + length + custom text) to system prompt.
     // These are behavioral directives that belong in the system context, not as reference materials.
@@ -951,8 +1041,9 @@ pub async fn generate_assist(
         stateless_provider(&state, &app_handle, &route, &params).await?
     };
 
-    // Check for active Gemini context cache — only applies when Gemini is the provider
-    let active_cache_name = if provider_type == Some(ProviderType::Gemini) {
+    // Check for active Gemini context cache — only applies when Gemini is the provider.
+    // A profile meeting never uses it: the cache holds the global document set.
+    let active_cache_name = if provider_type == Some(ProviderType::Gemini) && active_profile.is_none() {
         state.gemini_cache
             .lock()
             .ok()
@@ -987,13 +1078,17 @@ pub async fn generate_assist(
             .filter(|q| !q.is_empty())
             .map(|q| q.to_string())
             .or_else(|| effective_question.as_ref().map(|q| q.text.clone()));
-        retrieve_rag(&state, question_text, tail_chars(&transcript_text, 500), rag_top_k).await?
+        match &active_profile {
+            Some(p) => retrieve_profile_context(&state, &p.profile.id, question_text, tail_chars(&transcript_text, 500), rag_top_k),
+            None => retrieve_rag(&state, question_text, tail_chars(&transcript_text, 500), rag_top_k).await?,
+        }
     } else {
         RagRetrieval::default()
     };
     // Nothing retrieved (no index yet, Ollama unreachable, or no match): include
     // the attached documents directly so the AI still has the meeting context.
-    if include_rag && active_cache_name.is_none() && rag.context_text.is_empty() {
+    // Never for a profile meeting: the global attachments belong to no meeting.
+    if active_profile.is_none() && include_rag && active_cache_name.is_none() && rag.context_text.is_empty() {
         if let Some(docs) = attached_documents_fallback(&state) {
             rag.context_text = docs;
         }
@@ -1001,6 +1096,26 @@ pub async fn generate_assist(
 
     let context_text = rag.context_text;
     let include_context = !context_text.is_empty();
+
+    // Consented automatic fallback, when this meeting's policy allows one.
+    let failover = match &active_profile {
+        Some(p) if p.has_failover() => {
+            let policy = p.policy.clone().expect("has_failover implies a policy");
+            let fallback_ref = policy.fallback.clone().expect("has_failover implies a fallback");
+            match build_provider(&state, &fallback_ref) {
+                Ok(provider) => Some(crate::intelligence::Failover {
+                    policy,
+                    book: p.book.clone(),
+                    fallback: Some(provider),
+                }),
+                Err(reason) => {
+                    log::warn!("Automatic fallback disabled for this request: {reason}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
 
     // Run the generation asynchronously
     let mode_clone = mode.clone();
@@ -1031,6 +1146,7 @@ pub async fn generate_assist(
         ResolvedScope::label_of(user_scope.as_ref()),
         app_handle,
         cancel_token,
+        failover,
     )
     .await;
 
@@ -1213,7 +1329,13 @@ pub async fn set_active_scenario(
 ) -> Result<(), String> {
     let mut scenario = state.active_scenario.write()
         .map_err(|e| format!("Failed to lock active scenario: {}", e))?;
-    scenario.system_prompt = system_prompt;
+    let profile_prompt = state.active_profile.read().ok()
+        .and_then(|p| p.as_ref().map(|a| a.system_prompt.clone()));
+    // A meeting profile's prompt is the meeting's prompt: the generic scenario
+    // pushed at meeting start must never replace it.
+    scenario.system_prompt = crate::intelligence::prompt_templates::scenario_prompt_for_meeting(
+        profile_prompt.as_deref(), system_prompt,
+    );
     scenario.summary_prompt = summary_prompt;
     scenario.question_detection_prompt = question_detection_prompt;
     log::info!("Active scenario updated (system_prompt len={}, summary_prompt len={})",

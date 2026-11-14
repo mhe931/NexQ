@@ -16,6 +16,102 @@ pub struct GeminiClient {
     client: reqwest::Client,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::gemini_cache::GeminiCacheClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_KEY: &str = "nexq-unit-test-key-not-a-credential";
+
+    async fn server(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let request = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let head_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0, "request ended before its headers");
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..head_end]);
+                let length = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap_or(0);
+                while raw.len() < head_end + length {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0, "request ended before its body");
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+                String::from_utf8(raw).unwrap()
+            }).await.unwrap()
+        });
+        (base, request)
+    }
+
+    fn assert_authentication(request: &str, request_line: &str) {
+        assert_eq!(request.lines().next(), Some(request_line));
+        assert!(request.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("x-goog-api-key") && value.trim() == TEST_KEY
+            })
+        }), "Gemini must authenticate with a header, not its URL");
+    }
+
+    #[tokio::test]
+    async fn list_models_keeps_credentials_out_of_urls() {
+        let (base, request) = server(r#"{"models":[{"name":"models/gemini-test","displayName":"Test Gemini","supportedGenerationMethods":["generateContent"],"inputTokenLimit":8192}]}"#).await;
+        let models = GeminiClient::new(TEST_KEY, Some(&base)).list_models().await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-test");
+        assert_authentication(&request.await.unwrap(), "GET /v1beta/models HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn cache_operations_keep_credentials_out_of_urls() {
+        let (base, request) = server(r#"{"name":"cachedContents/test","model":"models/gemini-test","expireTime":"2030-01-01T00:00:00Z","usageMetadata":{"totalTokenCount":42}}"#).await;
+        let entry = GeminiCacheClient::new(TEST_KEY, Some(&base))
+            .create("gemini-test", Some("Ground answers in supplied context."), "Test context", 60)
+            .await.unwrap();
+        assert_eq!(entry.name, "cachedContents/test");
+        assert_eq!(entry.total_token_count, 42);
+        let request = request.await.unwrap();
+        assert_authentication(&request, "POST /v1beta/cachedContents HTTP/1.1");
+        let body: serde_json::Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["model"], "models/gemini-test");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "Test context");
+
+        let (base, request) = server("{}").await;
+        GeminiCacheClient::new(TEST_KEY, Some(&base)).delete(&entry.name).await.unwrap();
+        assert_authentication(&request.await.unwrap(), "DELETE /v1beta/cachedContents/test HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_expose_api_keys() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = GeminiClient::new(TEST_KEY, Some(&base)).list_models().await.unwrap_err();
+        assert!(!error.to_string().contains(TEST_KEY), "transport error exposed a credential");
+        let error = GeminiCacheClient::new(TEST_KEY, Some(&base)).delete("cachedContents/test").await.unwrap_err();
+        assert!(!error.contains(TEST_KEY), "cache transport error exposed a credential");
+    }
+}
+
 impl GeminiClient {
     pub fn new(api_key: &str, base_url: Option<&str>) -> Self {
         Self {
@@ -67,12 +163,11 @@ impl LLMProvider for GeminiClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LLMError> {
-        let url = format!(
-            "{}/v1beta/models?key={}",
-            self.base_url, self.api_key
-        );
+        let url = format!("{}/v1beta/models", self.base_url);
 
-        let response = self.client.get(&url).send().await?;
+        let response = self.client.get(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -160,8 +255,8 @@ impl LLMProvider for GeminiClient {
         sink: Option<TokenSink>,
     ) -> Result<CompletionStats, LLMError> {
         let url = format!(
-            "{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
-            self.base_url, model, self.api_key
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, model
         );
         let start = Instant::now();
 
@@ -208,6 +303,7 @@ impl LLMProvider for GeminiClient {
             self
                 .client
                 .post(&url)
+                .header("x-goog-api-key", &self.api_key)
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send(),

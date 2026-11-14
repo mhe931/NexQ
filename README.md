@@ -138,7 +138,7 @@ Live two-party transcription, instant AI answers grounded in your own documents,
 3. **(Optional) Load context** such as your resume or notes in the Context panel.
 4. **Start a meeting** with <kbd>Ctrl</kbd>+<kbd>M</kbd>. NexQ captures system audio, so it works with Zoom, Teams, Meet, Discord, or anything else.
 
-Guides: [Getting started](docs/user-guide/getting-started.md) · [Choosing providers](docs/user-guide/ai-providers.md) · [Audio setup](docs/user-guide/audio-setup.md) · [Interview copilot](docs/user-guide/interview-copilot.md) · [Meeting detection](docs/user-guide/meeting-detection.md) · [Keyboard shortcuts](docs/user-guide/keyboard-shortcuts.md) · [Troubleshooting](docs/user-guide/troubleshooting.md)
+Guides: [Meetings: setup, presenter notes and Q&A](docs/user-guide/meeting-profiles.md) · [Getting started](docs/user-guide/getting-started.md) · [Choosing providers](docs/user-guide/ai-providers.md) · [Audio setup](docs/user-guide/audio-setup.md) · [Interview copilot](docs/user-guide/interview-copilot.md) · [Meeting detection](docs/user-guide/meeting-detection.md) · [Keyboard shortcuts](docs/user-guide/keyboard-shortcuts.md) · [Troubleshooting](docs/user-guide/troubleshooting.md)
 
 ## Supported providers
 

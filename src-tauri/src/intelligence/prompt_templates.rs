@@ -18,6 +18,94 @@ pub fn get_system_prompt(mode: &str) -> &'static str {
     }
 }
 
+/// Answer-producing modes a meeting's scenario/instructions should guide.
+/// Structured extraction modes (summaries, action items, ...) keep their own prompts.
+const SCENARIO_GUIDED_MODES: &[&str] = &["Assist", "WhatToSay", "AskQuestion", "FollowUp"];
+
+pub fn is_scenario_guided(mode: &str) -> bool {
+    SCENARIO_GUIDED_MODES.contains(&mode)
+}
+
+/// The scenario prompt to store at meeting start: an active meeting profile's
+/// prompt always wins over the generic scenario the frontend pushes.
+pub fn scenario_prompt_for_meeting(profile_prompt: Option<&str>, incoming: String) -> String {
+    match profile_prompt {
+        Some(p) if !p.is_empty() => p.to_owned(),
+        _ => incoming,
+    }
+}
+
+#[cfg(test)]
+mod meeting_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn a_meeting_profile_prompt_is_not_replaced_by_the_generic_scenario() {
+        assert_eq!(
+            scenario_prompt_for_meeting(Some("MEETING PROMPT"), "generic team meeting".into()),
+            "MEETING PROMPT"
+        );
+        assert_eq!(scenario_prompt_for_meeting(None, "generic".into()), "generic");
+        assert_eq!(scenario_prompt_for_meeting(Some(""), "generic".into()), "generic");
+    }
+}
+
+/// Precedence: a prompt the user customised for an action wins outright; for
+/// default prompts the selected scenario leads and the mode's template follows,
+/// so a custom meeting prompt is never silently replaced by the default one.
+pub fn resolve_system_prompt(
+    mode: &str,
+    action: Option<&super::action_config::ActionConfig>,
+    scenario: Option<&str>,
+) -> String {
+    let scenario = scenario.map(str::trim).filter(|s| !s.is_empty());
+    let guided = SCENARIO_GUIDED_MODES.contains(&mode);
+    match (action, scenario) {
+        (Some(a), _) if !a.is_default_prompt => a.system_prompt.clone(),
+        (Some(a), Some(s)) if guided => format!("{s}\n\n{}", a.system_prompt),
+        (Some(a), _) => a.system_prompt.clone(),
+        (None, Some(s)) if guided => format!("{s}\n\n{}", get_system_prompt(mode)),
+        (None, Some(s)) => s.to_owned(),
+        (None, None) => get_system_prompt(mode).to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod scenario_prompt_tests {
+    use super::*;
+    use crate::intelligence::action_config::AllActionConfigs;
+
+    #[test]
+    fn selected_scenario_guides_default_answers() {
+        let config = AllActionConfigs::default();
+        for mode in ["Assist", "WhatToSay", "AskQuestion", "FollowUp"] {
+            let prompt = resolve_system_prompt(
+                mode, config.actions.get(mode),
+                Some("REHEARSAL ONLY: discuss validation from the reviewer's perspective."),
+            );
+            assert!(prompt.contains("REHEARSAL ONLY"));
+            assert!(prompt.contains(get_system_prompt(mode)));
+        }
+    }
+
+    #[test]
+    fn custom_action_prompts_and_structured_outputs_keep_their_instructions() {
+        let mut config = AllActionConfigs::default();
+        let action = config.actions.get_mut("AskQuestion").unwrap();
+        action.system_prompt = "Evaluate the rehearsal; do not suggest an answer.".into();
+        action.is_default_prompt = false;
+        assert_eq!(
+            resolve_system_prompt("AskQuestion", Some(action), Some("Speak as Daniel")),
+            "Evaluate the rehearsal; do not suggest an answer.",
+        );
+        let action = config.actions.get("ActionItemsExtraction").unwrap();
+        assert_eq!(
+            resolve_system_prompt("ActionItemsExtraction", Some(action), Some("Speak as Daniel")),
+            action.system_prompt,
+        );
+    }
+}
+
 pub const ASSIST_PROMPT: &str = "\
 You are an AI meeting assistant. A question has been detected in the meeting. \
 Based on the transcript, uploaded documents, and available context, provide a clear, \

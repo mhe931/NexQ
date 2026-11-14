@@ -14,6 +14,7 @@ pub fn run(conn: &Connection) -> Result<(), rusqlite::Error> {
     v6_translation_schema(conn)?;
     v7_meeting_chat(conn)?;
     v8_segment_speaker_tag(conn)?;
+    crate::profiles::store::migrate(conn)?;
 
     log::info!("Database migrations completed successfully");
     Ok(())

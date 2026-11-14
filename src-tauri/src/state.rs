@@ -100,6 +100,12 @@ pub struct AppState {
     /// Active scenario prompts — pushed by the frontend at meeting start.
     /// Intelligence pipeline reads these for scenario-aware prompt assembly.
     pub active_scenario: Arc<RwLock<ActiveScenario>>,
+    /// The meeting profile in use: its prompt, retrieval scope and routing.
+    pub active_profile: Arc<RwLock<Option<crate::profiles::ActiveProfile>>>,
+    /// Measured latency per provider/model across meetings in this session.
+    pub latency_book: Arc<Mutex<crate::profiles::routing::LatencyBook>>,
+    /// Binding to the presentation being presented (PowerPoint COM worker, lazily started).
+    pub presentation: Arc<crate::presentation::service::PresentationService>,
     /// Recording info stored by stop_capture, consumed by end_meeting.
     /// This bridges the gap: frontend calls stopCapture() then endMeeting()
     /// in sequence; by the time end_meeting runs the recorder is stopped and
@@ -172,6 +178,9 @@ impl AppState {
             original_default_device: Arc::new(Mutex::new(None)),
             ipolicy_target_endpoint: Arc::new(Mutex::new(None)),
             active_scenario: Arc::new(RwLock::new(ActiveScenario::default())),
+            active_profile: Arc::new(RwLock::new(None)),
+            latency_book: Arc::new(Mutex::new(Default::default())),
+            presentation: Arc::new(crate::presentation::service::PresentationService::new()),
             pending_recording: Arc::new(Mutex::new(None)),
             openrouter_cache: Arc::new(Mutex::new(None)),
             tray_manager: Arc::new(Mutex::new(None)),

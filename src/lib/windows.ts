@@ -46,7 +46,9 @@ export async function showOverlayWindow(): Promise<void> {
   if (overlay) {
     await overlay.show().catch(() => {});
     await overlay.unminimize().catch(() => {});
-    await overlay.setFocus().catch(() => {});
+    // A profile meeting must not pull keyboard focus from PowerPoint, Teams or Zoom.
+    const { useMeetingStore } = await import("../stores/meetingStore");
+    if (!useMeetingStore.getState().profileId) await overlay.setFocus().catch(() => {});
   }
   if (!stealth) {
     await launcher?.hide().catch(() => {});
