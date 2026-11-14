@@ -24,6 +24,161 @@ Everything you need to build, run, test and debug NexQ locally. For how the code
 
 See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) if something is missing.
 
+### Windows source-only builds with Conda
+
+An existing user-scoped Conda environment can supply Node, Rust, CMake,
+Ninja and LLVM/libclang, where company policy permits those packages. It does
+not by itself supply the Microsoft C++ headers/libraries or Windows SDK.
+The default MSVC-based setup still needs a coherent MSVC C++ toolchain and SDK;
+LLD alone cannot provide missing libraries such as `kernel32.lib`.
+Conda's `vc14_runtime` and `ucrt` runtime packages are not a development SDK.
+
+Use an approved C++ developer shell and activate the existing environment:
+
+```powershell
+conda activate nexq
+# If libclang is installed here, override the repository's system-wide default:
+$env:LIBCLANG_PATH = Join-Path $env:CONDA_PREFIX 'Library\bin'
+npm run tauri -- build --no-bundle
+```
+
+Only set `LIBCLANG_PATH` to a directory containing the installed libclang DLL.
+The build command compiles the native release application without producing or
+running an installer. Its existing pre-build hook still stages ONNX Runtime
+1.24.2 and the MSVC runtime DLLs; acquire these dependencies only through an
+approved route. The staging script currently locates the MSVC redistributable
+through an installed Visual Studio toolchain. Do not substitute the older
+Windows System32 ONNX Runtime, disable TLS checks, or change download formats
+to evade policy.
+
+#### GNU alternative with approved Anaconda defaults
+
+When MSVC/Windows SDK development files are unavailable, use a separate
+user-scoped environment rather than replacing the existing `nexq` environment.
+Use defaults only where organizational policy and Anaconda's terms permit it.
+Verify the solver plan with `--dry-run` before creating the environment:
+
+```powershell
+conda create -n nexq-native --override-channels -c defaults `
+  rust-gnu=1.99.1 ucrt64-gcc-toolchain=14.2.0 `
+  clang=23.1.4 libclang=23.1.4 libclang13=23.1.4 `
+  cmake=4.3.4 ninja=1.13.2 onnxruntime-cpp=1.24.4=hbb2ed37_2_cpu
+```
+
+The `mingw64-gcc-toolchain` metapackage currently has unavailable defaults
+dependencies; `ucrt64-gcc-toolchain` supplies GCC/G++, binutils, MinGW headers
+and import libraries. `rust-gnu` supplies the matching Rust standard library.
+Compile and execute small C, C++ and Rust probes before using a new toolchain.
+
+The approved CPU runtime package provides ONNX Runtime **1.24.4**, not the
+upstream staging script's 1.24.2 archive. Its x64 DLL and API 24 entry point were
+verified locally; the locked `ort` crate still targets API 24. Do not silently
+substitute an older API or the Windows System32 runtime.
+
+From the project root, activate both environments, keeping GNU tools first:
+
+```powershell
+conda activate nexq
+conda activate --stack nexq-native
+$nativePrefix = $env:CONDA_PREFIX
+$nativeBin = Join-Path $nativePrefix 'Library\bin'
+$env:LIBCLANG_PATH = Join-Path $PWD 'src-tauri\target\native-tools'
+New-Item -ItemType Directory -Force $env:LIBCLANG_PATH | Out-Null
+Copy-Item (Join-Path $nativeBin 'libclang-13.dll') `
+  (Join-Path $env:LIBCLANG_PATH 'libclang.dll')
+$clangResources = (& clang -print-resource-dir).Trim()
+$mingwHeaders = Join-Path $nativePrefix 'Library\ucrt64\include'
+$env:BINDGEN_EXTRA_CLANG_ARGS = "--target=x86_64-pc-windows-gnu -resource-dir='$clangResources' -I'$mingwHeaders'"
+$env:CMAKE_GENERATOR = 'Ninja'
+$env:CMAKE_CXX_FLAGS = '-finput-charset=UTF-8'
+$env:CMAKE_PROJECT_INCLUDE = Join-Path $PWD 'src-tauri\cmake\windows-gnu.cmake'
+$env:CARGO_BUILD_JOBS = '2'
+```
+
+The build-local libclang alias preserves the installed DLL's bytes: Windows
+`clang-sys` recognizes `libclang.dll`, not Conda's `libclang-13.dll`. Bindgen
+also needs an explicit GNU target (libclang otherwise defaults to MSVC) and
+quoted paths, because its argument parser treats unquoted backslashes as
+escapes. The CMake override replaces whisper-rs-sys's MSVC-only `/utf-8`
+argument with GCC's equivalent; GCC/G++ remain the native compilers.
+The CMake project hook restores the `lib` prefix on ggml's GNU static
+archives so rustc can find them, without patching downloaded crate sources.
+After changing these native build settings, invalidate only the relevant
+generated package output with `cargo clean -p whisper-rs-sys` from `src-tauri`;
+whisper-rs-sys does not track all CMake environment variables itself.
+
+Stage dependencies **from the approved installed packages**, not a download
+workaround. Verify package provenance, per-file metadata hashes and x64
+architecture first; preserve any existing staged files whose provenance differs.
+For the exact ONNX package above:
+
+```powershell
+$ortSource = Join-Path $nativeBin 'onnxruntime_conda.dll'
+if ((Get-FileHash $ortSource -Algorithm SHA256).Hash -ne `
+    '5b54bcc46dbcbc368d4d10527dc17a5b1ddd7c1e8dfa4828bc29fbedef534599') {
+  throw 'ONNX Runtime does not match the approved package'
+}
+$ortDir = Join-Path $PWD 'src-tauri\ort'
+New-Item -ItemType Directory -Force $ortDir | Out-Null
+Copy-Item $ortSource (Join-Path $ortDir 'onnxruntime.dll')
+foreach ($dll in @('msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+  Copy-Item (Join-Path $nativeBin $dll) (Join-Path $ortDir $dll)
+}
+Set-Content (Join-Path $ortDir '.version') '1.24.4' -Encoding Ascii
+```
+
+The VC runtime DLLs come from defaults `vc14_runtime` 14.44.35208. No ONNX
+headers/import library are required by the app's dynamic-loading configuration.
+The Conda build overlay deliberately skips the original network/Visual Studio
+staging hook; Tauri still requires and copies the staged resource files:
+
+```powershell
+Push-Location src-tauri
+cargo check --locked --offline --target x86_64-pc-windows-gnu
+Pop-Location
+npm run tauri -- build --debug --no-bundle --target x86_64-pc-windows-gnu `
+  --config src-tauri\tauri.conda.conf.json -- --locked --offline
+```
+
+This builds the native application with embedded frontend assets, not an
+installer or a browser preview. Omit `--debug` for an optimized release build,
+which is the launcher's default profile.
+The GNU build embeds the same Common Controls v6 manifest using `windres`;
+MSVC retains its existing linker flags. It also prioritizes the active GCC
+C++ import library over Rust's bundled MinGW copy (which has a different
+`mbstate_t` ABI), and disables implicit cdylib auto-exports to stay within
+Windows' export ordinal limit. Explicit exports are retained.
+
+Quit NexQ from its system-tray menu before rebuilding the same profile.
+Closing its window only hides it. Windows locks loaded runtime DLLs, so
+tauri-build's resource/WebView2 loader copies otherwise fail with
+`The process cannot access the file because it is being used by another process.
+(os error 32)`. A separate release build can compile while the debug app runs.
+
+After a successful GNU release source build, launch the local output:
+
+```powershell
+.\scripts\start-nexq.ps1
+```
+
+The launcher uses `nexq-native` so MinGW runtime DLLs are on `PATH`, and performs
+no downloads or installation. It reports an error if the local build is absent.
+It defaults to `src-tauri\target\x86_64-pc-windows-gnu\release\nexq.exe`;
+pass `-Configuration debug` to use the debug profile.
+Quit the existing instance before switching profiles: NexQ's single-instance
+handler otherwise focuses the old app instead of loading the new executable.
+The launcher explicitly refuses a switch while this project's other profile runs.
+Its default Conda location is
+`$HOME\Miniforge3\Scripts\conda.exe`; pass `-CondaExe` for another existing
+installation. The launcher does not override PowerShell execution policy.
+
+Configure cloud providers in **Settings > LLM Providers**. Enter keys only in
+the app's masked fields, then use **Test Connection**, **Load Models**, and
+**Set as Active Provider**. Windows stores keys in the current user's Credential
+Manager. A ChatGPT subscription does not include OpenAI API access.
+Gemini model, streaming and cache requests authenticate with `x-goog-api-key`,
+not URL query parameters, so transport-error URLs do not contain the API key.
+
 ## First run
 
 ```bash

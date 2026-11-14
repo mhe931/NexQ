@@ -57,6 +57,13 @@ docs/superpowers
 # Local tool output and notes
 .planning/
 .playwright-mcp/
+# Local, personal or generated content must never reach the public repository
+/files/
+.nexq-local/
+*.local.json
+*.local.md
+meeting-data/
+defense/
 
 # Logs
 *.log
