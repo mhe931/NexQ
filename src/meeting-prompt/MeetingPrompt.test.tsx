@@ -25,6 +25,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 import { MeetingPrompt, MeetingPromptWindow } from "./MeetingPrompt";
 import { useScenarioStore } from "../stores/scenarioStore";
 import type { MeetingPromptInfo, ScenarioTemplate } from "../lib/types";
+import type { ProfileSummary } from "../lib/profileTypes";
 
 const boardReview = {
   id: "custom_1",
@@ -153,6 +154,82 @@ describe("MeetingPrompt", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(onDismiss).not.toHaveBeenCalled();
+  });
+});
+
+describe("MeetingPrompt saved meetings", () => {
+  const profile = (id: string, over: Partial<ProfileSummary> = {}): ProfileSummary => ({
+    id, name: id, meetingType: "general", platform: "zoom", meetingDate: null, primaryProvider: "gemini", primaryModel: "m",
+    documentCount: 0, sessionCount: 0, updatedAt: "2026-01-01T00:00:00Z", lastUsedAt: null, presentationName: null, ...over,
+  });
+  const saved = [
+    profile("Old interview", { meetingType: "interview", lastUsedAt: "2026-02-01T00:00:00Z" }),
+    profile("Thesis defence", { meetingType: "presentation_qa", presentationName: "Thesis.pptx", lastUsedAt: "2026-04-01T00:00:00Z" }),
+    profile("Lab talk", { meetingType: "presentation_qa", lastUsedAt: "2026-03-01T00:00:00Z" }),
+  ];
+
+  it("lists recent meetings most recent first, and nothing starts until Start is pressed", () => {
+    const onStart = vi.fn();
+    const onPanelToggle = vi.fn();
+    render(<MeetingPrompt info={info()} profiles={saved} onStart={onStart} onDismiss={() => {}} onPanelToggle={onPanelToggle} />);
+    expect(onStart).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Recent meetings/ }));
+    expect(onPanelToggle).toHaveBeenLastCalledWith(true);
+    const rows = screen.getAllByRole("radio");
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining("Thesis defence"),
+      expect.stringContaining("Lab talk"),
+      expect.stringContaining("Old interview"),
+    ]);
+    expect(rows[0]).toHaveTextContent("Presentation + Questions · Thesis.pptx");
+    fireEvent.click(rows[2]);
+    expect(onStart).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Start NexQ with Old interview" }));
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(onStart).toHaveBeenCalledWith(expect.any(String), "interview", { kind: "profile", profileId: "Old interview" });
+  });
+
+  it("Presentation + Q&A preselects the latest such meeting and starts exactly that one", () => {
+    const onStart = vi.fn();
+    render(<MeetingPrompt info={info({ app: "google_meet", app_name: "Google Meet" })} profiles={saved} onStart={onStart} onDismiss={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Presentation + Q&A" }));
+    const rows = screen.getAllByRole("radio");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByText("Old interview")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Start NexQ with Thesis defence" }));
+    expect(onStart).toHaveBeenCalledWith(expect.any(String), "interview", { kind: "profile", profileId: "Thesis defence" });
+  });
+
+  it("without a saved Presentation + Q&A it offers a new one named after the call and never creates it by itself", () => {
+    const onStart = vi.fn();
+    render(<MeetingPrompt info={info({ app: "google_meet", app_name: "Google Meet", title: "Defence" })} profiles={[]} onStart={onStart} onDismiss={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Presentation + Q&A" }));
+    expect(screen.getByText("No Presentation + Q&A meetings yet.")).toBeInTheDocument();
+    expect(onStart).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Set up Presentation \+ Q&A/ }));
+    expect(onStart).toHaveBeenCalledWith(expect.any(String), "interview", { kind: "new_presentation_qa", name: "Defence", platform: "meet" });
+  });
+
+  it("the classic Start still starts a plain meeting with two arguments only", () => {
+    const onStart = vi.fn();
+    render(<MeetingPrompt info={info()} profiles={saved} onStart={onStart} onDismiss={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /Start NexQ/ }));
+    expect(onStart.mock.calls[0]).toHaveLength(2);
+  });
+
+  it("closing the panel forgets the choice and pauses the dismiss timer while it is open", () => {
+    vi.useFakeTimers();
+    const onDismiss = vi.fn();
+    render(<MeetingPrompt info={info({}, 2)} profiles={saved} onStart={() => {}} onDismiss={onDismiss} />);
+    fireEvent.click(screen.getByRole("button", { name: /Recent meetings/ }));
+    act(() => vi.advanceTimersByTime(5000));
+    expect(onDismiss).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByRole("radio")[0]);
+    fireEvent.click(screen.getByRole("button", { name: /Recent meetings/ }));
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+    expect(screen.getByRole("button", { name: /Start NexQ/ })).toHaveAccessibleName("Start NexQ");
+    vi.useRealTimers();
   });
 });
 

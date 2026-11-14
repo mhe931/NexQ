@@ -7,7 +7,7 @@ import { BindStatusChip } from "./BindPresentation";
 import { palette } from "./theme";
 import { usePresenterStore } from "../stores/presenterStore";
 import { DISCONNECTED, makeProfile, profileIpcMock as ipc, resetProfileIpcMock } from "../test/profileFixtures";
-import type { BindingStatus, PresentationTarget } from "../lib/profileTypes";
+import type { BindingStatus, LaunchReport, PresentationInfo, PresentationTarget } from "../lib/profileTypes";
 
 const colors = palette(makeProfile().environment.teleprompter);
 
@@ -25,9 +25,33 @@ const CLOSED: BindingStatus = {
 };
 
 const TARGETS: PresentationTarget[] = [
-  { id: "ppt-1", kind: "powerpoint", title: "Thesis.pptx", detail: "C:\\Decks\\Thesis.pptx", supportsControl: true, slideshowRunning: true, slideCount: 12, currentSlide: 3 },
-  { id: "gs-1", kind: "google_slides", title: "Quarterly deck", detail: "Quarterly deck - Google Slides - Chrome", supportsControl: false, slideshowRunning: false, slideCount: null, currentSlide: null },
+  { id: "ppt-1", kind: "powerpoint", title: "Thesis.pptx", detail: "C:\\Decks\\Thesis.pptx", supportsControl: true, slideshowRunning: true, slideCount: 12, currentSlide: 3, protectedView: false, note: null },
+  { id: "gs-1", kind: "google_slides", title: "Quarterly deck", detail: "Quarterly deck - Google Slides - Chrome", supportsControl: false, slideshowRunning: false, slideCount: null, currentSlide: null, protectedView: false, note: null },
 ];
+
+const INFO: PresentationInfo = {
+  documentId: "d1", name: "Thesis.pptx", path: "C:\\Decks\\Thesis.pptx", slideCount: 12, indexedAt: "2026-01-01T00:00:00Z",
+  stale: false, sourceMissing: false, origin: "local",
+};
+
+const REPORT_OK: LaunchReport = {
+  stages: [
+    { id: "imported", label: "Imported and indexed in NexQ", state: "done", detail: "12 slides are imported and indexed in NexQ." },
+    { id: "launched", label: "Presentation file opened", state: "done", detail: "Asked PowerPoint to open C:\\Decks\\Thesis.pptx." },
+    { id: "app_detected", label: "Presentation application detected", state: "done", detail: "PowerPoint answered to automation." },
+    { id: "bound", label: "NexQ bound to this presentation", state: "done", detail: "Bound to C:\\Decks\\Thesis.pptx." },
+    { id: "navigation", label: "Slide navigation verified", state: "done", detail: "PowerPoint confirmed slide 1." },
+  ],
+  status: { ...CONNECTED, targetSlide: 1, slideshowRunning: false },
+  sourcePath: "C:\\Decks\\Thesis.pptx", sourceMoved: false, launched: true, candidates: [], summary: "Connected to Thesis.pptx and slide navigation verified.",
+};
+
+const REPORT_WAITING: LaunchReport = {
+  ...REPORT_OK,
+  stages: REPORT_OK.stages.map((s) => (s.id === "navigation" ? { ...s, state: "skipped", detail: "Protected View: start the slide show." } : s)),
+  status: { ...CONNECTED, state: "waiting", targetSlide: null, slideshowRunning: false, message: "This presentation is open in Protected View. Start the slide show and NexQ will follow it." },
+  summary: "Bound to Thesis.pptx; start the slide show.",
+};
 
 function show(binding: BindingStatus = DISCONNECTED) {
   usePresenterStore.setState({ profile: makeProfile(), binding });
@@ -113,15 +137,87 @@ describe("bind dialog: choosing a presentation", () => {
     expect(within(list).getByText(/Quarterly deck - Google Slides - Chrome/)).toBeInTheDocument();
   });
 
-  it("explains what to do when nothing is open and can refresh", async () => {
+  it("never leaves a bare 'not found': it says why, offers retry and lists next steps", async () => {
     ipc.presentTargets.mockResolvedValueOnce([]);
     show();
     fireEvent.click(chip());
-    expect(await screen.findByText("No presentations found. Open your deck in PowerPoint (desktop) or Google Slides in a browser.")).toBeInTheDocument();
+    expect(await screen.findByText("No open presentation found.")).toBeInTheDocument();
+    expect(await screen.findByText("PowerPoint is not running.")).toBeInTheDocument();
+    expect(screen.getByText(/Protected View; NexQ follows its slide show/)).toBeInTheDocument();
+    expect(screen.getByText(/Sharing a browser tab is not the same as sharing a PowerPoint slide show/)).toBeInTheDocument();
+    expect(screen.queryByText(/^No presentations found/)).toBeNull();
     ipc.presentTargets.mockResolvedValueOnce(TARGETS);
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(await screen.findByRole("radiogroup", { name: "Open presentations" })).toBeInTheDocument();
     expect(ipc.presentTargets).toHaveBeenCalledTimes(2);
+  });
+
+  it("with an imported presentation and nothing open it names the deck and offers Open, Bind to open and Refresh", async () => {
+    ipc.presentTargets.mockResolvedValue([]);
+    ipc.presentationInfo.mockResolvedValue(INFO);
+    show();
+    fireEvent.click(chip());
+    const panel = await screen.findByRole("region", { name: "This meeting's presentation" });
+    expect(panel).toHaveTextContent("Thesis.pptx");
+    expect(panel).toHaveTextContent("C:\\Decks\\Thesis.pptx");
+    expect(panel).toHaveTextContent("12 slides imported and indexed in NexQ");
+    expect(within(panel).getByRole("button", { name: /Open presentation/ })).toBeEnabled();
+    expect(within(panel).getByRole("button", { name: "Bind to open presentation" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeInTheDocument();
+    expect(await screen.findByText("“Thesis.pptx” is not open in a presentation app.")).toBeInTheDocument();
+    expect(usePresenterStore.getState().binding.state).toBe("disconnected");
+  });
+
+  it("Open presentation runs the launch, lists steps A to E and shows CONNECTED only for a connected result", async () => {
+    ipc.presentTargets.mockResolvedValue([]);
+    ipc.presentationInfo.mockResolvedValue(INFO);
+    ipc.presentOpenAndBind.mockResolvedValue(REPORT_OK);
+    show();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: /Open presentation/ }));
+    await waitFor(() => expect(ipc.presentOpenAndBind).toHaveBeenCalledWith("p1", true));
+    const steps = await screen.findByRole("list", { name: "Presentation launch steps" });
+    expect(within(steps).getAllByRole("listitem")).toHaveLength(5);
+    expect(steps).toHaveTextContent("A. Imported and indexed in NexQ");
+    expect(steps).toHaveTextContent("E. Slide navigation verified");
+    expect(await within(dialog()).findByRole("status", { name: "Connection state" })).toHaveTextContent("CONNECTED");
+  });
+
+  it("a Protected View deck that is bound but not presenting is WAITING, never CONNECTED, and navigation is not applicable", async () => {
+    ipc.presentTargets.mockResolvedValue([]);
+    ipc.presentationInfo.mockResolvedValue(INFO);
+    ipc.presentOpenAndBind.mockResolvedValue(REPORT_WAITING);
+    show();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: /Open presentation/ }));
+    const state = await within(dialog()).findByRole("status", { name: "Connection state" });
+    expect(state).toHaveTextContent("WAITING FOR SLIDE SHOW");
+    expect(state).not.toHaveTextContent(/^CONNECTED/);
+    expect(dialog()).toHaveTextContent(/not CONNECTED yet/);
+    expect(screen.getByRole("list", { name: "Presentation launch steps" })).toHaveTextContent("E. Slide navigation verifiedNot applicable");
+    expect(within(dialog()).getByRole("button", { name: "Test navigation" })).toBeDisabled();
+  });
+
+  it("Bind to open presentation never launches", async () => {
+    ipc.presentTargets.mockResolvedValue([]);
+    ipc.presentationInfo.mockResolvedValue(INFO);
+    ipc.presentOpenAndBind.mockResolvedValue({ ...REPORT_OK, launched: false, status: { ...CLOSED, message: "C:\\Decks\\Thesis.pptx is not open in PowerPoint." } });
+    show();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Bind to open presentation" }));
+    await waitFor(() => expect(ipc.presentOpenAndBind).toHaveBeenCalledWith("p1", false));
+    expect(ipc.presentOpenAndBind).not.toHaveBeenCalledWith("p1", true);
+  });
+
+  it("lists a Protected View deck with its limitation", async () => {
+    ipc.presentTargets.mockResolvedValue([
+      { ...TARGETS[0], protectedView: true, slideshowRunning: false, currentSlide: null, note: "Opened in Protected View (a downloaded or e-mailed file)." },
+    ]);
+    show();
+    fireEvent.click(chip());
+    const list = await screen.findByRole("radiogroup", { name: "Open presentations" });
+    expect(list).toHaveTextContent("Protected View");
+    expect(list).toHaveTextContent("downloaded or e-mailed file");
   });
 
   it("shows a listing failure and a bind failure as alerts", async () => {

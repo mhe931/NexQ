@@ -8,8 +8,9 @@ use std::mem::ManuallyDrop;
 
 use windows::core::{Interface, BSTR, GUID, PCWSTR};
 use windows::Win32::System::Com::{
-    CLSIDFromProgID, CoInitializeEx, CoUninitialize, IDispatch, COINIT_APARTMENTTHREADED, DISPATCH_FLAGS,
-    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS, EXCEPINFO,
+    CLSIDFromProgID, CoInitializeEx, CoTaskMemFree, CoUninitialize, CreateBindCtx, GetRunningObjectTable, IDispatch,
+    IMoniker, IRunningObjectTable, COINIT_APARTMENTTHREADED, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
+    DISPPARAMS, EXCEPINFO,
 };
 use windows::Win32::System::Ole::GetActiveObject;
 use windows::Win32::System::Variant::{
@@ -240,6 +241,78 @@ impl Dispatch {
             .into_dispatch()
             .ok_or_else(|| ComError::Other("collection item is not an object".into()))
     }
+}
+
+/// Whether `prog_id` is registered on this machine (the application is installed).
+pub fn is_registered(prog_id: &str) -> bool {
+    let wide: Vec<u16> = prog_id.encode_utf16().chain(Some(0)).collect();
+    unsafe { CLSIDFromProgID(PCWSTR(wide.as_ptr())) }.is_ok()
+}
+
+fn each_running_moniker(mut visit: impl FnMut(&IRunningObjectTable, &IMoniker, String)) {
+    let Ok(rot) = (unsafe { GetRunningObjectTable(0) }) else { return };
+    let Ok(monikers) = (unsafe { rot.EnumRunning() }) else { return };
+    let Ok(ctx) = (unsafe { CreateBindCtx(0) }) else { return };
+    loop {
+        let mut slot: [Option<IMoniker>; 1] = [None];
+        let mut fetched = 0u32;
+        let hr = unsafe { monikers.Next(&mut slot, Some(&mut fetched)) };
+        if hr.is_err() || fetched == 0 {
+            break;
+        }
+        let Some(moniker) = slot[0].take() else { break };
+        let Ok(raw) = (unsafe { moniker.GetDisplayName(&ctx, None::<&IMoniker>) }) else { continue };
+        let name = unsafe { raw.to_string() }.unwrap_or_default();
+        unsafe { CoTaskMemFree(Some(raw.0 as *const _)) };
+        visit(&rot, &moniker, name);
+    }
+}
+
+/// Display names of everything in the Running Object Table (diagnostics).
+pub fn running_object_names() -> Vec<String> {
+    let mut names = Vec::new();
+    each_running_moniker(|_, _, name| names.push(name));
+    names
+}
+
+/// Automation objects in the Running Object Table whose display name `wanted`
+/// accepts (for example open `.pptx` documents). This reaches PowerPoint
+/// instances that `GetActiveObject` does not return (it yields only one).
+pub fn running_objects(wanted: impl Fn(&str) -> bool) -> Vec<(String, Dispatch)> {
+    let mut out = Vec::new();
+    each_running_moniker(|rot, moniker, name| {
+        if !wanted(&name) {
+            return;
+        }
+        if let Ok(unknown) = unsafe { rot.GetObject(moniker) } {
+            if let Ok(dispatch) = unknown.cast::<IDispatch>() {
+                out.push((name, Dispatch(dispatch)));
+            }
+        }
+    });
+    out
+}
+
+/// Starts `file` with `parameters` through the shell (as a double click would).
+/// Returns false when Windows refuses.
+pub fn shell_open(file: &str, parameters: Option<&str>) -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let file: Vec<u16> = file.encode_utf16().chain(Some(0)).collect();
+    let params: Option<Vec<u16>> = parameters.map(|p| p.encode_utf16().chain(Some(0)).collect());
+    let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            params.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute reports success with a value greater than 32.
+    result.0 as isize > 32
 }
 
 /// The running instance of `prog_id` (for example `PowerPoint.Application`),

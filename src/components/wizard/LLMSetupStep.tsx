@@ -21,6 +21,7 @@ import {
   Sparkles,
   Zap,
   Brain,
+  Github,
   RefreshCw,
   Terminal,
 } from "lucide-react";
@@ -65,6 +66,14 @@ const CLOUD_PROVIDERS: ProviderCard[] = [
     description: "Ultra-fast inference",
     icon: <Zap className="h-5 w-5" />,
     requiresKey: true,
+  },
+  {
+    // No key: the official Copilot CLI holds the sign-in. Chats go to GitHub.
+    type: "github_copilot",
+    label: "GitHub Copilot",
+    description: "Your Copilot plan via the official CLI",
+    icon: <Github className="h-5 w-5" />,
+    requiresKey: false,
   },
 ];
 
@@ -363,6 +372,17 @@ export function LLMSetupStep({
             ))}
           </div>
         </div>
+
+        {/* GitHub Copilot: needs the official CLI and a Copilot plan, no key */}
+        {selectedProvider === "github_copilot" && (
+          <div className="space-y-1 rounded-xl border border-border/30 bg-secondary/20 px-5 py-4">
+            <p className="text-xs text-muted-foreground">
+              Requires an active GitHub Copilot plan and the official Copilot CLI, signed in once with{" "}
+              <code className="font-mono">copilot login</code> in a terminal. NexQ never sees your GitHub credentials.
+              Test Connection shows what the CLI reports. Your prompts and meeting context are sent to GitHub Copilot.
+            </p>
+          </div>
+        )}
 
         {/* API Key Input */}
         {requiresApiKey && (

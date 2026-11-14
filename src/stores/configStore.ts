@@ -132,7 +132,8 @@ async function storedProviderConfig(provider: LLMProviderType): Promise<string> 
       const token = await getApiKey("custom").catch(() => null);
       if (token) config.auth_value = token;
     }
-  } else if (provider !== "claude_cli") {
+  } else if (provider !== "claude_cli" && provider !== "github_copilot") {
+    // Claude CLI and GitHub Copilot hold their sign-in in their own CLI: no key here.
     const key = await getApiKey(provider).catch(() => null);
     if (key) config.api_key = key;
   }
@@ -148,6 +149,8 @@ export const DEFAULT_MEETING_DETECTION: MeetingDetectionConfig = {
   webex: true,
   slack: false,
   discord: false,
+  jitsi: true,
+  whereby: true,
   auto_dismiss_secs: 60,
   default_scenario: "team_meeting",
   check_interval_secs: 3,
@@ -549,7 +552,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
     const model =
       provider === "claude_cli"
         ? useConfigStore.getState().claudeCliConfig.fast_model
-        : options.model || before.lastModelByProvider[provider] || "";
+        : options.model || before.lastModelByProvider[provider] || (provider === "github_copilot" ? "auto" : "");
     // Without a model, Claude's Fast model must not carry over to the new provider.
     if (model || before.llmProvider === "claude_cli") {
       try {

@@ -14,9 +14,11 @@ import type {
   DocumentRole,
   LatencySnapshot,
   BindingStatus,
+  LaunchReport,
   NavResult,
   NotesBlock,
   NotesImportResult,
+  PresentationDiagnostics,
   PresentationImport,
   PresentationInfo,
   PresentationSettings,
@@ -68,6 +70,10 @@ export const profileIpc = {
   presentStatus: (expectedSlide: number | null) => invoke<BindingStatus>("present_status", { expectedSlide }),
   presentGoto: (slide: number) => invoke<NavResult>("present_goto", { slide }),
   presentTestNavigation: () => invoke<NavResult>("present_test_navigation"),
+  presentDiagnose: () => invoke<PresentationDiagnostics>("present_diagnose"),
+  /** `launch: false` only binds to an already open copy; `true` also opens the file when it is not open. */
+  presentOpenAndBind: (profileId: string, launch: boolean) =>
+    invoke<LaunchReport>("present_open_and_bind", { profileId, launch }),
 
   // Presentation and external speaker-notes sources
   addPresentation: (profileId: string, path: string) =>

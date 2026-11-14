@@ -11,7 +11,10 @@
 pub mod browsers;
 #[cfg(windows)]
 pub mod com;
+pub mod diagnostics;
+pub mod launch;
 pub mod powerpoint;
+pub mod pp_windows;
 pub mod service;
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +34,28 @@ pub struct Target {
     pub slideshow_running: bool,
     pub slide_count: Option<u32>,
     pub current_slide: Option<u32>,
+    /// PowerPoint opened the file in Protected View (a downloaded or e-mailed file).
+    /// Such a presentation is not in PowerPoint's `Presentations` collection.
+    pub protected_view: bool,
+    /// What NexQ can and cannot do with exactly this target, in plain words.
+    pub note: Option<String>,
+}
+
+impl Target {
+    pub fn new(id: impl Into<String>, kind: TargetKind, title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            title: title.into(),
+            detail: detail.into(),
+            supports_control: true,
+            slideshow_running: false,
+            slide_count: None,
+            current_slide: None,
+            protected_view: false,
+            note: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +65,9 @@ pub enum ConnectionState {
     Disconnected,
     Unsupported,
     OutOfSync,
+    /// Bound to the right presentation, but it cannot report or change its slide yet
+    /// (Protected View before the slide show starts). Never shown as connected.
+    Waiting,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -91,13 +119,15 @@ pub enum BackendError {
     Gone(String),
     /// The application is installed/running but did not answer in time or refused.
     Busy(String),
+    /// The right presentation is there but cannot be read or moved yet.
+    NotReady(String),
     Failed(String),
 }
 
 impl BackendError {
     pub fn message(&self) -> &str {
         match self {
-            Self::Gone(m) | Self::Busy(m) | Self::Failed(m) => m,
+            Self::Gone(m) | Self::Busy(m) | Self::NotReady(m) | Self::Failed(m) => m,
         }
     }
 }
@@ -108,6 +138,39 @@ pub trait Backend {
     fn position(&mut self, id: &str) -> Result<Position, BackendError>;
     /// Moves exactly the target `id` to `slide` (1-based) and returns what it reports.
     fn goto(&mut self, id: &str, slide: u32) -> Result<Position, BackendError>;
+    /// Why targets are or are not found (processes, windows, automation reachability).
+    fn diagnose(&mut self) -> diagnostics::Diagnostics {
+        diagnostics::Diagnostics::default()
+    }
+    /// Starts the presentation application with this file. Never starts a slide show.
+    fn launch_file(&mut self, _path: &std::path::Path) -> Result<(), BackendError> {
+        Err(BackendError::Failed("Opening a presentation from NexQ is only available on Windows.".into()))
+    }
+    /// Opens a web presentation in the default browser.
+    fn launch_url(&mut self, _url: &str) -> Result<(), BackendError> {
+        Err(BackendError::Failed("Opening a web presentation from NexQ is only available on Windows.".into()))
+    }
+}
+
+impl Backend for Box<dyn Backend> {
+    fn list(&mut self) -> Result<Vec<Target>, BackendError> {
+        (**self).list()
+    }
+    fn position(&mut self, id: &str) -> Result<Position, BackendError> {
+        (**self).position(id)
+    }
+    fn goto(&mut self, id: &str, slide: u32) -> Result<Position, BackendError> {
+        (**self).goto(id, slide)
+    }
+    fn diagnose(&mut self) -> diagnostics::Diagnostics {
+        (**self).diagnose()
+    }
+    fn launch_file(&mut self, path: &std::path::Path) -> Result<(), BackendError> {
+        (**self).launch_file(path)
+    }
+    fn launch_url(&mut self, url: &str) -> Result<(), BackendError> {
+        (**self).launch_url(url)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +179,7 @@ struct Bound {
     title: String,
     kind: TargetKind,
     controllable: bool,
+    note: Option<String>,
 }
 
 pub struct Controller<B: Backend> {
@@ -130,6 +194,18 @@ impl<B: Backend> Controller<B> {
 
     pub fn targets(&mut self) -> Result<Vec<Target>, String> {
         self.backend.list().map_err(|e| e.message().to_string())
+    }
+
+    pub fn diagnose(&mut self) -> diagnostics::Diagnostics {
+        self.backend.diagnose()
+    }
+
+    pub fn launch_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.backend.launch_file(path).map_err(|e| e.message().to_string())
+    }
+
+    pub fn launch_url(&mut self, url: &str) -> Result<(), String> {
+        self.backend.launch_url(url).map_err(|e| e.message().to_string())
     }
 
     fn status_for(&self, bound: &Bound, position: Result<Position, BackendError>, expected: Option<u32>) -> BindingStatus {
@@ -160,6 +236,7 @@ impl<B: Backend> Controller<B> {
                     if p.in_show { "Connected (slide show running)".into() } else { "Connected (editing view)".into() },
                 ),
             },
+            Err(BackendError::NotReady(m)) => base(ConnectionState::Waiting, None, None, false, m),
             Err(e) => base(ConnectionState::Disconnected, None, None, false, e.message().to_string()),
         }
     }
@@ -176,6 +253,7 @@ impl<B: Backend> Controller<B> {
             title: target.title.clone(),
             kind: target.kind,
             controllable: target.supports_control,
+            note: target.note.clone(),
         };
         self.bound = Some(bound.clone());
         if !bound.controllable {
@@ -260,6 +338,30 @@ impl<B: Backend> Controller<B> {
         self.goto(away)?;
         self.goto(start.slide)
     }
+
+    /// Proof that navigation really reaches the presentation, using a read-back.
+    /// While a slide show runs (an audience may be watching) it asks for the slide the
+    /// presentation is already on, so nothing visibly changes. In an editing view
+    /// (nobody watching) it moves one slide away and back. Returns the confirmed slide and
+    /// whether the presentation actually moved during the proof.
+    pub fn verify_navigation(&mut self) -> Result<(u32, bool), String> {
+        let bound = self.bound.clone().ok_or("No presentation is bound.")?;
+        if !bound.controllable {
+            return Err(unsupported(&bound).message);
+        }
+        let now = self.backend.position(&bound.id).map_err(|e| e.message().to_string())?;
+        if now.slide == 0 {
+            return Err("The presentation did not report its current slide.".into());
+        }
+        if !now.in_show && now.slide_count >= 2 {
+            let away = if now.slide < now.slide_count { now.slide + 1 } else { now.slide - 1 };
+            self.goto(away)?;
+            let back = self.goto(now.slide)?;
+            return Ok((back.confirmed_slide, true));
+        }
+        let confirmed = self.goto(now.slide)?;
+        Ok((confirmed.confirmed_slide, false))
+    }
 }
 
 fn unsupported(bound: &Bound) -> BindingStatus {
@@ -271,8 +373,9 @@ fn unsupported(bound: &Bound) -> BindingStatus {
         target_slide: None,
         slide_count: None,
         slideshow_running: false,
-        message: match bound.kind {
-            TargetKind::GoogleSlides => "Google Slides cannot be controlled from NexQ (Google offers no slideshow-control API). NexQ notes follow your manual selection; change the slide in the browser yourself.".into(),
+        message: match (&bound.note, bound.kind) {
+            (Some(note), _) => note.clone(),
+            (None, TargetKind::GoogleSlides) => "Google Slides cannot be controlled from NexQ (Google offers no slideshow-control API). NexQ notes follow your manual selection; change the slide in the browser yourself.".into(),
             _ => "NexQ can list this window but cannot control it. Use manual slide selection.".into(),
         },
     }
@@ -296,10 +399,7 @@ mod tests {
     }
 
     fn pp(id: &str, title: &str) -> Target {
-        Target {
-            id: id.into(), kind: TargetKind::Powerpoint, title: title.into(), detail: String::new(),
-            supports_control: true, slideshow_running: false, slide_count: None, current_slide: None,
-        }
+        Target::new(id, TargetKind::Powerpoint, title, "")
     }
 
     impl Fake {
@@ -416,8 +516,8 @@ mod tests {
     fn google_slides_windows_can_be_bound_but_are_reported_unsupported_and_never_navigated() {
         let mut f = Fake::default();
         f.browsers.push(Target {
-            id: "win:123".into(), kind: TargetKind::GoogleSlides, title: "Thesis - Google Slides".into(),
-            detail: String::new(), supports_control: false, slideshow_running: false, slide_count: None, current_slide: None,
+            supports_control: false,
+            ..Target::new("win:123", TargetKind::GoogleSlides, "Thesis - Google Slides", "")
         });
         let mut c = Controller::new(f);
         let s = c.bind("win:123").unwrap();

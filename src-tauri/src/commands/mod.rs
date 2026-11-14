@@ -1,6 +1,7 @@
 pub mod audio_commands;
 pub mod claude_cli_commands;
 pub mod context_commands;
+pub mod copilot_commands;
 pub mod credential_commands;
 pub mod gemini_cache_commands;
 pub mod intelligence_commands;

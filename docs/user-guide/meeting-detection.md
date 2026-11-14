@@ -7,9 +7,18 @@ When a call starts in Zoom, Microsoft Teams, Google Meet or Webex, NexQ shows a 
 NexQ checks which app is using your microphone every 3 seconds (you can change this from every second to every 10 seconds). Each check takes a few milliseconds. When a call app holds the microphone for a few seconds, NexQ treats that as a meeting. **It never listens to audio before you click Start**: it only reads which process has the microphone open, and the titles of that app's windows.
 
 - **Desktop apps.** Zoom, Teams and Webex count as soon as they use the microphone.
-- **Browsers.** A browser that uses the microphone counts only when its active tab is a meeting (Google Meet, Teams or Zoom on the web). Browsers use the microphone for other things too, such as voice typing and recorders.
+- **Browsers.** A browser that uses the microphone counts only when its active tab is a meeting (Google Meet, Teams, Zoom or Webex on the web, plus Jitsi Meet and Whereby). Browsers use the microphone for other things too, such as voice typing and recorders. Once a browser call is recognised it stays the same call while that browser keeps the microphone, even if you switch to another tab (for example your slides). NexQ reads only the window title: no cookies, no browser debugging port, no accounts.
 - **One prompt per call.** If you dismiss the prompt, it won't come back for the same call. A call counts as ended about 10 seconds after the app releases the microphone, and the prompt closes then.
 - **Never while recording.** No prompt appears while a NexQ meeting is already running.
+- **Nothing starts by itself.** Detection never starts audio capture, recording, screen sharing or the external meeting. Only the buttons on the prompt do.
+
+## Recent meetings and Presentation + Q&A
+
+Under the card, **Recent meetings** lists your saved meetings, most recently used first (with their type, presentation and last-used date). Pick one and press **Start NexQ**: it starts with that meeting's documents, notes, AI provider, presentation settings and history. A meeting that cannot start yet (for example no AI provider chosen) opens its setup with the reason instead.
+
+**Presentation + Q&A** is the explicit presentation action: it lists your Presentation + Q&A meetings, preselects the latest, and starts exactly the one you confirm. With none saved, **New Presentation + Q&A for “<call name>”** prepares one named after the call (an existing meeting of the same name is reused, never duplicated) and opens its setup so you can import your deck; it does not start by itself.
+
+If the meeting has a presentation, NexQ then opens it and binds to it — see [Presenting → Opening your presentation automatically](meeting-profiles.md#opening-your-presentation-automatically).
 
 ## The meeting name
 
@@ -31,7 +40,7 @@ The chevron next to **Start NexQ** picks the meeting type (Team Meeting, Intervi
 **Settings → General → Detect meetings** has these options:
 
 - **On/off.** Detection is on by default.
-- **Apps.** Zoom, Microsoft Teams, Google Meet, Webex, Slack huddles and Discord. Slack and Discord are off by default.
+- **Apps.** Zoom, Microsoft Teams, Google Meet, Webex, Jitsi Meet (browser), Whereby (browser), Slack huddles and Discord. Slack and Discord are off by default.
 - **Start as.** The meeting type a prompt starts with.
 - **Check for calls.** How often NexQ checks: every 1, 2, 3 (default), 5 or 10 seconds.
 - **Hide the prompt after.** 30 seconds, 1 minute, 2 minutes, or until the call ends. The timer pauses while your mouse is over the prompt.

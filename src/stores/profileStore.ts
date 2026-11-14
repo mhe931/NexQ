@@ -24,6 +24,8 @@ export function promptIsEdited(profile: MeetingProfile, catalog: TemplateCatalog
 interface ProfileState {
   summaries: ProfileSummary[];
   catalog: TemplateCatalog | null;
+  /** A meeting another window asked the home screen to open for setup (consumed by the home screen). */
+  setupRequest: string | null;
   /** The meeting being edited (a draft: only `save` writes it). */
   current: MeetingProfile | null;
   dirty: boolean;
@@ -107,6 +109,7 @@ export const useProfileStore = create<ProfileState>((set, get) => {
   return {
     summaries: [],
     catalog: null,
+    setupRequest: null,
     ...EMPTY_MEETING,
     busy: false,
 

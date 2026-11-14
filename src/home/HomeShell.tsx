@@ -73,6 +73,14 @@ export function HomeShell() {
     if (profile) setView("setup");
   }, []);
 
+  // Another window (the meeting-detection prompt) asked for this meeting's setup.
+  const setupRequest = useProfileStore((s) => s.setupRequest);
+  useEffect(() => {
+    if (!setupRequest) return;
+    useProfileStore.setState({ setupRequest: null });
+    void openMeeting(setupRequest);
+  }, [setupRequest, openMeeting]);
+
   const newMeeting = useCallback(async () => {
     setStart({ starting: false, error: null });
     await useProfileStore.getState().loadCatalog();

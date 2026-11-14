@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod cli_agent;
+pub mod copilot;
 pub mod custom;
 pub mod gemini;
 pub mod gemini_cache;
@@ -28,6 +29,8 @@ pub enum ProviderType {
     Custom,
     /// The local Claude Code CLI on the user's own subscription login.
     ClaudeCli,
+    /// GitHub Copilot through the user's own `copilot` CLI (ACP server).
+    GithubCopilot,
 }
 
 impl ProviderType {
@@ -42,6 +45,7 @@ impl ProviderType {
             "openrouter" => Ok(Self::Openrouter),
             "custom" => Ok(Self::Custom),
             "claude_cli" => Ok(Self::ClaudeCli),
+            "github_copilot" => Ok(Self::GithubCopilot),
             _ => Err(LLMError::NotConfigured(format!(
                 "Unknown provider type: {}",
                 s
@@ -60,6 +64,7 @@ impl ProviderType {
             Self::Openrouter => "openrouter",
             Self::Custom => "custom",
             Self::ClaudeCli => "claude_cli",
+            Self::GithubCopilot => "github_copilot",
         }
     }
 
@@ -74,6 +79,7 @@ impl ProviderType {
             Self::Openrouter => "OpenRouter",
             Self::Custom => "Custom",
             Self::ClaudeCli => "Claude (subscription)",
+            Self::GithubCopilot => "GitHub Copilot",
         }
     }
 
@@ -86,7 +92,7 @@ impl ProviderType {
             Self::Groq => "https://api.groq.com/openai/v1",
             Self::Gemini => "https://generativelanguage.googleapis.com",
             Self::Openrouter => "https://openrouter.ai/api/v1",
-            Self::Custom | Self::ClaudeCli => "",
+            Self::Custom | Self::ClaudeCli | Self::GithubCopilot => "",
         }
     }
 
@@ -196,6 +202,9 @@ pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LLMProvider>, 
         // Needs no config: it reaches the session manager through the
         // `AppHandle` passed to every `stream_completion` call.
         ProviderType::ClaudeCli => Box::new(cli_agent::provider::ClaudeCliProvider::new()),
+        // Needs no key: the user's own `copilot` CLI holds the sign-in. All
+        // providers share one `copilot --acp` process (`CopilotHub::global`).
+        ProviderType::GithubCopilot => Box::new(copilot::CopilotProvider::new()),
     };
 
     Ok(provider)
@@ -282,6 +291,7 @@ impl LLMRouter {
             ProviderType::Openrouter,
             ProviderType::Custom,
             ProviderType::ClaudeCli,
+            ProviderType::GithubCopilot,
         ];
 
         all_types
@@ -344,6 +354,35 @@ mod tests {
         assert!(LLMRouter::get_all_providers()
             .iter()
             .any(|p| p.provider_type == "claude_cli" && !p.requires_api_key && p.is_local));
+    }
+
+    #[test]
+    fn github_copilot_provider_type_roundtrip() {
+        let pt = ProviderType::from_str("github_copilot").unwrap();
+        assert_eq!(pt, ProviderType::GithubCopilot);
+        assert_eq!(pt.as_str(), "github_copilot");
+        assert_eq!(serde_json::to_string(&pt).unwrap(), "\"github_copilot\"");
+        assert_eq!(pt.display_name(), "GitHub Copilot");
+        assert_eq!(pt.default_base_url(), "");
+    }
+
+    #[test]
+    fn github_copilot_needs_no_key_and_is_a_cloud_provider() {
+        let pt = ProviderType::GithubCopilot;
+        assert!(!pt.requires_api_key());
+        // Chats leave the machine: never treated as local (fallback consent).
+        assert!(!pt.is_local());
+        let provider = create_provider(&cfg("github_copilot", None, None)).unwrap();
+        assert_eq!(provider.provider_name(), "github_copilot");
+        assert!(LLMRouter::get_all_providers()
+            .iter()
+            .any(|p| p.provider_type == "github_copilot" && !p.requires_api_key && !p.is_local));
+        // Switching to and from it leaves the router consistent.
+        let mut router = LLMRouter::new();
+        router.set_provider(cfg("github_copilot", None, None)).unwrap();
+        assert_eq!(router.active_provider_type(), Some(&ProviderType::GithubCopilot));
+        router.set_provider(cfg("ollama", None, None)).unwrap();
+        assert_eq!(router.active_provider_type(), Some(&ProviderType::Ollama));
     }
 
     #[test]

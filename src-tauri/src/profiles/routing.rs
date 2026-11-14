@@ -407,6 +407,29 @@ mod tests {
     }
 
     #[test]
+    fn github_copilot_is_a_cloud_fallback_that_needs_consent() {
+        // Chats go to GitHub Copilot, so it must never count as local.
+        let mut p = policy(Strategy::Balanced);
+        p.fallback = Some(ModelRef::new("github_copilot", "auto"));
+        p.consent_provider = None;
+        assert_eq!(
+            decide_after_failure(&p, FailureKind::Unavailable, false, false, 0.0),
+            Decision::Blocked(BlockReason::ConsentMissing("github_copilot".into()))
+        );
+        // Consent for another provider does not cover it.
+        p.consent_provider = Some("gemini".into());
+        assert!(matches!(
+            decide_after_failure(&p, FailureKind::Unavailable, false, false, 0.0),
+            Decision::Blocked(BlockReason::ConsentMissing(_))
+        ));
+        p.consent_provider = Some("github_copilot".into());
+        assert_eq!(
+            decide_after_failure(&p, FailureKind::Unavailable, false, false, 0.0),
+            Decision::UseFallback(ModelRef::new("github_copilot", "auto"))
+        );
+    }
+
+    #[test]
     fn a_local_fallback_needs_neither_consent_nor_paid_permission() {
         let mut p = policy(Strategy::Balanced);
         p.fallback = Some(ModelRef::new("ollama", "llama"));

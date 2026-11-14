@@ -114,7 +114,7 @@ Everything is saved with *this* meeting; other meetings keep their own look.
 1. Open your deck in **desktop PowerPoint** (or Google Slides in a browser).
 2. In the presenter view click **Bind presentation**, then choose the target from the list and press
    **Bind**. NexQ never assumes the focused window; it lists what is open and you pick.
-3. The chip shows the name and **CONNECTED / DISCONNECTED / UNSUPPORTED / OUT OF SYNC**.
+3. The chip shows the name and **CONNECTED / DISCONNECTED / UNSUPPORTED / OUT OF SYNC / WAITING FOR SLIDE SHOW**.
    **Rebind**, **Disconnect**, **Test navigation** (one slide away and back) and
    **Sync to current slide** are in the same panel.
 
@@ -122,9 +122,28 @@ The binding is stored with the meeting but re-checked every time you reopen it: 
 is not open you see DISCONNECTED and can rebind.
 
 **PowerPoint (desktop)** is controlled through its official COM automation: no keystrokes are sent, no
-window is focused, no administrator rights are needed. **Google Slides** can be *listed* but cannot be
+window is focused, no administrator rights are needed. NexQ finds presentations through PowerPoint itself
+(every PowerPoint instance, open files, **Protected View** files and slide shows) — not from window titles or
+the focused window — so presenting or sharing your screen does not hide a presentation. If PowerPoint was
+started **as administrator**, a normal NexQ may be unable to reach it (Windows isolates the two); the Bind dialog then says so. **Google Slides** can be *listed* but cannot be
 controlled: Google offers no slideshow-control API, so NexQ labels it UNSUPPORTED and the notes
 follow your manual selection (change the slide in the browser yourself).
+
+### Opening your presentation automatically
+
+When you press **Start** (or start a Presentation + Q&A from the [meeting-detection prompt](meeting-detection.md#recent-meetings-and-presentation--qa)), NexQ opens the presentation this meeting was prepared with and binds to it — you do not have to open PowerPoint first. It reports five separate facts, and none is inferred from another:
+
+| | Fact | Meaning |
+|---|---|---|
+| A | Imported and indexed | The file's slides and notes are stored in NexQ (the imported copy is reused, never regenerated). |
+| B | File opened | NexQ asked **desktop PowerPoint** to open the file — only if no matching presentation was already open. It never starts a slide show, moves windows or shares your screen. |
+| C | Application detected | PowerPoint answered to automation. |
+| D | Bound | NexQ is bound to exactly that document. If several open presentations could be it, NexQ does not guess: you choose in the Bind dialog. |
+| E | Navigation verified | PowerPoint accepted a go-to-slide command and read the slide back. In a live slide show NexQ asks for the slide it is already on, so the audience sees nothing change; in an editing view it moves one slide away and back. |
+
+CONNECTED appears only when the presentation can really be read. A file opened in **Protected View** (downloaded or e-mailed files) is listed and bound but shows **WAITING FOR SLIDE SHOW** until its slide show runs; NexQ never marks it CONNECTED earlier. If the saved file was moved, NexQ looks for the same file name in this meeting's folders and reports the new location; otherwise it asks you to import it again. Locally synced OneDrive / SharePoint / Google Drive files work as local files; a Google Slides link is opened in your browser but cannot be controlled (UNSUPPORTED). Turn the behaviour off per meeting with **Open and bind this presentation when the meeting starts** in the setup screen.
+
+If something is missing, **Bind presentation** never just says "not found": it names your imported presentation, offers **Open presentation**, **Bind to open presentation** (finds an already open copy, opens nothing) and **Refresh**, and prints what NexQ sees — whether PowerPoint is running, how many presentations (and Protected View files) it holds, and the slide-show and Presenter View windows. Sharing a **browser tab** is not the same as sharing a PowerPoint slide show: NexQ controls desktop PowerPoint only.
 
 ### One control for slides and notes
 

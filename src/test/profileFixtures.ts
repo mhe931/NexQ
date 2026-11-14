@@ -38,6 +38,8 @@ export const profileIpcMock = {
   presentStatus: vi.fn(),
   presentGoto: vi.fn(),
   presentTestNavigation: vi.fn(),
+  presentDiagnose: vi.fn(),
+  presentOpenAndBind: vi.fn(),
   addPresentation: vi.fn(),
   presentationInfo: vi.fn(),
   addNotes: vi.fn(),
@@ -57,6 +59,9 @@ export function resetProfileIpcMock() {
   profileIpcMock.sessions.mockResolvedValue([]);
   profileIpcMock.displays.mockResolvedValue([]);
   profileIpcMock.presentTargets.mockResolvedValue([]);
+  profileIpcMock.presentDiagnose.mockResolvedValue({
+    summary: "PowerPoint is not running.", powerpointInstalled: true, applications: [], windows: [], runningObjectEntries: [], notes: [],
+  });
   profileIpcMock.presentRevalidate.mockResolvedValue(DISCONNECTED);
   profileIpcMock.presentStatus.mockResolvedValue(DISCONNECTED);
   profileIpcMock.presentationInfo.mockResolvedValue(null);
@@ -136,7 +141,7 @@ export function makeProfile(over: Partial<MeetingProfile> = {}): MeetingProfile 
       },
     },
     presentation: {
-      source: "none", googleSlidesUrl: "", autoFollow: true, currentSlide: 1, notesPriority: "external_first", binding: null,
+      source: "none", googleSlidesUrl: "", autoFollow: true, autoOpen: true, currentSlide: 1, notesPriority: "external_first", binding: null,
       shortcuts: {
         next: ["ArrowRight", "PageDown", "n"], prev: ["ArrowLeft", "PageUp", "p"],
         first: ["Home"], last: ["End"], startQa: ["q"],
@@ -170,6 +175,8 @@ export function makeSummary(over: Partial<ProfileSummary> = {}): ProfileSummary 
     documentCount: 2,
     sessionCount: 1,
     updatedAt: "2026-02-01T00:00:00Z",
+    lastUsedAt: null,
+    presentationName: null,
     ...over,
   };
 }

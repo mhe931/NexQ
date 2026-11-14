@@ -380,6 +380,8 @@ pub struct PresentationSettings {
     /// Follow slide changes made directly in the bound presentation.
     /// Only effective where the integration can report the current slide.
     pub auto_follow: bool,
+    /// Open and bind this meeting's own presentation when the meeting is started.
+    pub auto_open: bool,
     pub current_slide: u32,
     pub notes_priority: NotesPriority,
     pub binding: Option<PresentationBinding>,
@@ -392,6 +394,7 @@ impl Default for PresentationSettings {
             source: PresentationSource::None,
             google_slides_url: String::new(),
             auto_follow: true,
+            auto_open: true,
             current_slide: 1,
             notes_priority: NotesPriority::ExternalFirst,
             binding: None,
@@ -466,6 +469,12 @@ pub struct ProfileSummary {
     pub document_count: u32,
     pub session_count: u32,
     pub updated_at: String,
+    /// Start of the most recent session run under this profile (RFC 3339), if any.
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    /// Name of the imported presentation, when the profile has one.
+    #[serde(default)]
+    pub presentation_name: Option<String>,
 }
 
 /// Markers of provider credentials that must never be stored in a profile.

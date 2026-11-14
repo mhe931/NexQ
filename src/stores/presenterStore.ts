@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { profileIpc } from "../lib/profileIpc";
 import type {
   BindingStatus,
+  LaunchReport,
   MeetingProfile,
   PresentationSettings,
   SlideRow,
@@ -39,6 +40,11 @@ interface PresenterState {
 
   /** Connection to the presentation being presented. */
   binding: BindingStatus;
+  /** Result of the last "open and bind" (stages A–E), shown in the Bind dialog. */
+  launch: LaunchReport | null;
+  launchError: string | null;
+  /** An open-and-bind is running (it can take up to ~30 s while PowerPoint starts). */
+  opening: boolean;
   /** `manual` = nothing to control (notes follow your selection); `pending` = waiting for the presentation. */
   sync: SyncState;
   pendingSlide: number | null;
@@ -46,8 +52,13 @@ interface PresenterState {
   /** Auto-scrolling of the notes is paused (runtime only). */
   scrollPaused: boolean;
 
-  /** Loads the meeting's profile and slides; chooses the starting phase and re-checks the saved binding. */
-  load: (profileId: string) => Promise<void>;
+  /**
+   * Loads the meeting's profile and slides; chooses the starting phase and re-checks the saved binding.
+   * `autoOpen` (a meeting was just started) also opens and binds the meeting's presentation when it is not connected.
+   */
+  load: (profileId: string, options?: { autoOpen?: boolean }) => Promise<void>;
+  /** Opens (`launch`) or only finds the meeting's own presentation, then binds and verifies it. */
+  openPresentation: (launch: boolean) => Promise<LaunchReport | null>;
   clear: () => void;
   gotoSlide: (slideNo: number) => void;
   step: (delta: number) => void;
@@ -141,12 +152,15 @@ export const usePresenterStore = create<PresenterState>((set, get) => {
     speechMuted: false,
     error: null,
     binding: NOT_BOUND,
+    launch: null,
+    launchError: null,
+    opening: false,
     sync: "manual",
     pendingSlide: null,
     syncError: null,
     scrollPaused: false,
 
-    load: async (profileId) => {
+    load: async (profileId, options) => {
       try {
         const [profile, slides] = await Promise.all([profileIpc.get(profileId), profileIpc.slides(profileId)]);
         const presenting = profile.meetingType === "presentation_qa" && slides.length > 0;
@@ -161,6 +175,9 @@ export const usePresenterStore = create<PresenterState>((set, get) => {
           hidden: false,
           error: null,
           binding: NOT_BOUND,
+          launch: null,
+          launchError: null,
+          opening: false,
           sync: "manual",
           pendingSlide: null,
           syncError: null,
@@ -178,8 +195,37 @@ export const usePresenterStore = create<PresenterState>((set, get) => {
             set({ binding: { ...NOT_BOUND, message: e instanceof Error ? e.message : String(e) } });
           }
         }
+        // The user explicitly started this meeting: bring its own presentation up, once.
+        const wantsPresentation = slides.length > 0 || profile.presentation.source !== "none";
+        if (options?.autoOpen && profile.presentation.autoOpen && wantsPresentation && get().profile?.id === profileId) {
+          const state = get().binding.state;
+          if (state !== "connected" && state !== "waiting") void get().openPresentation(true).catch(() => {});
+        }
       } catch (e) {
         set({ error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+
+    openPresentation: async (launch) => {
+      const profile = get().profile;
+      if (!profile) throw new Error("No meeting is open.");
+      if (get().opening) return get().launch;
+      set({ opening: true, launchError: null });
+      try {
+        const report = await profileIpc.presentOpenAndBind(profile.id, launch);
+        if (get().profile?.id !== profile.id) return report;
+        set({ launch: report, binding: report.status });
+        controller?.bindingChanged();
+        if (report.status.state === "connected" && report.status.targetSlide && profile.presentation.autoFollow) {
+          controller?.adopt(report.status.targetSlide);
+        }
+        return report;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        if (get().profile?.id === profile.id) set({ launchError: message });
+        throw e;
+      } finally {
+        if (get().profile?.id === profile.id) set({ opening: false });
       }
     },
 
@@ -189,7 +235,8 @@ export const usePresenterStore = create<PresenterState>((set, get) => {
       controller = null;
       set({
         profile: null, slides: [], currentSlide: 1, phase: "qa", hidden: false, speechMuted: false,
-        error: null, binding: NOT_BOUND, sync: "manual", pendingSlide: null, syncError: null, scrollPaused: false,
+        error: null, binding: NOT_BOUND, launch: null, launchError: null, opening: false,
+        sync: "manual", pendingSlide: null, syncError: null, scrollPaused: false,
       });
     },
 
@@ -246,7 +293,7 @@ export const usePresenterStore = create<PresenterState>((set, get) => {
 
     pollBinding: async () => {
       const current = get();
-      if (!controllable(current.binding) || !current.profile) return;
+      if ((!controllable(current.binding) && current.binding.state !== "waiting") || !current.profile) return;
       const shownBefore = current.currentSlide;
       try {
         const status = await profileIpc.presentStatus(shownBefore);

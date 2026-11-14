@@ -37,7 +37,7 @@ fn prompt_info(meeting: DetectedMeeting) -> MeetingPromptInfo {
     let config = with_detector(|d| d.config.clone());
     MeetingPromptInfo { meeting, auto_dismiss_secs: config.auto_dismiss_secs, default_scenario: config.default_scenario }
 }
-use rules::{Tracker, TrackerEvent};
+use rules::{BrowserCallMemory, Tracker, TrackerEvent};
 
 pub const PROMPT_WINDOW: &str = "meeting-prompt";
 const PROMPT_WIDTH: f64 = 480.0;
@@ -47,13 +47,18 @@ const PROMPT_TOP_MARGIN: f64 = 14.0;
 struct Detector {
     config: MeetingDetectionConfig,
     tracker: Tracker,
+    browser_calls: BrowserCallMemory,
 }
 
 static DETECTOR: Mutex<Option<Detector>> = Mutex::new(None);
 
 fn with_detector<T>(f: impl FnOnce(&mut Detector) -> T) -> T {
     let mut guard = DETECTOR.lock().unwrap_or_else(|e| e.into_inner());
-    let det = guard.get_or_insert_with(|| Detector { config: MeetingDetectionConfig::default(), tracker: Tracker::default() });
+    let det = guard.get_or_insert_with(|| Detector {
+        config: MeetingDetectionConfig::default(),
+        tracker: Tracker::default(),
+        browser_calls: BrowserCallMemory::default(),
+    });
     f(det)
 }
 
@@ -75,11 +80,9 @@ pub fn start(app: &AppHandle) {
             // follows the call so it doesn't prompt for it once NexQ stops.
             let seen = if config.enabled {
                 let capturing = probe::capturing_processes();
-                if rules::may_be_call(&capturing) {
-                    rules::detect(&capturing, &probe::visible_windows(), &config)
-                } else {
-                    None
-                }
+                let windows = if rules::may_be_call(&capturing) { probe::visible_windows() } else { Vec::new() };
+                let found = rules::detect(&capturing, &windows, &config);
+                with_detector(|d| d.browser_calls.apply(&capturing, &windows, found))
             } else {
                 None
             };
