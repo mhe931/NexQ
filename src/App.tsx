@@ -262,7 +262,7 @@ function App() {
           settingsOpen: false,
         });
         useMeetingStore.getState().startTimer();
-        if (profileId) void usePresenterStore.getState().load(profileId);
+        if (profileId) void usePresenterStore.getState().load(profileId, { autoOpen: true });
         // Then tell the launcher this window owns the meeting's speaker/bookmark data.
         emitOverlayMeetingReady(meeting.id).catch(() => {});
       }

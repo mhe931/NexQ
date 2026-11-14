@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, Link2, Link2Off, MonitorPlay, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FolderOpen, Hourglass, Link2, Link2Off, Loader2, MinusCircle, MonitorPlay, RefreshCw, X, XCircle } from "lucide-react";
 import type { Palette } from "./theme";
-import type { BindingStatus, BoundKind, ConnectionState, PresentationTarget } from "../lib/profileTypes";
+import type {
+  BindingStatus, BoundKind, ConnectionState, LaunchReport, LaunchStage, PresentationDiagnostics, PresentationInfo, PresentationTarget,
+} from "../lib/profileTypes";
 import { profileIpc } from "../lib/profileIpc";
 import { usePresenterStore } from "../stores/presenterStore";
 
@@ -20,6 +22,7 @@ const STATE_VIEW: Record<ConnectionState, { label: string; Icon: typeof Link2; c
   disconnected: { label: "DISCONNECTED", Icon: Link2Off, color: () => "#f87171" },
   unsupported: { label: "UNSUPPORTED", Icon: AlertTriangle, color: () => "#fbbf24" },
   out_of_sync: { label: "OUT OF SYNC", Icon: AlertTriangle, color: () => "#fb923c" },
+  waiting: { label: "WAITING FOR SLIDE SHOW", Icon: Hourglass, color: () => "#fbbf24" },
 };
 
 const controllable = (s: BindingStatus) => s.state === "connected" || s.state === "out_of_sync";
@@ -92,6 +95,8 @@ export function BindDialog({ colors, onClose }: { colors: Palette; onClose: () =
   const disconnect = usePresenterStore((s) => s.disconnect);
   const testNavigation = usePresenterStore((s) => s.testNavigation);
   const syncToPresentation = usePresenterStore((s) => s.syncToPresentation);
+  const profileId = usePresenterStore((s) => s.profile?.id ?? null);
+  const hasLaunch = usePresenterStore((s) => s.launch !== null);
 
   const panelRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<"list" | "bound">(binding.targetTitle ? "bound" : "list");
@@ -101,6 +106,15 @@ export function BindDialog({ colors, onClose }: { colors: Palette; onClose: () =
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
+  const [info, setInfo] = useState<PresentationInfo | null>(null);
+  const [scans, setScans] = useState(0);
+
+  useEffect(() => {
+    if (!profileId) return;
+    let live = true;
+    profileIpc.presentationInfo(profileId).then((i) => live && setInfo(i ?? null)).catch(() => live && setInfo(null));
+    return () => { live = false; };
+  }, [profileId]);
 
   const loadTargets = useCallback(async () => {
     setLoading(true);
@@ -113,6 +127,7 @@ export function BindDialog({ colors, onClose }: { colors: Palette; onClose: () =
       setTargets([]);
       setError(errorText(e));
     } finally {
+      setScans((n) => n + 1);
       setLoading(false);
     }
   }, []);
@@ -211,6 +226,14 @@ export function BindDialog({ colors, onClose }: { colors: Palette; onClose: () =
         {mode === "list" ? (
           <>
             <p style={{ color: colors.muted }}>Open PowerPoint or Google Slides first, then choose it here.</p>
+            <MeetingPresentation
+              info={info}
+              colors={colors}
+              onDone={(report) => {
+                if (report && report.status.targetId && report.status.state !== "disconnected") setMode("bound");
+                void loadTargets();
+              }}
+            />
             <div className="flex flex-wrap items-center gap-2">
               <button type="button" className={btn} style={{ borderColor: colors.border }} onClick={() => void loadTargets()} disabled={loading || busy}>
                 <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden="true" /> Refresh
@@ -231,21 +254,26 @@ export function BindDialog({ colors, onClose }: { colors: Palette; onClose: () =
               )}
             </div>
             {error && <Problem>{error}</Problem>}
-            <TargetList targets={targets} loading={loading} selected={selected} onSelect={setSelected} colors={colors} />
+            <TargetList targets={targets} loading={loading} selected={selected} onSelect={setSelected} colors={colors} info={info} scans={scans} />
           </>
         ) : (
-          <BoundView
-            binding={binding}
-            colors={colors}
-            busy={busy}
-            canControl={controllable(binding)}
-            result={result}
-            error={error}
-            onRebind={() => { setResult(null); setError(null); setMode("list"); }}
-            onDisconnect={onDisconnect}
-            onTest={onTest}
-            onSync={onSync}
-          />
+          <>
+            <BoundView
+              binding={binding}
+              colors={colors}
+              busy={busy}
+              canControl={controllable(binding)}
+              result={result}
+              error={error}
+              onRebind={() => { setResult(null); setError(null); setMode("list"); }}
+              onDisconnect={onDisconnect}
+              onTest={onTest}
+              onSync={onSync}
+            />
+            {(binding.state === "disconnected" || binding.state === "waiting" || hasLaunch) && (
+              <MeetingPresentation info={info} colors={colors} onDone={() => undefined} />
+            )}
+          </>
         )}
       </div>
     </div>,
@@ -262,22 +290,18 @@ function Problem({ children }: { children: ReactNode }) {
 }
 
 function TargetList({
-  targets, loading, selected, onSelect, colors,
+  targets, loading, selected, onSelect, colors, info, scans,
 }: {
   targets: PresentationTarget[] | null;
   loading: boolean;
   selected: string | null;
   onSelect: (id: string) => void;
   colors: Palette;
+  info: PresentationInfo | null;
+  scans: number;
 }) {
   if (targets === null) return <p role="status" style={{ color: colors.muted }}>{loading ? "Looking for open presentations…" : ""}</p>;
-  if (targets.length === 0) {
-    return (
-      <p role="status" style={{ color: colors.muted }}>
-        No presentations found. Open your deck in PowerPoint (desktop) or Google Slides in a browser.
-      </p>
-    );
-  }
+  if (targets.length === 0) return <NoTargets colors={colors} info={info} scans={scans} />;
   return (
     <div role="radiogroup" aria-label="Open presentations" className="space-y-1.5">
       {targets.map((t) => {
@@ -294,6 +318,7 @@ function TargetList({
                 <span className="min-w-0 truncate font-semibold" title={t.title}>{t.title}</span>
                 <span className="rounded border px-1.5 text-[10px] font-bold uppercase" style={{ borderColor: colors.border }}>{KIND_LABEL[t.kind]}</span>
                 {t.slideshowRunning && <span className="font-semibold" style={{ color: colors.accent }}>slide show running</span>}
+                {t.protectedView && <span className="rounded border px-1.5 text-[10px] font-bold uppercase" style={{ borderColor: "#fbbf24", color: "#fbbf24" }}>Protected View</span>}
               </span>
               {t.detail && <span className="block truncate" style={{ color: colors.muted }} title={t.detail}>{t.detail}</span>}
               <span className="block" style={{ color: colors.muted }}>
@@ -301,6 +326,7 @@ function TargetList({
                 {t.slideCount !== null && t.currentSlide !== null && " · "}
                 {t.currentSlide !== null && `currently on slide ${t.currentSlide}`}
               </span>
+              {t.note && <span className="block" style={{ color: colors.muted }}>{t.note}</span>}
               {!t.supportsControl && (
                 <span className="mt-0.5 flex items-center gap-1 font-semibold" style={{ color: "#fbbf24" }}>
                   <AlertTriangle className="h-3 w-3 shrink-0" aria-hidden="true" />
@@ -311,6 +337,169 @@ function TargetList({
           </label>
         );
       })}
+    </div>
+  );
+}
+
+const STAGE_ICON: Record<LaunchStage["state"], { Icon: typeof CheckCircle2; color: string; text: string }> = {
+  done: { Icon: CheckCircle2, color: "#4ade80", text: "Done" },
+  failed: { Icon: XCircle, color: "#f87171", text: "Failed" },
+  skipped: { Icon: MinusCircle, color: "#a1a1aa", text: "Not applicable" },
+  pending: { Icon: Loader2, color: "#fbbf24", text: "Pending" },
+};
+
+/** Stages A–E of opening the meeting's presentation: each is its own fact, never inferred from another. */
+function StageList({ stages, colors }: { stages: LaunchStage[]; colors: Palette }) {
+  return (
+    <ol aria-label="Presentation launch steps" className="space-y-1">
+      {stages.map((s, i) => {
+        const v = STAGE_ICON[s.state];
+        return (
+          <li key={s.id} className="flex items-start gap-1.5">
+            <v.Icon className="mt-0.5 h-3.5 w-3.5 shrink-0" style={{ color: v.color }} aria-hidden="true" />
+            <span className="min-w-0">
+              <span className="font-semibold">{String.fromCharCode(65 + i)}. {s.label}</span>
+              <span className="ml-1 text-[10px] font-bold uppercase" style={{ color: v.color }}>{v.text}</span>
+              {s.detail && <span className="block" style={{ color: colors.muted }}>{s.detail}</span>}
+            </span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+/**
+ * The presentation this meeting was prepared with, and the actions that bring it up. Shown even when nothing is
+ * open, so an empty list is never a dead end.
+ */
+function MeetingPresentation({ info, colors, onDone }: { info: PresentationInfo | null; colors: Palette; onDone: (r: LaunchReport | null) => void }) {
+  const opening = usePresenterStore((s) => s.opening);
+  const launch = usePresenterStore((s) => s.launch);
+  const launchError = usePresenterStore((s) => s.launchError);
+  const openPresentation = usePresenterStore((s) => s.openPresentation);
+  const [action, setAction] = useState<"open" | "find" | null>(null);
+
+  if (!info && !launch && !launchError) return null;
+
+  const run = async (launchIt: boolean) => {
+    setAction(launchIt ? "open" : "find");
+    try {
+      onDone(await openPresentation(launchIt));
+    } catch {
+      onDone(null);
+    } finally {
+      setAction(null);
+    }
+  };
+
+  return (
+    <section aria-label="This meeting's presentation" className="space-y-1.5 rounded-lg border px-2.5 py-2" style={{ borderColor: colors.border }}>
+      <h3 className="text-[10px] font-bold uppercase tracking-wide" style={{ color: colors.muted }}>This meeting's presentation</h3>
+      {info && (
+        <div>
+          <p className="truncate font-semibold" title={info.name}>{info.name}</p>
+          <p className="truncate" style={{ color: colors.muted }} title={info.path}>{info.path}</p>
+          <p style={{ color: colors.muted }}>
+            {info.slideCount} {info.slideCount === 1 ? "slide" : "slides"} imported and indexed in NexQ
+            {info.origin === "synced_cloud" ? " · locally synced cloud copy" : ""}
+          </p>
+          {info.sourceMissing && (
+            <p className="font-semibold" style={{ color: "#fbbf24" }}>
+              The file is no longer at this location. NexQ will look for the same file name in this meeting's folders; otherwise import it again from its new location.
+            </p>
+          )}
+          {info.stale && !info.sourceMissing && (
+            <p style={{ color: "#fbbf24" }}>The file changed after it was imported; refresh the meeting's sources if its text or notes changed.</p>
+          )}
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          className={btn}
+          style={{ borderColor: colors.accent, background: colors.accent, color: colors.onAccent }}
+          onClick={() => void run(true)}
+          disabled={opening || !info}
+          title={info ? "Opens this file in PowerPoint if it is not open yet, then binds to it" : "Import a PowerPoint file in the meeting setup first"}
+        >
+          <FolderOpen className="h-3.5 w-3.5" aria-hidden="true" /> Open presentation
+        </button>
+        <button
+          type="button"
+          className={btn}
+          style={{ borderColor: colors.border }}
+          onClick={() => void run(false)}
+          disabled={opening || !info}
+          title="Finds this presentation among the open ones and binds to it, without opening anything"
+        >
+          Bind to open presentation
+        </button>
+      </div>
+      {opening && (
+        <p role="status" className="flex items-center gap-1.5 font-semibold" style={{ color: colors.accent }}>
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          {action === "find" ? "Looking for the open presentation…" : "Opening and binding — this can take up to 30 seconds while PowerPoint starts…"}
+        </p>
+      )}
+      {launch && !opening && (
+        <>
+          <StageList stages={launch.stages} colors={colors} />
+          <p role="status" className="font-semibold">{launch.summary}</p>
+          {launch.sourceMoved && launch.sourcePath && <p style={{ color: colors.muted }}>The file was found at its new location: {launch.sourcePath}</p>}
+        </>
+      )}
+      {launchError && <Problem>{launchError}</Problem>}
+    </section>
+  );
+}
+
+/** Why the list is empty, in facts, plus what to do next. Never a bare "not found". */
+function NoTargets({ colors, info, scans }: { colors: Palette; info: PresentationInfo | null; scans: number }) {
+  const [diag, setDiag] = useState<PresentationDiagnostics | null>(null);
+  const [diagError, setDiagError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    setDiag(null);
+    setDiagError(null);
+    profileIpc.presentDiagnose().then((d) => live && setDiag(d)).catch((e) => live && setDiagError(errorText(e)));
+    return () => { live = false; };
+  }, [scans]);
+
+  return (
+    <div role="status" className="space-y-1.5" style={{ color: colors.muted }}>
+      <p className="font-semibold" style={{ color: colors.fg }}>
+        {info ? `“${info.name}” is not open in a presentation app.` : "No open presentation found."}
+      </p>
+      <p>{diagError ? `Diagnostics unavailable: ${diagError}` : (diag?.summary ?? "Checking PowerPoint…")}</p>
+      <ul className="list-disc space-y-0.5 pl-4">
+        {info ? (
+          <li>Choose <strong>Open presentation</strong> to open it, or open it yourself and choose Refresh.</li>
+        ) : (
+          <li>Open your deck in PowerPoint (desktop) or Google Slides in a browser, then choose Refresh.</li>
+        )}
+        <li>A file downloaded or received by e-mail opens in Protected View; NexQ follows its slide show once it is running.</li>
+        <li>Sharing a browser tab is not the same as sharing a PowerPoint slide show: NexQ can only control desktop PowerPoint.</li>
+      </ul>
+      {diag && (diag.applications.length > 0 || diag.windows.length > 0 || diag.notes.length > 0) && (
+        <details>
+          <summary className="cursor-pointer font-semibold">Diagnostic details</summary>
+          <ul className="mt-1 space-y-0.5">
+            {diag.applications.map((a, i) => (
+              <li key={`app-${i}`}>
+                PowerPoint {a.version || ""} ({a.source}): {a.presentations} open, {a.protectedView} in Protected View, {a.slideShows} slide show(s)
+              </li>
+            ))}
+            {diag.windows.map((w, i) => (
+              <li key={`win-${i}`}>
+                {w.role.replace("_", " ")} “{w.title}” — {w.reachable ? "reachable" : "not reachable"}
+              </li>
+            ))}
+            {diag.notes.map((n, i) => <li key={`note-${i}`}>{n}</li>)}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }
@@ -353,6 +542,11 @@ function BoundView({
         {position}{binding.slideshowRunning ? " · slide show running" : ""}
       </p>
       {binding.state === "unsupported" && <p style={{ color: "#fbbf24" }}>{unsupportedCopy(binding.kind)}</p>}
+      {binding.state === "waiting" && (
+        <p style={{ color: "#fbbf24" }}>
+          Bound to the right presentation, but it is not CONNECTED yet: start the slide show (or click Enable Editing in PowerPoint) and NexQ will follow it. Nothing is controlled until then.
+        </p>
+      )}
       {binding.state === "disconnected" && (
         <p style={{ color: colors.muted }}>
           The presentation is not reachable. Open it again, then choose Rebind; until then your notes follow the slide you select in NexQ.

@@ -159,6 +159,22 @@ export function PresenterPreferences({ profile }: { profile: MeetingProfile }) {
 
       <div className="flex items-start gap-2 text-xs text-foreground/90">
         <input
+          id="auto-open"
+          type="checkbox"
+          className="mt-0.5"
+          checked={profile.presentation.autoOpen}
+          onChange={(e) => patch((p) => ({ ...p, presentation: { ...p.presentation, autoOpen: e.target.checked } }))}
+        />
+        <div>
+          <label htmlFor="auto-open">Open and bind this presentation when the meeting starts</label>
+          <p className="text-meta text-muted-foreground">
+            Opens the imported PowerPoint file only if it is not already open, then binds to exactly that file. It never starts a slide show or shares your screen.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-2 text-xs text-foreground/90">
+        <input
           id="auto-follow"
           type="checkbox"
           className="mt-0.5"

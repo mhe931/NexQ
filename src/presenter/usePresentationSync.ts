@@ -11,7 +11,7 @@ export const POLL_INTERVAL_MS = 500;
 export function usePresentationSync() {
   const phase = usePresenterStore((s) => s.phase);
   const hidden = usePresenterStore((s) => s.hidden);
-  const bound = usePresenterStore((s) => s.binding.state === "connected" || s.binding.state === "out_of_sync");
+  const bound = usePresenterStore((s) => ["connected", "out_of_sync", "waiting"].includes(s.binding.state));
   const active = phase === "presentation" && !hidden && bound;
 
   useEffect(() => {

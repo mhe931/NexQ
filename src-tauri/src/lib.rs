@@ -619,6 +619,8 @@ pub fn run() {
             presentation_commands::present_status,
             presentation_commands::present_goto,
             presentation_commands::present_test_navigation,
+            presentation_commands::present_diagnose,
+            presentation_commands::present_open_and_bind,
             presentation_commands::profile_add_presentation,
             presentation_commands::profile_presentation_info,
             presentation_commands::profile_add_notes,

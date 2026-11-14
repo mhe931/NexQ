@@ -54,16 +54,14 @@ pub fn google_slides_targets() -> Vec<Target> {
         .into_iter()
         .filter_map(|(hwnd, title)| {
             let deck = google_slides_title(&title)?;
-            Some(Target {
-                id: format!("win:{hwnd}"),
-                kind: TargetKind::GoogleSlides,
-                title: deck,
-                detail: format!("Browser window: {title}"),
-                supports_control: false,
-                slideshow_running: false,
-                slide_count: None,
-                current_slide: None,
-            })
+            let mut target = Target::new(format!("win:{hwnd}"), TargetKind::GoogleSlides, deck, format!("Browser window: {title}"));
+            target.supports_control = false;
+            target.note = Some(
+                "A browser tab cannot be controlled from NexQ (Google offers no slideshow-control API). \
+                 Sharing this tab is not the same as sharing a PowerPoint slide show; notes follow your manual selection."
+                    .into(),
+            );
+            Some(target)
         })
         .collect()
 }
@@ -100,6 +98,18 @@ impl Backend for SystemBackend {
         } else {
             Err(BackendError::Failed("This window cannot be controlled.".into()))
         }
+    }
+
+    fn diagnose(&mut self) -> super::diagnostics::Diagnostics {
+        self.powerpoint.diagnose()
+    }
+
+    fn launch_file(&mut self, path: &std::path::Path) -> Result<(), BackendError> {
+        self.powerpoint.launch_file(path)
+    }
+
+    fn launch_url(&mut self, url: &str) -> Result<(), BackendError> {
+        self.powerpoint.launch_url(url)
     }
 }
 

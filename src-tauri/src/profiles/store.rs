@@ -177,16 +177,28 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<ProfileSummary>, String> {
         .prepare(
             "SELECT p.data,
                     (SELECT COUNT(*) FROM profile_documents d WHERE d.profile_id = p.id),
-                    (SELECT COUNT(*) FROM meetings m WHERE m.profile_id = p.id)
+                    (SELECT COUNT(*) FROM meetings m WHERE m.profile_id = p.id),
+                    (SELECT MAX(m.start_time) FROM meetings m WHERE m.profile_id = p.id),
+                    (SELECT d.name FROM profile_documents d
+                       WHERE d.profile_id = p.id AND d.id = (SELECT s.document_id FROM profile_slides s
+                                                              WHERE s.profile_id = p.id ORDER BY s.slide_no LIMIT 1))
              FROM meeting_profiles p ORDER BY p.updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?)))
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, u32>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows {
-        let (data, documents, sessions) = row.map_err(|e| e.to_string())?;
+        let (data, documents, sessions, last_used_at, presentation_name) = row.map_err(|e| e.to_string())?;
         let p: MeetingProfile = match serde_json::from_str(&data) {
             Ok(p) => p,
             Err(e) => {
@@ -205,6 +217,8 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<ProfileSummary>, String> {
             document_count: documents,
             session_count: sessions,
             updated_at: p.updated_at,
+            last_used_at,
+            presentation_name,
         });
     }
     Ok(out)

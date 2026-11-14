@@ -16,7 +16,7 @@ export type TextDirection = "auto" | "ltr" | "rtl";
 export type ColorPreset = "auto" | "white_on_black" | "yellow_on_black" | "green_on_black" | "black_on_white";
 export type NotesPriority = "external_first" | "embedded_first";
 export type BoundKind = "powerpoint" | "google_slides" | "other";
-export type ConnectionState = "connected" | "disconnected" | "unsupported" | "out_of_sync";
+export type ConnectionState = "connected" | "disconnected" | "unsupported" | "out_of_sync" | "waiting";
 
 export interface SourceFolder {
   id: string;
@@ -108,6 +108,8 @@ export interface PresentationSettings {
   googleSlidesUrl: string;
   /** Follow slide changes made directly in the bound presentation. */
   autoFollow: boolean;
+  /** Open and bind this meeting's own presentation when the meeting is started. */
+  autoOpen: boolean;
   currentSlide: number;
   notesPriority: NotesPriority;
   binding: PresentationBinding | null;
@@ -147,6 +149,10 @@ export interface ProfileSummary {
   documentCount: number;
   sessionCount: number;
   updatedAt: string;
+  /** Start of the most recent session run under this profile. */
+  lastUsedAt: string | null;
+  /** Name of the imported presentation, when the profile has one. */
+  presentationName: string | null;
 }
 
 export interface ProfileDocument {
@@ -301,6 +307,10 @@ export interface PresentationTarget {
   slideshowRunning: boolean;
   slideCount: number | null;
   currentSlide: number | null;
+  /** Opened in PowerPoint's Protected View (a downloaded or e-mailed file). */
+  protectedView: boolean;
+  /** What NexQ can and cannot do with exactly this target. */
+  note: string | null;
 }
 
 export interface BindingStatus {
@@ -317,6 +327,56 @@ export interface BindingStatus {
 export interface NavResult {
   confirmedSlide: number;
   status: BindingStatus;
+}
+
+/** The five facts of opening a meeting's presentation, kept apart (never inferred from each other). */
+export type LaunchStageId = "imported" | "launched" | "app_detected" | "bound" | "navigation";
+export type LaunchStageState = "done" | "failed" | "skipped" | "pending";
+
+export interface LaunchStage {
+  id: LaunchStageId;
+  label: string;
+  state: LaunchStageState;
+  detail: string;
+}
+
+export interface LaunchReport {
+  stages: LaunchStage[];
+  status: BindingStatus;
+  sourcePath: string | null;
+  sourceMoved: boolean;
+  launched: boolean;
+  /** Open presentations that might be the right one when NexQ could not choose safely. */
+  candidates: PresentationTarget[];
+  summary: string;
+}
+
+export interface DiagnosticsApp {
+  /** 0 when unknown (Protected View exposes no window handle). */
+  pid: number;
+  version: string;
+  source: string;
+  presentations: number;
+  protectedView: number;
+  slideShows: number;
+}
+
+export interface DiagnosticsWindow {
+  pid: number;
+  class: string;
+  title: string;
+  role: "editor" | "slide_show" | "presenter_view";
+  rect: [number, number, number, number];
+  reachable: boolean;
+}
+
+export interface PresentationDiagnostics {
+  summary: string;
+  powerpointInstalled: boolean;
+  applications: DiagnosticsApp[];
+  windows: DiagnosticsWindow[];
+  runningObjectEntries: string[];
+  notes: string[];
 }
 
 export interface PresentationInfo {
