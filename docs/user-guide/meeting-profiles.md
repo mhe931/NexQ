@@ -78,26 +78,84 @@ is compact and movable.
 
 ## 8. Notes near the webcam
 
-Set **Webcam position** and the teleprompter font size, line length, opacity and
-scroll speed. **Test placement** moves the overlay under the camera. The overlay
-does not take keyboard focus from PowerPoint, Teams or Zoom.
+Set **Webcam position** and the teleprompter size in the setup screen. **Test
+placement** moves the overlay under the camera. The overlay does not take
+keyboard focus from PowerPoint, Teams or Zoom, and its position and size are
+saved per meeting (drag the top bar to move, drag an edge to resize).
 
-## 9. From presentation to Q&A
+### Live text controls (Presentation View)
 
-Presentation + Questions meetings start with your slide notes. Keys: **→ / PgDn /
-N** next, **← / PgUp / P** previous, **Home/End**, **↑/↓** scroll, **H**
-hide/show, **Q** start Q&A. NexQ shows the notes of exactly the slide selected
-(manual selection is the supported mode; automatic following is not available).
-**Start Q&A** asks you to confirm that everyone agreed to listening, then starts
-transcription. The meeting, its documents and settings stay the same; answers come
-from *this meeting's* documents with source references. Interview meetings start
-directly in Q&A and show `[ACTION]` steps (what you should do) apart from
-`[ANSWER]` (what to say). NexQ never operates your computer.
+One slim row, always available while presenting:
+`[ A− ] [ A+ ] [ Font ] [ LTR | RTL | Auto ] [ Opacity ] [ Settings ]`.
 
-To use Google Slides: File → Download → PowerPoint (.pptx), add it, and choose
-**Use as presentation**. Notes can be edited as this meeting's copy; the file is
-untouched.
+- **A− / A+** (or the `-` and `+` keys): 14–96 px, visible immediately.
+- **Font**: "Default" or any installed font. A missing font falls back to Segoe UI / Tahoma /
+  Noto Arabic so English and Persian text always render.
+- **LTR / RTL / Auto**: *Auto* follows each paragraph's first strong character, so mixed
+  Persian/English notes lay out correctly. Text is shown exactly as written.
+- **Opacity** only affects the panel background (minimum 30 %); the text stays solid.
+- **Settings**: line spacing, text width, scroll speed, **Pause/Resume scrolling**, colour preset
+  (white, yellow or green on black, black on white) and **Restore defaults**.
 
+Everything is saved with *this* meeting; other meetings keep their own look.
+
+## 9. From presentation to Q&A, with the real presentation
+
+### Bind Presentation
+
+1. Open your deck in **desktop PowerPoint** (or Google Slides in a browser).
+2. In the presenter view click **Bind presentation**, then choose the target from the list and press
+   **Bind**. NexQ never assumes the focused window; it lists what is open and you pick.
+3. The chip shows the name and **CONNECTED / DISCONNECTED / UNSUPPORTED / OUT OF SYNC**.
+   **Rebind**, **Disconnect**, **Test navigation** (one slide away and back) and
+   **Sync to current slide** are in the same panel.
+
+The binding is stored with the meeting but re-checked every time you reopen it: if exactly that file
+is not open you see DISCONNECTED and can rebind.
+
+**PowerPoint (desktop)** is controlled through its official COM automation: no keystrokes are sent, no
+window is focused, no administrator rights are needed. **Google Slides** can be *listed* but cannot be
+controlled: Google offers no slideshow-control API, so NexQ labels it UNSUPPORTED and the notes
+follow your manual selection (change the slide in the browser yourself).
+
+### One control for slides and notes
+
+Next / Previous / First / Last (buttons or keys) move **the bound presentation and the notes
+together**. The notes change after PowerPoint confirms the slide ("Moving…" until then; a failure is
+shown and nothing changes). Fast presses are combined, held keys are ignored, and a slide
+change made directly in PowerPoint is followed automatically (turn this off in the setup screen to get
+an OUT OF SYNC notice and a **Sync to current slide** button instead). Navigation never calls an AI
+provider.
+
+Default keys: next `→ PgDn N`, previous `← PgUp P`, first `Home`, last `End`, Start Q&A `Q`
+(change them in the setup screen); `↑ ↓` scroll and `H` hide are fixed.
+
+### Start Q&A
+
+**Start Q&A** switches phase; the meeting, its documents, prompt and model stay the same. The first
+time a meeting starts listening you get **one** inline notice ("Listening transcribes everyone on this
+call — make sure that is allowed") with *Start listening and remember for this meeting*. After that
+nothing is asked on pause/resume, slide↔Q&A switches or questions. You can tick the same box
+in *Privacy & consent* beforehand. A visible LISTENING / NOT LISTENING status and **Pause listening**
+are always on screen; audio is not recorded and nothing is uploaded unless you turn recording on. Windows' own
+microphone permission still applies.
+
+### Presentations and speaker notes from files
+
+- **Add Presentation**: `.pptx`, `.pptm`, `.ppsx`. Slide numbers, titles, text and embedded notes are
+  cached locally (also searchable in Q&A); the setup screen shows when it was imported and warns if the
+  file changed ("Refresh"). Your edited notes survive a refresh.
+- **Google Slides / OneDrive / SharePoint**: signing in from NexQ is not built (it needs your own OAuth
+  registration). Use *File → Download → Microsoft PowerPoint (.pptx)* from Google Slides, or add a deck
+  that the OneDrive/SharePoint/Google Drive desktop app already synced to disk (labelled "Locally synced
+  cloud file").
+- **Add Speaker Notes**: a separate `.docx`, `.pdf`, `.txt` or `.md` with sections such as `# Slide 1`,
+  `Slide 2: Objectives`, `SLIDE 03 | …`, `Slide 4 of 16`. A table **SLIDE | TITLE | NOTES SOURCE |
+  STATUS** shows the mapping; open a row to see embedded, external and edited text side by side.
+  Ambiguous sections (duplicates, no number, beyond the last slide) are listed for you to assign by hand.
+- **Precedence** (shown, never silent): *your own edits* > *speaker-notes document* > *presentation
+  notes* by default; one switch prefers the presentation's notes instead. Neither source is deleted and
+  the original files are never modified.
 ## 10. Automatic fallback
 
 Optional and off by default. If the primary provider is rate-limited, down or
