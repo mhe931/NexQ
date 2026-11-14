@@ -9,6 +9,7 @@ import { palette, type Palette } from "./theme";
 import { usePresentationSync } from "./usePresentationSync";
 import { usePresenterKeys } from "./usePresenterKeys";
 import { useWindowGeometry } from "./useWindowGeometry";
+import { useWindowOpacity } from "./useWindowOpacity";
 import { profileIpc } from "../lib/profileIpc";
 import type { MeetingProfile } from "../lib/profileTypes";
 import { useMeetingStore } from "../stores/meetingStore";
@@ -59,6 +60,7 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
 
   const t = profile.environment.teleprompter;
   const colors = palette(t);
+  const fallbackOpacity = useWindowOpacity(t.windowOpacity);
   const notesRef = useRef<HTMLDivElement>(null);
   const [asking, setAsking] = useState<AskingToListen>(null);
   // Asked at most once per meeting: after the user agreed it is saved with the profile.
@@ -129,7 +131,12 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
     </span>
   );
   const frame = "relative flex h-full flex-col overflow-hidden rounded-xl border shadow-xl";
-  const frameStyle = { background: colors.bg, color: colors.fg, borderColor: colors.border };
+  const frameStyle = {
+    background: colors.bg,
+    color: colors.fg,
+    borderColor: colors.border,
+    opacity: fallbackOpacity < 1 ? fallbackOpacity : undefined,
+  };
 
   if (hidden) {
     return (

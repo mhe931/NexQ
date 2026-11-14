@@ -86,14 +86,22 @@ saved per meeting (drag the top bar to move, drag an edge to resize).
 ### Live text controls (Presentation View)
 
 One slim row, always available while presenting:
-`[ A− ] [ A+ ] [ Font ] [ LTR | RTL | Auto ] [ Opacity ] [ Settings ]`.
+`[ A− ] [ A+ ] [ Font ] [ LTR | RTL | Auto ] [ Window Opacity ] [ Reset to 100% ] [ Settings ]`.
 
 - **A− / A+** (or the `-` and `+` keys): 14–96 px, visible immediately.
 - **Font**: "Default" or any installed font. A missing font falls back to Segoe UI / Tahoma /
   Noto Arabic so English and Persian text always render.
 - **LTR / RTL / Auto**: *Auto* follows each paragraph's first strong character, so mixed
   Persian/English notes lay out correctly. Text is shown exactly as written.
-- **Opacity** only affects the panel background (minimum 30 %); the text stays solid.
+- **Window Opacity** (20–100 %, live): fades the *entire* NexQ window (background, notes, AI answers,
+  toolbar, buttons and borders) so PowerPoint, Teams or a browser behind it shows through. The
+  fade is applied by Windows to the NexQ window itself, not by CSS, and NexQ stays clickable (it is
+  never click-through). It applies in both Presentation and Q&A, is saved per meeting, and does not
+  change the opacity of any other app. **Reset to 100%** makes it fully opaque again. While the
+  presenter runs, the overlay's glass blur is off so the desktop behind is sharp; it returns when the
+  meeting closes. Meetings saved before this control start at 100 %. Limitations: Windows
+  only (elsewhere the window's own content fades instead), and at very low values the text is
+  as faint as the background, so keep it above about 40 % while presenting.
 - **Settings**: line spacing, text width, scroll speed, **Pause/Resume scrolling**, colour preset
   (white, yellow or green on black, black on white) and **Restore defaults**.
 

@@ -229,7 +229,9 @@ pub struct TeleprompterSettings {
     pub line_spacing: f32,
     /// Maximum line length in characters (0 = fill the window).
     pub line_chars: u32,
-    pub opacity: f32,
+    /// Opacity of the whole presenter window, 0.2 to 1.0. It replaces the old
+    /// background-only `opacity`, whose saved value is ignored on load.
+    pub window_opacity: f32,
     /// Auto-scroll speed in pixels per second (0 = manual only).
     pub scroll_speed: u32,
     pub high_contrast: bool,
@@ -249,7 +251,7 @@ impl Default for TeleprompterSettings {
             color_preset: ColorPreset::Auto,
             line_spacing: 1.45,
             line_chars: 60,
-            opacity: 0.92,
+            window_opacity: 1.0,
             scroll_speed: 0,
             high_contrast: true,
             x: 0,
@@ -533,9 +535,9 @@ impl MeetingProfile {
         if !(12..=120).contains(&t.font_size) {
             return Err("Teleprompter font size must be between 12 and 120.".into());
         }
-        // Below 0.3 the notes become easy to lose on a busy screen.
-        if !(0.3..=1.0).contains(&t.opacity) {
-            return Err("Teleprompter opacity must be between 0.3 and 1.0.".into());
+        // Below 0.2 the window is too easy to lose on a busy screen.
+        if !(0.2..=1.0).contains(&t.window_opacity) {
+            return Err("Window opacity must be between 20% and 100%.".into());
         }
         if !(1.0..=2.5).contains(&t.line_spacing) {
             return Err("Teleprompter line spacing must be between 1.0 and 2.5.".into());
@@ -610,9 +612,11 @@ mod tests {
     #[test]
     fn presenter_text_preferences_are_bounded_and_older_profiles_get_defaults() {
         let mut p = MeetingProfile { name: "A".into(), ..Default::default() };
-        p.environment.teleprompter.opacity = 0.1;
+        p.environment.teleprompter.window_opacity = 0.1;
         assert!(p.validate().unwrap_err().contains("opacity"));
-        p.environment.teleprompter.opacity = 0.5;
+        p.environment.teleprompter.window_opacity = 0.2;
+        assert!(p.validate().is_ok());
+        p.environment.teleprompter.window_opacity = 0.5;
         p.environment.teleprompter.line_spacing = 3.0;
         assert!(p.validate().is_err());
         p.environment.teleprompter.line_spacing = 1.6;
@@ -629,6 +633,15 @@ mod tests {
         assert_eq!(old.environment.teleprompter.text_direction, TextDirection::Auto);
         assert_eq!(old.presentation.notes_priority, NotesPriority::ExternalFirst);
         assert!(old.presentation.auto_follow && old.presentation.binding.is_none());
+        assert_eq!(old.environment.teleprompter.window_opacity, 1.0);
+
+        // The former background-only value is not reused as a window opacity.
+        let legacy: MeetingProfile = serde_json::from_str(
+            r#"{"id":"x","name":"Old","environment":{"teleprompter":{"opacity":0.4}}}"#).unwrap();
+        assert_eq!(legacy.environment.teleprompter.window_opacity, 1.0);
+        let saved: MeetingProfile = serde_json::from_str(
+            r#"{"id":"x","name":"New","environment":{"teleprompter":{"windowOpacity":0.4}}}"#).unwrap();
+        assert_eq!(saved.environment.teleprompter.window_opacity, 0.4);
     }
 
     #[test]

@@ -145,7 +145,7 @@ export function EnvironmentSection({ profile }: { profile: MeetingProfile }) {
       <div className="grid grid-cols-3 gap-3">
         <NumberField id="tp-font" label="Teleprompter font size" value={env.teleprompter.fontSize} min={12} max={120} onChange={(n) => setTele({ fontSize: n })} />
         <NumberField id="tp-line" label="Line length (characters)" value={env.teleprompter.lineChars} min={0} max={200} onChange={(n) => setTele({ lineChars: n })} />
-        <NumberField id="tp-opacity" label="Opacity" value={env.teleprompter.opacity} min={0.2} max={1} step={0.05} onChange={(n) => setTele({ opacity: n })} />
+        <NumberField id="tp-opacity" label="Window opacity (0.2 – 1)" value={env.teleprompter.windowOpacity} min={0.2} max={1} step={0.05} onChange={(n) => setTele({ windowOpacity: n })} />
         <NumberField id="tp-scroll" label="Auto-scroll (px/second)" value={env.teleprompter.scrollSpeed} min={0} max={400} onChange={(n) => setTele({ scrollSpeed: n })} />
       </div>
       <label className="flex items-center gap-2 text-xs text-foreground/90">

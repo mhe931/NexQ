@@ -5,7 +5,8 @@ import { stepFontSize } from "../lib/presenterTypography";
 import type { ColorPreset, TeleprompterSettings, TextDirection } from "../lib/profileTypes";
 import { TEXT_LIMITS } from "../lib/teleprompterDefaults";
 import { usePresenterStore } from "../stores/presenterStore";
-import { backgroundAlpha, type Palette } from "./theme";
+import { clampWindowOpacity } from "./useWindowOpacity";
+import type { Palette } from "./theme";
 
 interface Props {
   t: TeleprompterSettings;
@@ -37,7 +38,7 @@ const KEYS_HINT = "Keys: ← → slides, ↑ ↓ scroll, Q start Q&A, H hide, �
 const patch = (p: Partial<TeleprompterSettings>) => usePresenterStore.getState().patchTeleprompter(p);
 
 /**
- * One slim row of live text controls: A− A+ · font · LTR/RTL/Auto · background opacity · Settings.
+ * One slim row of live text controls: A− A+ · font · LTR/RTL/Auto · window opacity · Settings.
  * Every change is applied at once and saved with the meeting.
  */
 export function PresenterToolbar({ t, colors }: Props) {
@@ -82,7 +83,9 @@ export function PresenterToolbar({ t, colors }: Props) {
   }, [open, closeSettings]);
 
   const families = Array.from(new Set(["", ...(fonts ?? []), ...(t.fontFamily ? [t.fontFamily] : [])]));
-  const opacity = backgroundAlpha(t.opacity);
+  const opacity = clampWindowOpacity(t.windowOpacity);
+  const percent = Math.round(opacity * 100);
+  const opacityId = useId();
 
   return (
     <div className="relative">
@@ -137,22 +140,31 @@ export function PresenterToolbar({ t, colors }: Props) {
           })}
         </div>
 
-        <label className="inline-flex items-center gap-1 text-xs" style={{ color: colors.muted }} title="Background opacity (the text stays solid)">
-          <span className="sr-only">Background opacity</span>
-          <span aria-hidden="true">Opacity</span>
+        <div className="inline-flex items-center gap-1 text-xs" style={{ color: colors.muted }} title="Fades the whole NexQ window, including its text, so what is behind it shows through">
+          <label htmlFor={opacityId} className="inline-flex items-center gap-1">Window Opacity</label>
           <input
+            id={opacityId}
             type="range"
             className={`${range} w-20`}
-            aria-label="Background opacity"
-            aria-valuetext={`${Math.round(opacity * 100)}%`}
-            min={TEXT_LIMITS.opacity.min}
-            max={TEXT_LIMITS.opacity.max}
-            step={TEXT_LIMITS.opacity.step}
+            aria-valuetext={`${percent}%`}
+            min={TEXT_LIMITS.windowOpacity.min}
+            max={TEXT_LIMITS.windowOpacity.max}
+            step={TEXT_LIMITS.windowOpacity.step}
             value={opacity}
-            onChange={(e) => patch({ opacity: backgroundAlpha(Number(e.target.value)) })}
+            onChange={(e) => patch({ windowOpacity: clampWindowOpacity(Number(e.target.value)) })}
           />
-          <span className="w-8 tabular-nums" aria-hidden="true">{Math.round(opacity * 100)}%</span>
-        </label>
+          <span className="w-8 tabular-nums" aria-hidden="true">{percent}%</span>
+          <button
+            type="button"
+            className={tb}
+            style={border}
+            title="Make the window fully opaque again"
+            disabled={opacity >= TEXT_LIMITS.windowOpacity.max}
+            onClick={() => patch({ windowOpacity: TEXT_LIMITS.windowOpacity.max })}
+          >
+            Reset to 100%
+          </button>
+        </div>
 
         <button
           ref={settingsButton}
@@ -199,7 +211,7 @@ function SettingsPanel({ id, panelRef, t, colors, onClose }: {
       aria-modal="false"
       aria-label="Presentation settings"
       className="absolute right-2 top-full z-30 mt-1 w-80 max-w-[calc(100%-1rem)] space-y-2 overflow-y-auto rounded-lg border p-3 text-xs shadow-xl"
-      style={{ background: colors.solid, color: colors.fg, borderColor: colors.border, maxHeight: "calc(100vh - 5rem)", minHeight: "8rem" }}
+      style={{ background: colors.bg, color: colors.fg, borderColor: colors.border, maxHeight: "calc(100vh - 5rem)", minHeight: "8rem" }}
     >
       <Slider label="Font size" unit="px" value={t.fontSize} {...L.fontSize} onChange={(v) => patch({ fontSize: v })} />
       <Slider label="Line spacing" value={t.lineSpacing} {...L.lineSpacing} format={(v) => v.toFixed(2)} onChange={(v) => patch({ lineSpacing: v })} />

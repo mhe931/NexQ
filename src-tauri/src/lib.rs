@@ -50,6 +50,7 @@ use commands::gemini_cache_commands;
 // == MODULE COMMANDS: rag ==
 use commands::rag_commands;
 use commands::presentation_commands;
+use commands::window_opacity_commands;
 use commands::profile_commands;
 // == MODULE COMMANDS: recording ==
 use commands::recording_commands;
@@ -677,6 +678,7 @@ pub fn run() {
             // == COMMANDS: stealth ==
             stealth_commands::set_stealth_mode,
             stealth_commands::get_stealth_support,
+            window_opacity_commands::set_presenter_window_opacity,
             log_commands::get_log_info,
             log_commands::set_verbose_logging,
             log_commands::open_log_folder,

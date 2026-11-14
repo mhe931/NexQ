@@ -11,7 +11,7 @@ const env = (over: Partial<EnvironmentSettings> = {}): EnvironmentSettings => ({
   webcamPosition: "top_center", screenShare: "display",
   teleprompter: {
     fontSize: 28, fontFamily: "", textDirection: "auto", colorPreset: "auto", lineSpacing: 1.45,
-    lineChars: 60, opacity: 0.9, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220,
+    lineChars: 60, windowOpacity: 1, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220,
   },
   ...over,
 });

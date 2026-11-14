@@ -170,28 +170,55 @@ describe("font family and direction", () => {
   });
 });
 
-describe("opacity", () => {
-  it("only changes the background; the text stays solid", async () => {
+describe("window opacity", () => {
+  const slider = () => screen.getByRole("slider", { name: "Window Opacity" });
+
+  it("is a window-level control: the colours stay opaque and the native window is faded", async () => {
     await presentLoaded();
-    const textBefore = frame().style.color;
-    const slider = screen.getByRole("slider", { name: "Background opacity" });
-    expect(slider).toHaveAttribute("min", "0.3");
-    expect(slider).toHaveAttribute("max", "1");
-    fireEvent.change(slider, { target: { value: "0.5" } });
-    expect(frame().style.background).toContain("rgba(0, 0, 0, 0.5)");
-    expect(frame().style.color).toBe(textBefore);
-    expect(column().style.opacity).toBe("");
+    expect(slider()).toHaveAttribute("min", "0.2");
+    expect(slider()).toHaveAttribute("max", "1");
+    expect(ipc.setPresenterWindowOpacity).toHaveBeenLastCalledWith(1);
+    const before = frame().style.background;
+    fireEvent.change(slider(), { target: { value: "0.4" } });
+    expect(tele().windowOpacity).toBeCloseTo(0.4);
+    await waitFor(() => expect(ipc.setPresenterWindowOpacity).toHaveBeenLastCalledWith(0.4));
+    expect(frame().style.background).toBe(before);
     expect(frame().style.opacity).toBe("");
-    expect(screen.getByRole("slider", { name: "Background opacity" })).toHaveAttribute("aria-valuetext", "50%");
+    expect(slider()).toHaveAttribute("aria-valuetext", "40%");
+    expect(screen.getByText("40%")).toBeInTheDocument();
   });
 
-  it("never goes below 30 %", async () => {
+  it("is limited to 20-100 % and Reset to 100% recovers a faint window", async () => {
     await presentLoaded();
-    act(() => usePresenterStore.getState().patchTeleprompter({ opacity: 0.05 }));
-    expect(frame().style.background).toContain("rgba(0, 0, 0, 0.3)");
-    expect(screen.getByRole("slider", { name: "Background opacity" })).toHaveAttribute("aria-valuetext", "30%");
-    act(() => usePresenterStore.getState().patchTeleprompter({ opacity: 7 }));
-    expect(frame().style.background).toBe("rgb(0, 0, 0)");
+    const reset = screen.getByRole("button", { name: "Reset to 100%" });
+    expect(reset).toBeDisabled();
+    act(() => usePresenterStore.getState().patchTeleprompter({ windowOpacity: 0.05 }));
+    expect(slider()).toHaveAttribute("aria-valuetext", "20%");
+    await waitFor(() => expect(ipc.setPresenterWindowOpacity).toHaveBeenLastCalledWith(0.2));
+    fireEvent.click(screen.getByRole("button", { name: "Reset to 100%" }));
+    expect(tele().windowOpacity).toBe(1);
+    await waitFor(() => expect(ipc.setPresenterWindowOpacity).toHaveBeenLastCalledWith(1));
+  });
+
+  it("saves with the meeting, applies in Q&A too, and returns the window to normal on close", async () => {
+    await presentLoaded(withTeleprompter({ windowOpacity: 0.7 }));
+    await waitFor(() => expect(ipc.setPresenterWindowOpacity).toHaveBeenLastCalledWith(0.7));
+    act(() => usePresenterStore.getState().startQa());
+    expect(usePresenterStore.getState().phase).toBe("qa");
+    expect(ipc.setPresenterWindowOpacity).toHaveBeenLastCalledWith(0.7);
+    vi.useFakeTimers();
+    fireEvent.change(slider(), { target: { value: "0.5" } });
+    settle();
+    expect(lastSaved()).toMatchObject({ windowOpacity: 0.5 });
+    vi.useRealTimers();
+    cleanup();
+    await waitFor(() => expect(ipc.setPresenterWindowOpacity).toHaveBeenLastCalledWith(null));
+  });
+
+  it("fades the whole frame instead when the native window cannot be faded", async () => {
+    ipc.setPresenterWindowOpacity.mockRejectedValue(new Error("unsupported"));
+    await presentLoaded(withTeleprompter({ windowOpacity: 0.5 }));
+    await waitFor(() => expect(frame().style.opacity).toBe("0.5"));
   });
 });
 
@@ -240,7 +267,7 @@ describe("settings panel", () => {
     const before = frame().style.color;
     fireEvent.change(screen.getByRole("combobox", { name: "Colour preset" }), { target: { value: "black_on_white" } });
     expect(frame().style.color).not.toBe(before);
-    expect(frame().style.background).toContain("rgba(255, 255, 255");
+    expect(frame().style.background).toBe("rgb(255, 255, 255)");
   });
 
   it("pauses and resumes the auto-scroll", async () => {
@@ -266,7 +293,7 @@ describe("settings panel", () => {
   it("restores the defaults (but keeps the window geometry)", async () => {
     await presentLoaded(withTeleprompter({
       fontSize: 60, fontFamily: "Vazirmatn", textDirection: "rtl", colorPreset: "green_on_black",
-      lineSpacing: 2, lineChars: 30, opacity: 0.4, scrollSpeed: 80, x: 12, y: 34, width: 700, height: 300,
+      lineSpacing: 2, lineChars: 30, windowOpacity: 0.4, scrollSpeed: 80, x: 12, y: 34, width: 700, height: 300,
     }));
     vi.useFakeTimers();
     open();

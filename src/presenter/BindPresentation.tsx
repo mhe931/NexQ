@@ -190,8 +190,6 @@ export function BindDialog({ colors, onClose }: { colors: Palette; onClose: () =
     setResult(slide ? `Notes now follow slide ${slide} of the presentation.` : "Synced with the presentation.");
   });
 
-  const solid = colors.bg.startsWith("rgba") ? "#000000" : "hsl(var(--background))";
-
   return createPortal(
     <div
       ref={panelRef}
@@ -200,7 +198,7 @@ export function BindDialog({ colors, onClose }: { colors: Palette; onClose: () =
       aria-labelledby="bind-title"
       tabIndex={-1}
       className="fixed inset-1 z-50 flex flex-col overflow-hidden rounded-xl border shadow-2xl focus:outline-none"
-      style={{ background: solid, color: colors.fg, borderColor: colors.accent }}
+      style={{ background: colors.bg, color: colors.fg, borderColor: colors.accent }}
     >
       <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5" style={{ borderColor: colors.border }}>
         <h2 id="bind-title" className="text-sm font-bold">Bind presentation</h2>

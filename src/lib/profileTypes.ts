@@ -66,7 +66,8 @@ export interface TeleprompterSettings {
   colorPreset: ColorPreset;
   lineSpacing: number;
   lineChars: number;
-  opacity: number;
+  /** Opacity of the whole presenter window (0.2–1), applied by the OS, not a CSS background alpha. */
+  windowOpacity: number;
   scrollSpeed: number;
   highContrast: boolean;
   x: number;

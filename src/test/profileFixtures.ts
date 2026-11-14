@@ -29,6 +29,7 @@ export const profileIpcMock = {
   clearSessions: vi.fn(),
   displays: vi.fn(),
   placeOverlay: vi.fn(),
+  setPresenterWindowOpacity: vi.fn(),
   latencyStats: vi.fn(),
   presentTargets: vi.fn(),
   presentBind: vi.fn(),
@@ -64,6 +65,7 @@ export function resetProfileIpcMock() {
   profileIpcMock.updateTeleprompter.mockImplementation(async (_id: string, s: unknown) => s);
   profileIpcMock.updatePresentation.mockImplementation(async (_id: string, s: unknown) => s);
   profileIpcMock.setListeningConsent.mockResolvedValue(undefined);
+  profileIpcMock.setPresenterWindowOpacity.mockResolvedValue(undefined);
   profileIpcMock.catalog.mockResolvedValue(CATALOG);
   profileIpcMock.save.mockImplementation(async (p: MeetingProfile) => p);
 }
@@ -130,7 +132,7 @@ export function makeProfile(over: Partial<MeetingProfile> = {}): MeetingProfile 
       screenShare: "none",
       teleprompter: {
         fontSize: 28, fontFamily: "", textDirection: "auto", colorPreset: "auto", lineSpacing: 1.45,
-        lineChars: 60, opacity: 0.92, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220,
+        lineChars: 60, windowOpacity: 1, scrollSpeed: 0, highContrast: true, x: 0, y: 0, width: 900, height: 220,
       },
     },
     presentation: {

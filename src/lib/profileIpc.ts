@@ -90,4 +90,7 @@ export const profileIpc = {
   displays: () => invoke<DisplayInfo[]>("list_displays"),
   placeOverlay: (x: number, y: number, width: number, height: number) =>
     invoke<void>("place_overlay", { x, y, width, height }),
+  /** Fades the whole overlay window (0.2–1); `null` returns it to its normal, opaque look. */
+  setPresenterWindowOpacity: (opacity: number | null) =>
+    invoke<void>("set_presenter_window_opacity", { opacity }),
 };

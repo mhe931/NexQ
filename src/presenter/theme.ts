@@ -1,12 +1,11 @@
 import type { CSSProperties } from "react";
 import { fontStack } from "../lib/presenterTypography";
 import type { TeleprompterSettings } from "../lib/profileTypes";
-import { DEFAULT_TELEPROMPTER_TEXT, TEXT_LIMITS } from "../lib/teleprompterDefaults";
+import { DEFAULT_TELEPROMPTER_TEXT } from "../lib/teleprompterDefaults";
 
 export interface Palette {
+  /** Always an opaque colour: the window's opacity is applied to the window as a whole, never to this. */
   bg: string;
-  /** Always fully opaque (popovers must stay readable whatever the opacity). */
-  solid: string;
   fg: string;
   muted: string;
   accent: string;
@@ -15,42 +14,34 @@ export interface Palette {
   border: string;
 }
 
-/** The opacity applies to the background only, and never drops below the readable minimum. */
-export function backgroundAlpha(opacity: number): number {
-  const { min, max } = TEXT_LIMITS.opacity;
-  return Math.min(Math.max(Number.isFinite(opacity) ? opacity : max, min), max);
-}
-
-const onBlack = (alpha: number, fg: string, muted: string, accent: string): Palette => ({
-  bg: `rgba(0, 0, 0, ${alpha})`, solid: "#000000", fg, muted, accent, onAccent: "#000000", border: "rgba(255,255,255,0.35)",
+const onBlack = (fg: string, muted: string, accent: string): Palette => ({
+  bg: "#000000", fg, muted, accent, onAccent: "#000000", border: "rgba(255,255,255,0.35)",
 });
 
 /**
  * Colours for the notes window. A chosen colour preset wins; "auto" keeps the
  * previous behaviour: high contrast is white on black, otherwise the app's own theme tokens.
- * Opacity only ever changes the background, so the text stays fully opaque.
+ * Every colour is opaque; the window opacity fades the finished window.
  */
 export function palette(t: TeleprompterSettings): Palette {
-  const alpha = backgroundAlpha(t.opacity);
   switch (t.colorPreset) {
     case "white_on_black":
-      return onBlack(alpha, "#ffffff", "#d4d4d8", "#fde047");
+      return onBlack("#ffffff", "#d4d4d8", "#fde047");
     case "yellow_on_black":
-      return onBlack(alpha, "#fde047", "#e7d98a", "#ffffff");
+      return onBlack("#fde047", "#e7d98a", "#ffffff");
     case "green_on_black":
-      return onBlack(alpha, "#4ade80", "#9bd8b3", "#ffffff");
+      return onBlack("#4ade80", "#9bd8b3", "#ffffff");
     case "black_on_white":
       return {
-        bg: `rgba(255, 255, 255, ${alpha})`, solid: "#ffffff", fg: "#000000", muted: "#3f3f46", accent: "#1d4ed8",
+        bg: "#ffffff", fg: "#000000", muted: "#3f3f46", accent: "#1d4ed8",
         onAccent: "#ffffff", border: "rgba(0,0,0,0.35)",
       };
     default:
       break;
   }
-  if (t.highContrast) return onBlack(alpha, "#ffffff", "#d4d4d8", "#fde047");
+  if (t.highContrast) return onBlack("#ffffff", "#d4d4d8", "#fde047");
   return {
-    bg: `hsl(var(--background) / ${alpha})`,
-    solid: "hsl(var(--background))",
+    bg: "hsl(var(--background))",
     fg: "hsl(var(--foreground))",
     muted: "hsl(var(--muted-foreground))",
     accent: "hsl(var(--primary))",

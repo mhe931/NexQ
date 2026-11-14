@@ -350,6 +350,24 @@ pub fn blur_behind_while_visible<R: Runtime>(window: &Window<R>) {
     }
 }
 
+/// Fades a whole window (`Some(0..=255)`) or ends the fade (`None`). The fade
+/// survives anything that rewrites the window's style.
+#[cfg(target_os = "windows")]
+pub fn set_window_alpha<R: Runtime>(window: &Window<R>, alpha: Option<u8>) -> Result<(), String> {
+    let hwnd = window.hwnd().map_err(|e| format!("no window handle: {e}"))?;
+    visibility_hook::set_alpha(hwnd.0 as isize, alpha)
+}
+
+/// Turns the overlay's blur-behind off or back on. The presenter window must
+/// show the real, sharp desktop through it, so it runs without the glass blur.
+#[cfg(target_os = "windows")]
+pub fn set_blur_behind_enabled<R: Runtime>(window: &Window<R>, enabled: bool) -> Result<(), String> {
+    let hwnd = window.hwnd().map_err(|e| format!("no window handle: {e}"))?;
+    let visible = window.is_visible().unwrap_or(false);
+    visibility_hook::allow_blur(hwnd.0 as isize, enabled, visible);
+    Ok(())
+}
+
 /// A window subclass that follows a window being shown and hidden: just before
 /// the window is shown it gets the stealth setting, and its blur-behind turns
 /// on and off with it. A window being hidden keeps its affinity (see
@@ -359,16 +377,17 @@ mod visibility_hook {
     use std::sync::{LazyLock, Mutex};
 
     use windows::core::s;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_SERVER};
     use windows::Win32::UI::Shell::{
         DefSubclassProc, ITaskbarList, RemoveWindowSubclass, SetWindowSubclass, TaskbarList,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        IsWindowVisible, KillTimer, LoadCursorW, RegisterWindowMessageA, SetCursor, SetTimer,
-        SetWindowDisplayAffinity, HTBOTTOMRIGHT, HTLEFT, IDC_ARROW, SWP_HIDEWINDOW, SWP_SHOWWINDOW, WINDOWPOS,
-        WINDOW_DISPLAY_AFFINITY, WM_NCDESTROY, WM_SETCURSOR, WM_TIMER, WM_WINDOWPOSCHANGED,
-        WM_WINDOWPOSCHANGING,
+        GetWindowLongPtrW, IsWindowVisible, KillTimer, LoadCursorW, RegisterWindowMessageA, SetCursor,
+        SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, GWL_EXSTYLE, HTBOTTOMRIGHT,
+        HTLEFT, IDC_ARROW, LWA_ALPHA, STYLESTRUCT, SWP_HIDEWINDOW, SWP_SHOWWINDOW, WINDOWPOS, WINDOW_DISPLAY_AFFINITY,
+        WM_NCDESTROY, WM_SETCURSOR, WM_STYLECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        WS_EX_LAYERED,
     };
 
     use super::TabAction;
@@ -476,6 +495,66 @@ mod visibility_hook {
         }
         drop(blurred);
         set_blur(HWND(hwnd as *mut _), visible_now);
+    }
+
+    /// Windows the presenter fades, with their 0-255 alpha. tao rewrites a
+    /// window's extended style whenever its own flags change (shown, hidden,
+    /// resized, pinned), which drops `WS_EX_LAYERED`; the subclass puts it back.
+    static FADED: Mutex<Vec<(isize, u8)>> = Mutex::new(Vec::new());
+
+    fn faded_alpha(hwnd: HWND) -> Option<u8> {
+        FADED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(h, _)| *h == hwnd.0 as isize)
+            .map(|(_, a)| *a)
+    }
+
+    /// Layered window with a whole-window alpha. Never adds click-through.
+    fn apply_alpha(hwnd: HWND, alpha: u8) -> windows::core::Result<()> {
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if style & WS_EX_LAYERED.0 as isize == 0 {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+            }
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)
+        }
+    }
+
+    /// Fade the whole window to `alpha` (0-255) and keep it faded, or end the
+    /// fade with `None` (any thread).
+    pub fn set_alpha(hwnd: isize, alpha: Option<u8>) -> Result<(), String> {
+        let handle = HWND(hwnd as *mut _);
+        let mut faded = FADED.lock().unwrap_or_else(|e| e.into_inner());
+        faded.retain(|(h, _)| *h != hwnd);
+        match alpha {
+            Some(a) => {
+                faded.push((hwnd, a));
+                drop(faded);
+                apply_alpha(handle, a).map_err(|e| format!("SetLayeredWindowAttributes failed: {e}"))
+            }
+            None => {
+                drop(faded);
+                unsafe {
+                    let style = GetWindowLongPtrW(handle, GWL_EXSTYLE);
+                    if style & WS_EX_LAYERED.0 as isize != 0 {
+                        SetWindowLongPtrW(handle, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Stop (or resume) following `hwnd`'s visibility with a blur, and apply it now.
+    pub fn allow_blur(hwnd: isize, allowed: bool, visible_now: bool) {
+        if allowed {
+            blur_while_visible(hwnd, visible_now);
+        } else {
+            BLURRED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&h| h != hwnd);
+            set_blur(HWND(hwnd as *mut _), false);
+        }
     }
 
     fn wants_blur(hwnd: HWND) -> bool {
@@ -595,6 +674,19 @@ mod visibility_hook {
                     set_blur(hwnd, false);
                 }
             }
+            WM_STYLECHANGED => {
+                // Something rewrote the extended style: a faded window must stay layered.
+                if wparam.0 as i32 == GWL_EXSTYLE.0 {
+                    let style = &*(lparam.0 as *const STYLESTRUCT);
+                    if let Some(alpha) = faded_alpha(hwnd) {
+                        if style.styleNew & WS_EX_LAYERED.0 == 0 {
+                            if let Err(e) = apply_alpha(hwnd, alpha) {
+                                log::warn!("Window opacity: couldn't restore the fade: {e}");
+                            }
+                        }
+                    }
+                }
+            }
             WM_WINDOWPOSCHANGED => {
                 let pos = &*(lparam.0 as *const WINDOWPOS);
                 // Shown: the accent only takes on a visible window.
@@ -646,6 +738,7 @@ mod visibility_hook {
                 EXCLUDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&h| h != hwnd.0 as isize);
                 ARROW_EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|&h| h != hwnd.0 as isize);
                 TASKBAR_MANAGED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&h| h != hwnd.0 as isize);
+                FADED.lock().unwrap_or_else(|e| e.into_inner()).retain(|(h, _)| *h != hwnd.0 as isize);
                 TABS_REMOVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&h| h != hwnd.0 as isize);
             }
             _ => {}
