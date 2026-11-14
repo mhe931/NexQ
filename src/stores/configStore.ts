@@ -149,6 +149,8 @@ export const DEFAULT_MEETING_DETECTION: MeetingDetectionConfig = {
   webex: true,
   slack: false,
   discord: false,
+  jitsi: true,
+  whereby: true,
   auto_dismiss_secs: 60,
   default_scenario: "team_meeting",
   check_interval_secs: 3,

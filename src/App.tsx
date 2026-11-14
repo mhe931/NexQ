@@ -28,6 +28,7 @@ import { initMeetingSpeakers, resetMeetingScopedStores } from "./stores/resetMee
 import { listen } from "@tauri-apps/api/event";
 import type { AppView, Meeting, AudioMode, AIScenario, STTProviderType } from "./lib/types";
 import { usePresenterStore } from "./stores/presenterStore";
+import { startDetectedChoice } from "./lib/startDetectedChoice";
 import { PresenterOverlay } from "./presenter/PresenterOverlay";
 import { HomeShell } from "./home/HomeShell";
 import { useDemoShortcut } from "./demo/useDemoShortcut";
@@ -188,8 +189,14 @@ function App() {
   useEffect(() => {
     if (windowLabel !== "launcher") return;
     let unlisten: (() => void) | undefined;
-    onStartDetectedMeeting(({ title, scenario }) => {
+    onStartDetectedMeeting(({ title, scenario, choice }) => {
       if (useMeetingStore.getState().activeMeeting) return;
+      if (choice) {
+        startDetectedChoice(choice).catch((err) => {
+          console.error("[App] Starting the chosen meeting failed:", err);
+        });
+        return;
+      }
       useMeetingStore.getState().startMeetingFlow(title, "online", scenario).catch((err) => {
         console.error("[App] Starting the detected meeting failed:", err);
       });

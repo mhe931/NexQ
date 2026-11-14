@@ -3,6 +3,7 @@
 // ============================================================================
 
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { StartChoice } from "./meetingChoice";
 import type {
   AIScenario,
   MeetingPromptInfo,
@@ -366,6 +367,8 @@ export function onDetectedMeetingEnded(handler: () => void): Promise<UnlistenFn>
 export interface StartDetectedMeetingEvent {
   title: string;
   scenario: AIScenario;
+  /** A saved meeting to start, or a new Presentation + Q&A to set up. Absent: the classic quick meeting. */
+  choice?: StartChoice;
 }
 
 export function emitStartDetectedMeeting(payload: StartDetectedMeetingEvent): Promise<void> {

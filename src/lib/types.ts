@@ -1091,6 +1091,8 @@ export interface MeetingDetectionConfig {
   webex: boolean;
   slack: boolean;
   discord: boolean;
+  jitsi: boolean;
+  whereby: boolean;
   /** Seconds before an unanswered prompt goes away (0 = until the call ends). */
   auto_dismiss_secs: number;
   /** AI scenario for meetings started from the prompt. */

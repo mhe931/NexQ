@@ -17,6 +17,8 @@ pub struct MeetingDetectionConfig {
     pub webex: bool,
     pub slack: bool,
     pub discord: bool,
+    pub jitsi: bool,
+    pub whereby: bool,
     /// Seconds before an unanswered prompt goes away (0 = stays until the call ends).
     pub auto_dismiss_secs: u32,
     /// AI scenario a meeting started from the prompt uses (`AIScenario`).
@@ -46,6 +48,8 @@ impl Default for MeetingDetectionConfig {
             webex: true,
             slack: false,
             discord: false,
+            jitsi: true,
+            whereby: true,
             auto_dismiss_secs: 60,
             default_scenario: "team_meeting".to_string(),
             check_interval_secs: 3,
@@ -61,6 +65,10 @@ pub enum CallApp {
     Webex,
     Slack,
     Discord,
+    /// Browser only (jitsi.org and self-hosted Jitsi Meet).
+    Jitsi,
+    /// Browser only.
+    Whereby,
 }
 
 impl CallApp {
@@ -72,6 +80,8 @@ impl CallApp {
             CallApp::Webex => "webex",
             CallApp::Slack => "slack",
             CallApp::Discord => "discord",
+            CallApp::Jitsi => "jitsi",
+            CallApp::Whereby => "whereby",
         }
     }
 
@@ -83,6 +93,8 @@ impl CallApp {
             CallApp::Webex => "Webex",
             CallApp::Slack => "Slack",
             CallApp::Discord => "Discord",
+            CallApp::Jitsi => "Jitsi Meet",
+            CallApp::Whereby => "Whereby",
         }
     }
 
@@ -94,6 +106,8 @@ impl CallApp {
             CallApp::Webex => cfg.webex,
             CallApp::Slack => cfg.slack,
             CallApp::Discord => cfg.discord,
+            CallApp::Jitsi => cfg.jitsi,
+            CallApp::Whereby => cfg.whereby,
         }
     }
 }
@@ -190,10 +204,70 @@ pub fn detect(capturing: &[String], windows: &[WindowInfo], cfg: &MeetingDetecti
                 }
             } else if page.contains("Webex") && cfg.webex {
                 return Some(DetectedMeeting::new(CallApp::Webex, webex_title(&page)));
+            } else if let Some(title) = jitsi_title(&page) {
+                if cfg.jitsi {
+                    return Some(DetectedMeeting::new(CallApp::Jitsi, title));
+                }
+            } else if let Some(title) = whereby_title(&page) {
+                if cfg.whereby {
+                    return Some(DetectedMeeting::new(CallApp::Whereby, title));
+                }
             }
         }
     }
     None
+}
+
+/// A browser call stays the same call while that browser keeps the microphone,
+/// even after the user switches to another tab (for example to the slides), which
+/// changes the window title that detection reads.
+#[derive(Debug, Default)]
+pub struct BrowserCallMemory {
+    last: Option<(Vec<String>, DetectedMeeting)>,
+}
+
+impl BrowserCallMemory {
+    pub fn apply(
+        &mut self,
+        capturing: &[String],
+        windows: &[WindowInfo],
+        seen: Option<DetectedMeeting>,
+    ) -> Option<DetectedMeeting> {
+        let browsers: Vec<String> = capturing.iter().filter(|e| BROWSERS.contains(&e.as_str())).cloned().collect();
+        let native = capturing.iter().any(|e| native_app(e).is_some());
+        if let Some(meeting) = &seen {
+            // Only a call seen in a browser is remembered (a native app's own mic session is its meeting).
+            self.last = (!native && !browsers.is_empty()).then(|| (browsers, meeting.clone()));
+            return seen;
+        }
+        match &self.last {
+            Some((exes, meeting))
+                if exes.iter().any(|e| capturing.contains(e)) && windows.iter().any(|w| exes.contains(&w.exe)) =>
+            {
+                Some(meeting.clone())
+            }
+            _ => {
+                self.last = None;
+                None
+            }
+        }
+    }
+}
+
+/// "Standup | Jitsi Meet" → "Standup"; a bare "Jitsi Meet" is a call without a title.
+fn jitsi_title(page: &str) -> Option<Option<String>> {
+    if !page.contains("Jitsi Meet") {
+        return None;
+    }
+    Some(non_empty(&page.replace("| Jitsi Meet", "").replace("Jitsi Meet", "")))
+}
+
+/// "Whereby" or "<room> | Whereby" / "<room> - Whereby".
+fn whereby_title(page: &str) -> Option<Option<String>> {
+    if !page.contains("Whereby") {
+        return None;
+    }
+    Some(non_empty(&page.replace("| Whereby", "").replace("- Whereby", "").replace("Whereby", "")))
 }
 
 fn clean(title: &str) -> String {
@@ -408,6 +482,41 @@ mod tests {
         let code = detect(&caps(&["msedge.exe"]), &[win("msedge.exe", "Meet - abc-defg-hij and 2 more pages - Personal - Microsoft\u{200b} Edge")], &cfg()).unwrap();
         assert_eq!((code.app.as_str(), code.title), ("google_meet", None));
         assert_eq!(detect(&caps(&["chrome.exe"]), &[win("chrome.exe", "Quora - Google Chrome")], &cfg()), None);
+    }
+
+    #[test]
+    fn jitsi_and_whereby_tabs_are_calls_and_respect_their_switches() {
+        let jitsi = detect(&caps(&["firefox.exe"]), &[win("firefox.exe", "Standup | Jitsi Meet — Mozilla Firefox")], &cfg()).unwrap();
+        assert_eq!((jitsi.app.as_str(), jitsi.title.as_deref()), ("jitsi", Some("Standup")));
+        let bare = detect(&caps(&["chrome.exe"]), &[win("chrome.exe", "Jitsi Meet - Google Chrome")], &cfg()).unwrap();
+        assert_eq!((bare.app.as_str(), bare.title), ("jitsi", None));
+        let whereby = detect(&caps(&["chrome.exe"]), &[win("chrome.exe", "Design crit - Whereby - Google Chrome")], &cfg()).unwrap();
+        assert_eq!((whereby.app.as_str(), whereby.title.as_deref()), ("whereby", Some("Design crit")));
+        assert_eq!(detect(&caps(&["chrome.exe"]), &[win("chrome.exe", "Jitsi Meet - Google Chrome")], &MeetingDetectionConfig { jitsi: false, ..cfg() }), None);
+    }
+
+    #[test]
+    fn a_browser_call_survives_a_switch_to_the_slides_tab_while_the_mic_is_held() {
+        let mut memory = BrowserCallMemory::default();
+        let on_meet = [win("chrome.exe", "Meet – Q4 planning - Google Chrome")];
+        let seen = detect(&caps(&["chrome.exe"]), &on_meet, &cfg());
+        assert_eq!(memory.apply(&caps(&["chrome.exe"]), &on_meet, seen).unwrap().app, "google_meet");
+        // The user brings the slides to the front: the title no longer says Meet, the mic is still held.
+        let on_slides = [win("chrome.exe", "Thesis - Google Slides - Google Chrome")];
+        let seen = detect(&caps(&["chrome.exe"]), &on_slides, &cfg());
+        assert_eq!(seen, None);
+        assert_eq!(memory.apply(&caps(&["chrome.exe"]), &on_slides, seen).unwrap().app, "google_meet");
+        // The call ends: the browser lets go of the microphone.
+        assert_eq!(memory.apply(&[], &on_slides, None), None);
+        assert_eq!(memory.apply(&caps(&["chrome.exe"]), &on_slides, None), None, "forgotten for good");
+    }
+
+    #[test]
+    fn a_native_app_call_is_not_mistaken_for_a_browser_call() {
+        let mut memory = BrowserCallMemory::default();
+        let seen = detect(&caps(&["zoom.exe", "chrome.exe"]), &[win("zoom.exe", "Zoom Meeting")], &cfg());
+        assert_eq!(memory.apply(&caps(&["zoom.exe", "chrome.exe"]), &[win("zoom.exe", "Zoom Meeting")], seen).unwrap().app, "zoom");
+        assert_eq!(memory.apply(&caps(&["chrome.exe"]), &[win("chrome.exe", "News - Google Chrome")], None), None);
     }
 
     #[test]

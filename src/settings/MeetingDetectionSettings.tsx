@@ -4,13 +4,15 @@ import { useMeetingScenarios, useScenarioStore } from "../stores/scenarioStore";
 import { isMacPlatform } from "../lib/shortcutLabel";
 import type { AIScenario, MeetingDetectionConfig } from "../lib/types";
 
-type AppKey = "zoom" | "teams" | "google_meet" | "webex" | "slack" | "discord";
+type AppKey = "zoom" | "teams" | "google_meet" | "webex" | "slack" | "discord" | "jitsi" | "whereby";
 
 const APPS: Array<{ key: AppKey; label: string }> = [
   { key: "zoom", label: "Zoom" },
   { key: "teams", label: "Microsoft Teams" },
   { key: "google_meet", label: "Google Meet" },
   { key: "webex", label: "Webex" },
+  { key: "jitsi", label: "Jitsi Meet (browser)" },
+  { key: "whereby", label: "Whereby (browser)" },
   { key: "slack", label: "Slack huddles" },
   { key: "discord", label: "Discord" },
 ];
