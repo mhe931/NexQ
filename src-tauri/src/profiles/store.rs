@@ -61,6 +61,7 @@ pub fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         ",
     )?;
+    super::notes::migrate(conn)?;
     // Session history: the meeting row records which profile it ran under.
     if let Err(e) = conn.execute("ALTER TABLE meetings ADD COLUMN profile_id TEXT", []) {
         if !e.to_string().contains("duplicate column") {
@@ -105,6 +106,19 @@ pub struct SlideRow {
     pub body: String,
     pub notes_original: String,
     pub notes_edited: Option<String>,
+    /// Notes from a separately imported speaker-notes document, if mapped here.
+    #[serde(default)]
+    pub notes_external: Option<String>,
+    /// What the presenter view shows, by the meeting's priority (see `notes::effective`).
+    #[serde(default)]
+    pub effective_notes: String,
+    /// `edited`, `external`, `embedded` or `none`.
+    #[serde(default)]
+    pub notes_source: String,
+    /// `ok`, `differ` (embedded and external disagree), `duplicate` (several external
+    /// blocks on this slide) or `missing`.
+    #[serde(default)]
+    pub notes_status: String,
 }
 
 impl SlideRow {
@@ -234,6 +248,13 @@ pub fn duplicate_profile(conn: &Connection, id: &str) -> Result<MeetingProfile, 
             params![doc.id, new_id, new_doc_id, id],
         )
         .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO profile_notes_blocks (id, profile_id, document_id, ordinal, label, detected_slide, assigned_slide, text, manual)
+             SELECT lower(hex(randomblob(16))), ?2, ?3, ordinal, label, detected_slide, assigned_slide, text, manual
+             FROM profile_notes_blocks WHERE document_id = ?1",
+            params![doc.id, new_id, new_doc_id],
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(created)
 }
@@ -245,6 +266,8 @@ pub fn delete_profile(conn: &Connection, id: &str) -> Result<(), String> {
     conn.execute("DELETE FROM profile_fts WHERE profile_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM profile_slides WHERE profile_id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM profile_notes_blocks WHERE profile_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM profile_documents WHERE profile_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
@@ -337,6 +360,7 @@ pub fn remove_document(conn: &Connection, profile_id: &str, document_id: &str) -
         params![profile_id, document_id],
     )
     .map_err(|e| e.to_string())?;
+    super::notes::remove_document(conn, document_id)?;
     Ok(())
 }
 
@@ -393,10 +417,41 @@ pub fn list_slides(conn: &Connection, profile_id: &str) -> Result<Vec<SlideRow>,
                 body: r.get(3)?,
                 notes_original: r.get(4)?,
                 notes_edited: r.get(5)?,
+                notes_external: None,
+                effective_notes: String::new(),
+                notes_source: String::new(),
+                notes_status: String::new(),
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    let mut slides: Vec<SlideRow> = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    if slides.is_empty() {
+        return Ok(slides);
+    }
+    let priority = get_profile(conn, profile_id)
+        .map(|p| p.presentation.notes_priority)
+        .unwrap_or(super::model::NotesPriority::ExternalFirst);
+    let external = super::notes::external_by_slide(conn, profile_id)?;
+    for s in &mut slides {
+        let ext = external.get(&s.slide_no);
+        s.notes_external = ext.map(|(text, _)| text.clone());
+        let (text, source) = super::notes::effective(
+            priority, s.notes_edited.as_deref(), s.notes_external.as_deref(), &s.notes_original,
+        );
+        s.effective_notes = text;
+        s.notes_source = source.to_string();
+        s.notes_status = if ext.is_some_and(|(_, n)| *n > 1) {
+            "duplicate"
+        } else if super::notes::differs(s.notes_external.as_deref(), &s.notes_original) {
+            "differ"
+        } else if source == "none" {
+            "missing"
+        } else {
+            "ok"
+        }
+        .into();
+    }
+    Ok(slides)
 }
 
 /// Saves the meeting's own copy of a slide's notes; the imported file is untouched.

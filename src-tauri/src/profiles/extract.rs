@@ -9,7 +9,12 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "pdf", "docx", "pptx", "html", "htm"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "pdf", "docx", "pptx", "pptm", "ppsx", "html", "htm"];
+
+/// PowerPoint package formats that carry slides and notes in the same layout.
+pub fn is_presentation_ext(ext: &str) -> bool {
+    matches!(ext, "pptx" | "pptm" | "ppsx")
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
@@ -65,7 +70,7 @@ pub fn extract(path: &Path) -> Result<Extracted, String> {
             sections: docx_sections(&read_zip_entry(path, "word/document.xml")?),
             ..Default::default()
         },
-        "pptx" => extract_pptx(path)?,
+        "pptx" | "pptm" | "ppsx" => extract_pptx(path)?,
         "html" | "htm" => Extracted {
             file_type: "html".into(),
             sections: html_sections(&String::from_utf8_lossy(
@@ -85,6 +90,15 @@ pub fn extract(path: &Path) -> Result<Extracted, String> {
         return Err("No readable text was found (a scanned or image-only file?).".into());
     }
     Ok(out)
+}
+
+/// The document as lines of text in reading order (for notes documents).
+/// Markdown and text keep their raw lines so `# Slide 1` headings survive.
+pub fn plain_text(path: &Path) -> Result<String, String> {
+    match extension_of(path).as_str() {
+        "md" | "markdown" | "txt" => read_text(path.to_str().ok_or("The file path is not valid Unicode.")?),
+        _ => Ok(extract(path)?.sections.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n")),
+    }
 }
 
 fn read_text(path: &str) -> Result<String, String> {

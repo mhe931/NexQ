@@ -176,7 +176,11 @@ pub struct AudioSettings {
     pub output_device_id: Option<String>,
     pub output_mode: OutputMode,
     /// The user confirmed that everyone whose audio is captured has agreed.
+    /// Asked once per meeting (during setup, or at the first Start listening) and kept;
+    /// it is not repeated on pause/resume, Q&A transitions or questions.
     pub listening_consent_confirmed: bool,
+    /// When that acknowledgement was given (RFC 3339), for the user's own records.
+    pub listening_acknowledged_at: Option<String>,
 }
 
 impl Default for AudioSettings {
@@ -187,14 +191,42 @@ impl Default for AudioSettings {
             output_device_id: None,
             output_mode: OutputMode::Text,
             listening_consent_confirmed: false,
+            listening_acknowledged_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextDirection {
+    /// Each paragraph follows its own first strong character (mixed Persian/English).
+    Auto,
+    Ltr,
+    Rtl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorPreset {
+    /// Follows `high_contrast`.
+    Auto,
+    WhiteOnBlack,
+    YellowOnBlack,
+    GreenOnBlack,
+    BlackOnWhite,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TeleprompterSettings {
     pub font_size: u32,
+    /// Preferred font family; empty uses the built-in stack. Always rendered
+    /// with fallbacks so Latin and Persian text stay readable.
+    pub font_family: String,
+    pub text_direction: TextDirection,
+    pub color_preset: ColorPreset,
+    /// Line height multiplier.
+    pub line_spacing: f32,
     /// Maximum line length in characters (0 = fill the window).
     pub line_chars: u32,
     pub opacity: f32,
@@ -212,6 +244,10 @@ impl Default for TeleprompterSettings {
     fn default() -> Self {
         Self {
             font_size: 28,
+            font_family: String::new(),
+            text_direction: TextDirection::Auto,
+            color_preset: ColorPreset::Auto,
+            line_spacing: 1.45,
             line_chars: 60,
             opacity: 0.92,
             scroll_speed: 0,
@@ -252,15 +288,100 @@ impl Default for EnvironmentSettings {
     }
 }
 
+/// Which notes win when a slide has both embedded and external notes.
+/// A slide's own manually edited copy always wins over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotesPriority {
+    /// edited > external speaker-notes document > embedded (default)
+    ExternalFirst,
+    /// edited > embedded > external
+    EmbeddedFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundKind {
+    Powerpoint,
+    GoogleSlides,
+    Other,
+}
+
+/// The presentation this meeting was last bound to. It is only a hint:
+/// the target is looked up again (and may be gone) every time it is used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentationBinding {
+    pub id: String,
+    pub title: String,
+    pub kind: BoundKind,
+    pub bound_at: String,
+}
+
+/// Keyboard keys (`KeyboardEvent.key`) for each presenter action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Shortcuts {
+    pub next: Vec<String>,
+    pub prev: Vec<String>,
+    pub first: Vec<String>,
+    pub last: Vec<String>,
+    pub start_qa: Vec<String>,
+}
+
+impl Default for Shortcuts {
+    fn default() -> Self {
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect();
+        Self {
+            next: keys(&["ArrowRight", "PageDown", "n"]),
+            prev: keys(&["ArrowLeft", "PageUp", "p"]),
+            first: keys(&["Home"]),
+            last: keys(&["End"]),
+            start_qa: keys(&["q"]),
+        }
+    }
+}
+
+impl Shortcuts {
+    fn validate(&self) -> Result<(), String> {
+        let groups = [
+            ("next slide", &self.next), ("previous slide", &self.prev), ("first slide", &self.first),
+            ("last slide", &self.last), ("start Q&A", &self.start_qa),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (label, keys) in groups {
+            if keys.is_empty() {
+                return Err(format!("The shortcut for {label} needs at least one key."));
+            }
+            for key in keys {
+                if key.is_empty() || key.chars().count() > 20 {
+                    return Err(format!("Invalid key for {label}."));
+                }
+                // Arrow up/down and H are reserved for scrolling and hiding.
+                if matches!(key.as_str(), "ArrowUp" | "ArrowDown" | "h" | "H") {
+                    return Err(format!("{key} is reserved (scrolling / hide) and cannot be used for {label}."));
+                }
+                if let Some(other) = seen.insert(key.to_lowercase(), label) {
+                    return Err(format!("{key} is assigned to both {other} and {label}."));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PresentationSettings {
     pub source: PresentationSource,
     pub google_slides_url: String,
-    /// Automatic slide following is only offered where a supported
-    /// integration exists; manual selection is always available.
+    /// Follow slide changes made directly in the bound presentation.
+    /// Only effective where the integration can report the current slide.
     pub auto_follow: bool,
     pub current_slide: u32,
+    pub notes_priority: NotesPriority,
+    pub binding: Option<PresentationBinding>,
+    pub shortcuts: Shortcuts,
 }
 
 impl Default for PresentationSettings {
@@ -268,8 +389,11 @@ impl Default for PresentationSettings {
         Self {
             source: PresentationSource::None,
             google_slides_url: String::new(),
-            auto_follow: false,
+            auto_follow: true,
             current_slide: 1,
+            notes_priority: NotesPriority::ExternalFirst,
+            binding: None,
+            shortcuts: Shortcuts::default(),
         }
     }
 }
@@ -409,9 +533,22 @@ impl MeetingProfile {
         if !(12..=120).contains(&t.font_size) {
             return Err("Teleprompter font size must be between 12 and 120.".into());
         }
-        if !(0.2..=1.0).contains(&t.opacity) {
-            return Err("Teleprompter opacity must be between 0.2 and 1.0.".into());
+        // Below 0.3 the notes become easy to lose on a busy screen.
+        if !(0.3..=1.0).contains(&t.opacity) {
+            return Err("Teleprompter opacity must be between 0.3 and 1.0.".into());
         }
+        if !(1.0..=2.5).contains(&t.line_spacing) {
+            return Err("Teleprompter line spacing must be between 1.0 and 2.5.".into());
+        }
+        if t.line_chars != 0 && !(20..=200).contains(&t.line_chars) {
+            return Err("Teleprompter line length must be 0 (full width) or between 20 and 200 characters.".into());
+        }
+        if t.font_family.chars().count() > 80
+            || t.font_family.chars().any(|c| c.is_control() || matches!(c, '"' | '\'' | ';' | '{' | '}' | '<' | '>' | '\\'))
+        {
+            return Err("The font name contains characters that are not allowed.".into());
+        }
+        self.presentation.shortcuts.validate()?;
         if self.ai.max_response_seconds == 0 || self.ai.max_response_seconds > 300 {
             return Err("Maximum response time must be between 1 and 300 seconds.".into());
         }
@@ -468,6 +605,43 @@ mod tests {
         let sparse: MeetingProfile = serde_json::from_str(r#"{"id":"x","name":"Old"}"#).unwrap();
         assert_eq!(sparse.ai.strategy, Strategy::Balanced);
         assert_eq!(sparse.audio.output_mode, OutputMode::Text);
+    }
+
+    #[test]
+    fn presenter_text_preferences_are_bounded_and_older_profiles_get_defaults() {
+        let mut p = MeetingProfile { name: "A".into(), ..Default::default() };
+        p.environment.teleprompter.opacity = 0.1;
+        assert!(p.validate().unwrap_err().contains("opacity"));
+        p.environment.teleprompter.opacity = 0.5;
+        p.environment.teleprompter.line_spacing = 3.0;
+        assert!(p.validate().is_err());
+        p.environment.teleprompter.line_spacing = 1.6;
+        p.environment.teleprompter.font_family = "Vazirmatn; } body{display:none".into();
+        assert!(p.validate().unwrap_err().contains("font"));
+        p.environment.teleprompter.font_family = "B Nazanin".into();
+        p.environment.teleprompter.text_direction = TextDirection::Rtl;
+        assert!(p.validate().is_ok());
+
+        // A profile saved before these fields existed keeps working.
+        let old: MeetingProfile = serde_json::from_str(
+            r#"{"id":"x","name":"Old","environment":{"teleprompter":{"fontSize":30}}}"#).unwrap();
+        assert_eq!(old.environment.teleprompter.font_size, 30);
+        assert_eq!(old.environment.teleprompter.text_direction, TextDirection::Auto);
+        assert_eq!(old.presentation.notes_priority, NotesPriority::ExternalFirst);
+        assert!(old.presentation.auto_follow && old.presentation.binding.is_none());
+    }
+
+    #[test]
+    fn shortcuts_must_be_unique_non_empty_and_not_reserved() {
+        let mut p = MeetingProfile { name: "A".into(), ..Default::default() };
+        assert!(p.validate().is_ok());
+        p.presentation.shortcuts.first = vec!["ArrowRight".into()];
+        assert!(p.validate().unwrap_err().contains("assigned to both"));
+        p.presentation.shortcuts.first = vec!["Home".into()];
+        p.presentation.shortcuts.last = vec![];
+        assert!(p.validate().unwrap_err().contains("at least one"));
+        p.presentation.shortcuts.last = vec!["h".into()];
+        assert!(p.validate().unwrap_err().contains("reserved"));
     }
 
     #[test]

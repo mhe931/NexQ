@@ -2,8 +2,10 @@
 
 pub mod extract;
 pub mod failover;
+pub mod fonts;
 pub mod ingest;
 pub mod model;
+pub mod notes;
 pub mod prompt;
 pub mod retrieval;
 pub mod routing;

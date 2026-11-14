@@ -9,6 +9,7 @@ pub mod rag;
 pub mod llm;
 pub mod meeting_detect;
 pub mod ort_runtime;
+pub mod presentation;
 pub mod profiles;
 pub mod state;
 pub mod stt;
@@ -48,6 +49,7 @@ use commands::stealth_commands;
 use commands::gemini_cache_commands;
 // == MODULE COMMANDS: rag ==
 use commands::rag_commands;
+use commands::presentation_commands;
 use commands::profile_commands;
 // == MODULE COMMANDS: recording ==
 use commands::recording_commands;
@@ -608,6 +610,22 @@ pub fn run() {
             profile_commands::profile_sessions,
             profile_commands::profile_clear_sessions,
             profile_commands::list_displays,
+            presentation_commands::present_list_targets,
+            presentation_commands::present_bind,
+            presentation_commands::present_disconnect,
+            presentation_commands::present_revalidate,
+            presentation_commands::present_status,
+            presentation_commands::present_goto,
+            presentation_commands::present_test_navigation,
+            presentation_commands::profile_add_presentation,
+            presentation_commands::profile_presentation_info,
+            presentation_commands::profile_add_notes,
+            presentation_commands::profile_notes_blocks,
+            presentation_commands::profile_notes_assign,
+            presentation_commands::profile_update_teleprompter,
+            presentation_commands::profile_update_presentation,
+            presentation_commands::profile_set_listening_consent,
+            presentation_commands::list_system_fonts,
             profile_commands::place_overlay,
             intelligence_commands::update_speaker_context,
             // == COMMANDS: context ==

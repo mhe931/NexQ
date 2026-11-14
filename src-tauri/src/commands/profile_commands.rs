@@ -14,12 +14,12 @@ use crate::profiles::store::{self, ProfileDocument, SlideRow};
 use crate::profiles::{prompt, templates, ActiveProfile};
 use crate::state::AppState;
 
-fn database(state: &AppState) -> Result<Arc<Mutex<DatabaseManager>>, String> {
+pub(crate) fn database(state: &AppState) -> Result<Arc<Mutex<DatabaseManager>>, String> {
     state.database.clone().ok_or_else(|| "The database is not available.".to_string())
 }
 
 /// Runs `work` on a dedicated connection so imports never block other database users.
-async fn with_connection<T, F>(state: &AppState, work: F) -> Result<T, String>
+pub(crate) async fn with_connection<T, F>(state: &AppState, work: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> Result<T, String> + Send + 'static,
@@ -33,7 +33,7 @@ where
     .map_err(|e| format!("Background task failed: {e}"))?
 }
 
-fn quick<T>(state: &AppState, work: impl FnOnce(&rusqlite::Connection) -> Result<T, String>) -> Result<T, String> {
+pub(crate) fn quick<T>(state: &AppState, work: impl FnOnce(&rusqlite::Connection) -> Result<T, String>) -> Result<T, String> {
     let db = database(state)?;
     let guard = db.lock().map_err(|e| e.to_string())?;
     work(guard.connection())
