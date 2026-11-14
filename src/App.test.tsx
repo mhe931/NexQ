@@ -18,6 +18,8 @@ import App from "./App";
 import { useMeetingStore } from "./stores/meetingStore";
 import { useScenarioStore } from "./stores/scenarioStore";
 import type { AIScenario } from "./lib/types";
+import { usePresenterStore } from "./stores/presenterStore";
+import { makeProfile } from "./test/profileFixtures";
 
 /** config.json, which both windows read and the launcher writes. */
 let savedConfig: Record<string, unknown> = {};
@@ -49,6 +51,8 @@ beforeAll(() => {
     }
     if (cmd === "list_meetings") return "[]"; // Sent as a JSON string, like the two below
     if (cmd === "get_rag_status" || cmd === "get_token_budget") return "null";
+    if (cmd === "profile_get") return makeProfile({ meetingType: "general", name: "Board prep" });
+    if (cmd === "profile_slides") return [];
     return [];
   }, { shouldMockEvents: true });
   vi.stubGlobal("ResizeObserver", class {
@@ -64,7 +68,8 @@ afterEach(() => {
   cleanup();
   listeners.clear();
   useMeetingStore.getState().stopTimer();
-  useMeetingStore.setState({ activeMeeting: null, currentView: "launcher", isRecording: false });
+  useMeetingStore.setState({ activeMeeting: null, currentView: "launcher", isRecording: false, profileId: null, listening: false });
+  usePresenterStore.getState().clear();
   useScenarioStore.setState({ activeScenarioId: "team_meeting", customScenarios: [], scenarioOverrides: {} });
 });
 
@@ -81,6 +86,26 @@ describe("scenarios saved by another window", () => {
       });
       expect(useScenarioStore.getState().resolveScenario("custom_1")).toBe("custom_1");
     });
+  });
+});
+
+describe("a meeting started from a saved profile", () => {
+  it("shows the presenter view instead of the classic overlay", async () => {
+    await launchOverlayOn("team_meeting");
+    await act(async () => {
+      await listeners.get("nexq:meeting_started")?.({
+        payload: {
+          meeting: { id: "meeting-2", title: "Board prep" },
+          audioMode: "online",
+          aiScenario: "team_meeting",
+          profileId: "p1",
+          listening: false,
+        },
+      });
+    });
+    expect(await screen.findByText("REHEARSAL — AI assisted")).toBeTruthy();
+    expect(screen.getByText("NOT LISTENING")).toBeTruthy();
+    expect(screen.queryByText("Transcript")).toBeNull();
   });
 });
 

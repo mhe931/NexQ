@@ -15,6 +15,8 @@ export default defineConfig(async () => ({
     environment: "jsdom",
     setupFiles: ["src/test/setup.ts"],
     globals: true,
+    // Heavy component tests exceed 5 s when the whole suite runs in parallel.
+    testTimeout: 20_000,
     // Agent worktrees hold full copies of the repo.
     exclude: ["**/node_modules/**", "**/dist/**", ".claude/**"],
   },

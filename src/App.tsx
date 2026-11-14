@@ -3,7 +3,6 @@ import { useMeetingStore } from "./stores/meetingStore";
 import { useConfigStore } from "./stores/configStore";
 import { useAIActionsStore } from "./stores/aiActionsStore";
 import { useScenarioStore, watchSavedScenarios } from "./stores/scenarioStore";
-import { LauncherView } from "./launcher/LauncherView";
 import { OverlayView } from "./overlay/OverlayView";
 import { SettingsOverlay } from "./settings/SettingsOverlay";
 import { FirstRunWizard } from "./components/wizard/FirstRunWizard";
@@ -27,7 +26,10 @@ import { SelectionToolbar } from "./components/SelectionToolbar";
 import { ActiveMeetingProvider } from "./components/ActiveMeetingProvider";
 import { initMeetingSpeakers, resetMeetingScopedStores } from "./stores/resetMeeting";
 import { listen } from "@tauri-apps/api/event";
-import type { AppView, Meeting, AudioMode, AIScenario } from "./lib/types";
+import type { AppView, Meeting, AudioMode, AIScenario, STTProviderType } from "./lib/types";
+import { usePresenterStore } from "./stores/presenterStore";
+import { PresenterOverlay } from "./presenter/PresenterOverlay";
+import { HomeShell } from "./home/HomeShell";
 import { useDemoShortcut } from "./demo/useDemoShortcut";
 import { DemoPicker } from "./demo/DemoPicker";
 import { DemoBadge } from "./demo/DemoBadge";
@@ -45,6 +47,8 @@ function App() {
   // Changes on every new meeting → used as a React key to remount overlay UI
   // so local component state (open panels, tabs, layout) is reset too.
   const activeMeetingId = useMeetingStore((s) => s.activeMeeting?.id ?? "");
+  // A meeting started from a saved profile shows the presenter view in the overlay.
+  const profileId = useMeetingStore((s) => s.profileId);
   const firstRunCompleted = useConfigStore((s) => s.firstRunCompleted);
   const configLoaded = useConfigStore((s) => s._loaded);
   const loadConfig = useConfigStore((s) => s.loadConfig);
@@ -161,6 +165,8 @@ function App() {
       useMeetingStore.setState({
         currentView: "launcher",
         activeMeeting: null,
+        profileId: null,
+        listening: false,
         isRecording: false,
         meetingStartTime: null,
         elapsedMs: 0,
@@ -207,11 +213,17 @@ function App() {
   useEffect(() => {
     if (windowLabel !== "overlay") return;
     let unlisten: (() => void) | undefined;
-    listen<{ meeting: Meeting; audioMode: AudioMode; aiScenario: AIScenario }>(
+    listen<{ meeting: Meeting; audioMode: AudioMode; aiScenario: AIScenario; profileId?: string | null; listening?: boolean; sttOverride?: STTProviderType | null }>(
       "nexq:meeting_started",
       async (e) => {
-        const { meeting, audioMode, aiScenario } = e.payload;
+        const { meeting, audioMode, aiScenario, profileId = null, listening = true, sttOverride = null } = e.payload;
         const startedAt = Date.now();
+        // A profile meeting shows the presenter view with its own slides/notes.
+        if (profileId) {
+          await usePresenterStore.getState().load(profileId);
+        } else {
+          usePresenterStore.getState().clear();
+        }
         // Reset ALL per-meeting stores in THIS (overlay) window first. Each Tauri
         // webview has its own Zustand instances, so the launcher clearing its
         // copies is not enough. Publishing the meeting before the reset would let
@@ -232,6 +244,9 @@ function App() {
           currentView: "overlay",
           audioMode,
           aiScenario,
+          profileId,
+          listening,
+          sttOverride,
           isRecording: true,
           meetingStartTime: startedAt,
           elapsedMs: 0,
@@ -390,7 +405,7 @@ function App() {
                   state (open panels, tabs, layout mode) does not carry over */}
               <div key={activeMeetingId || "no-meeting"} className="flex h-full">
                 <div className="flex-1 min-w-0 overflow-hidden">
-                  <OverlayView />
+                  {profileId ? <PresenterOverlay /> : <OverlayView />}
                 </div>
                 <CallLogPanel />
               </div>
@@ -415,7 +430,7 @@ function App() {
       <ErrorBoundary fallbackMessage="NexQ encountered an error">
         {(resolvedView === "launcher" || resolvedView === "overlay") && (
           <ErrorBoundary fallbackMessage="Failed to load launcher">
-            <LauncherView />
+            <HomeShell />
           </ErrorBoundary>
         )}
         {resolvedView === "wizard" && (

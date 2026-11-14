@@ -17,12 +17,12 @@ vi.mock("./configStore", () => ({
 }));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: async (command: string) => {
-    if (command === "get_rag_config") return {
+    if (command === "get_rag_config") return JSON.stringify({
       enabled: false, embedding_model: "unused", ollama_url: "http://127.0.0.1:1",
       batch_size: 32, chunk_size: 512, chunk_overlap: 64, splitting_strategy: "recursive",
       top_k: 5, search_mode: "hybrid", similarity_threshold: 0.3,
       semantic_weight: 0.7, include_transcript: true, embedding_dimensions: 768,
-    };
+    });
     if (command === "update_rag_config") return;
     throw new Error(`Unexpected IPC: ${command}`);
   },

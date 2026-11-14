@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AppView, Meeting, MeetingSummary, AudioMode, AIScenario, WindowMeetingEndedEvent } from "../lib/types";
+import type { AppView, Meeting, MeetingSummary, AudioMode, AIScenario, WindowMeetingEndedEvent, STTProviderType } from "../lib/types";
 import { shouldPersistOverlayData } from "../lib/windows";
 import { skipYouStt } from "../lib/audioMode";
 import {
@@ -46,6 +46,11 @@ interface MeetingState {
   audioMode: AudioMode;
   aiScenario: AIScenario;
 
+  // Meeting profile this meeting runs under (null for the classic flow) and
+  // whether audio capture is currently running (listening indicator).
+  profileId: string | null;
+  listening: boolean;
+  sttOverride: STTProviderType | null;
   // Stealth mode (overlay hidden while recording)
   overlayHidden: boolean;
 
@@ -76,13 +81,70 @@ interface MeetingState {
   setSelectedMeetingId: (id: string | null) => void;
 
   // Async flows
-  startMeetingFlow: (title?: string, audioMode?: AudioMode, scenario?: AIScenario) => Promise<void>;
+  startMeetingFlow: (
+    title?: string,
+    audioMode?: AudioMode,
+    scenario?: AIScenario,
+    options?: StartMeetingOptions,
+  ) => Promise<void>;
+  /** Begin audio capture/transcription (after the user consented to listening). */
+  startListening: () => Promise<void>;
+  /** Stop capture without ending the meeting. */
+  pauseListening: () => Promise<void>;
   endMeetingFlow: () => Promise<void>;
   loadRecentMeetings: () => Promise<void>;
 
   // Timer management
   startTimer: () => void;
   stopTimer: () => void;
+}
+
+export interface StartMeetingOptions {
+  /** Meeting profile the session runs under. */
+  profileId?: string;
+  /** Start without listening; the user starts listening explicitly later. */
+  deferCapture?: boolean;
+  /** Transcription engine for this meeting only (does not change global settings). */
+  sttProvider?: STTProviderType;
+}
+
+/** Starts audio capture for the resolved mode. Throws nothing: failures are surfaced as a capture warning. */
+async function startAudioCapture(resolvedMode: AudioMode, sttOverride: STTProviderType | null = null): Promise<boolean> {
+  const config = useConfigStore.getState();
+  try {
+    if (config.meetingAudioConfig) {
+      const you = sttOverride ? { ...config.meetingAudioConfig.you, stt_provider: sttOverride } : config.meetingAudioConfig.you;
+      const them = sttOverride ? { ...config.meetingAudioConfig.them, stt_provider: sttOverride } : config.meetingAudioConfig.them;
+      await startCapturePerParty(
+        you,
+        them,
+        { skipYouStt: skipYouStt(resolvedMode) }
+      );
+      // In-person mode: mute "you" source — room mic captures everyone,
+      // separate mic capture is redundant and creates duplicate "You" transcripts.
+      if (resolvedMode === "in_person") {
+        try {
+          const { setSourceMuted } = await import("../lib/ipc");
+          await setSourceMuted("you", true);
+          // Also set the UI mute state
+          (await import("./configStore")).useConfigStore.setState({ mutedYou: true });
+        } catch { /* non-critical */ }
+      }
+    } else {
+      // Legacy fallback: use old mic + system device IDs
+      const micId = config.micDeviceId || "default";
+      const sysId = config.systemDeviceId || "default";
+      await startCapture(micId, sysId);
+    }
+    return true;
+  } catch (err) {
+    console.warn("[meetingStore] Audio capture failed to start:", err);
+    // Every window shows it (the overlay is the one on screen).
+    const message = `Audio capture failed: ${err instanceof Error ? err.message : String(err)}`;
+    import("@tauri-apps/api/event").then(({ emit }) => emit("capture_warning", message)).catch(() => {});
+    // Continue anyway — meeting is created, user can still use AI features
+    return false;
+  }
 }
 
 export const useMeetingStore = create<MeetingState>((set, get) => ({
@@ -100,6 +162,9 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
   _timerInterval: null,
   audioMode: "online",
   aiScenario: "team_meeting",
+  profileId: null,
+  listening: false,
+  sttOverride: null,
   overlayHidden: false,
   overlayMeetingId: null,
   selectedMeetingId: null,
@@ -140,7 +205,12 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
   },
   setSelectedMeetingId: (id) => set({ selectedMeetingId: id }),
 
-  startMeetingFlow: async (title?: string, audioMode?: AudioMode, scenario?: AIScenario) => {
+  startMeetingFlow: async (
+    title?: string,
+    audioMode?: AudioMode,
+    scenario?: AIScenario,
+    options: StartMeetingOptions = {},
+  ) => {
     try {
       // Resolve mode and scenario (fall back to current state if not provided)
       const resolvedMode: AudioMode = audioMode ?? get().audioMode;
@@ -206,37 +276,9 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         await setRecordingEnabled(config.recordingEnabled);
       } catch { /* non-critical */ }
 
-      // 3. Start audio capture — use per-party config if available, else legacy
-      try {
-        if (config.meetingAudioConfig) {
-          await startCapturePerParty(
-            config.meetingAudioConfig.you,
-            config.meetingAudioConfig.them,
-            { skipYouStt: skipYouStt(resolvedMode) }
-          );
-          // In-person mode: mute "you" source — room mic captures everyone,
-          // separate mic capture is redundant and creates duplicate "You" transcripts.
-          if (resolvedMode === "in_person") {
-            try {
-              const { setSourceMuted } = await import("../lib/ipc");
-              await setSourceMuted("you", true);
-              // Also set the UI mute state
-              (await import("./configStore")).useConfigStore.setState({ mutedYou: true });
-            } catch { /* non-critical */ }
-          }
-        } else {
-          // Legacy fallback: use old mic + system device IDs
-          const micId = config.micDeviceId || "default";
-          const sysId = config.systemDeviceId || "default";
-          await startCapture(micId, sysId);
-        }
-      } catch (err) {
-        console.warn("[meetingStore] Audio capture failed to start:", err);
-        // Every window shows it (the overlay is the one on screen).
-        const message = `Audio capture failed: ${err instanceof Error ? err.message : String(err)}`;
-        import("@tauri-apps/api/event").then(({ emit }) => emit("capture_warning", message)).catch(() => {});
-        // Continue anyway — meeting is created, user can still use AI features
-      }
+      // 3. Start audio capture — use per-party config if available, else legacy.
+      // A profile meeting may defer it until the user explicitly starts listening.
+      const listening = options.deferCapture ? false : await startAudioCapture(resolvedMode, options.sttProvider ?? null);
 
       // 4. Set meeting state
       const now = Date.now();
@@ -244,6 +286,9 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       set({
         activeMeeting: meeting,
         isRecording: true,
+        profileId: options.profileId ?? null,
+        listening,
+        sttOverride: options.sttProvider ?? null,
         meetingStartTime: now,
         elapsedMs: 0,
         lastPersistedIndex: 0,
@@ -265,12 +310,31 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
           meeting,
           audioMode: resolvedMode,
           aiScenario: resolvedScenario,
+          profileId: options.profileId ?? null,
+          listening,
+          sttOverride: options.sttProvider ?? null,
         }).catch(() => {});
       });
     } catch (err) {
       console.error("[meetingStore] Failed to start meeting:", err);
       throw err;
     }
+  },
+
+  startListening: async () => {
+    const ok = await startAudioCapture(get().audioMode, get().sttOverride);
+    set({ listening: ok });
+    import("@tauri-apps/api/event").then(({ emit }) => emit("nexq:listening_changed", { listening: ok })).catch(() => {});
+  },
+
+  pauseListening: async () => {
+    try {
+      await stopCapture();
+    } catch (err) {
+      console.warn("[meetingStore] Audio capture failed to pause:", err);
+    }
+    set({ listening: false });
+    import("@tauri-apps/api/event").then(({ emit }) => emit("nexq:listening_changed", { listening: false })).catch(() => {});
   },
 
   endMeetingFlow: async () => {
@@ -478,9 +542,16 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
     } catch { /* non-critical */ }
 
     // 8. Clear active state
+    try {
+      const { profileIpc } = await import("../lib/profileIpc");
+      await profileIpc.deactivate();
+    } catch { /* no profile was active */ }
     set({
       activeMeeting: null,
       isRecording: false,
+      profileId: null,
+      listening: false,
+      sttOverride: null,
       meetingStartTime: null,
       elapsedMs: 0,
       lastPersistedIndex: 0,
