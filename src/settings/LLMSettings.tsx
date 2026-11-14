@@ -15,6 +15,7 @@ import {
 import type { CustomLlmAuthType as CustomAuthType, LLMProviderType, ModelInfo, OpenRouterModel } from "../lib/types";
 import { OpenRouterModelCatalog } from "./openrouter/OpenRouterModelCatalog";
 import { ClaudeCliSettings, claudeTierLabel } from "./ClaudeCliSettings";
+import { GitHubCopilotSettings } from "./GitHubCopilotSettings";
 import { useAgentStore } from "../stores/agentStore";
 import {
   CheckCircle,
@@ -47,6 +48,9 @@ const PROVIDER_DISPLAY: Record<
   // Not in ALL_PROVIDERS: it gets its own "Subscription (local CLI)" group.
   // isLocal is false here because that flag drives the local-server hints below.
   claude_cli: { label: "Claude (subscription)", description: "Your own Claude login (beta)", requiresKey: false, isLocal: false },
+  // Not in ALL_PROVIDERS either: GitHubCopilotSettings has its own card. A cloud
+  // provider (chats go to GitHub) that needs no key: the official CLI holds the sign-in.
+  github_copilot: { label: "GitHub Copilot", description: "Your Copilot plan via the official CLI (beta)", requiresKey: false, isLocal: false },
 };
 
 const ALL_PROVIDERS: LLMProviderType[] = [
@@ -343,6 +347,7 @@ export function LLMSettings() {
   const isLocal = info?.isLocal ?? false;
   const isCustom = selectedProvider === "custom";
   const isClaudeCli = selectedProvider === "claude_cli";
+  const isCopilot = selectedProvider === "github_copilot";
   // Claude can be made active once the CLI is found and logged in (or while
   // its login state is unknown); it has no model of its own to pick here.
   const claudeUnusable =
@@ -373,6 +378,13 @@ export function LLMSettings() {
         selected={isClaudeCli}
         active={llmProvider === "claude_cli"}
         onSelect={() => handleProviderChange("claude_cli")}
+      />
+
+      {/* GitHub Copilot via the official CLI */}
+      <GitHubCopilotSettings
+        selected={isCopilot}
+        active={llmProvider === "github_copilot"}
+        onSelect={() => handleProviderChange("github_copilot")}
       />
 
       {/* Provider Selection */}
@@ -525,8 +537,8 @@ export function LLMSettings() {
         </div>
       )}
 
-      {/* Connection Test & Model Loading (Claude has its own above) */}
-      {!isClaudeCli && (
+      {/* Connection Test & Model Loading (Claude and Copilot have their own above) */}
+      {!isClaudeCli && !isCopilot && (
         <div className="rounded-xl border border-border/30 bg-card/50 p-5">
           <h3 className="mb-3 text-sm font-semibold text-primary/80">Connection</h3>
           <div className="flex items-center gap-2">
@@ -562,8 +574,8 @@ export function LLMSettings() {
         </div>
       )}
 
-      {/* Model Selection (Claude uses its Fast / Deep settings instead) */}
-      {!isClaudeCli && (
+      {/* Model Selection (Claude uses its Fast / Deep settings, Copilot its own picker) */}
+      {!isClaudeCli && !isCopilot && (
         <div className="rounded-xl border border-border/30 bg-card/50 p-5">
           <h3 className="mb-3 text-sm font-semibold text-primary/80">Model</h3>
           {selectedProvider === "openrouter" && openRouterModels.length > 0 ? (
@@ -591,8 +603,8 @@ export function LLMSettings() {
         </div>
       )}
 
-      {/* Make Active button — only when different from active AND provider is ready */}
-      {selectedProvider !== llmProvider && (
+      {/* Make Active button — only when different from active AND provider is ready (Copilot has its own in its card) */}
+      {selectedProvider !== llmProvider && !isCopilot && (
         <button
           disabled={claudeUnusable}
           onClick={async () => {

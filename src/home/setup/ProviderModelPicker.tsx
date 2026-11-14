@@ -11,7 +11,12 @@ export const MEETING_PROVIDERS: Array<{ id: string; label: string; local: boolea
   { id: "groq", label: "Groq", local: false },
   { id: "gemini", label: "Google Gemini", local: false },
   { id: "openrouter", label: "OpenRouter", local: false },
+  // A cloud provider (chats go to GitHub) that needs no key: the official Copilot CLI holds the sign-in.
+  { id: "github_copilot", label: "GitHub Copilot", local: false },
 ];
+
+/** Providers whose sign-in lives in their own CLI: no API key to look up or add. */
+const KEYLESS_PROVIDERS = ["github_copilot"];
 
 export function providerLabel(id: string | null): string {
   return MEETING_PROVIDERS.find((p) => p.id === id)?.label ?? id ?? "";
@@ -24,7 +29,7 @@ export function providerLabel(id: string | null): string {
  */
 async function providerConfigJson(provider: string): Promise<string> {
   const config: Record<string, unknown> = { provider_type: provider };
-  if (!MEETING_PROVIDERS.find((p) => p.id === provider)?.local) {
+  if (!MEETING_PROVIDERS.find((p) => p.id === provider)?.local && !KEYLESS_PROVIDERS.includes(provider)) {
     const key = await getApiKey(provider).catch(() => null);
     if (key) config.api_key = key;
   }
@@ -124,7 +129,10 @@ export function ProviderModelPicker({ idPrefix, label, provider, model, optional
 
       {provider && current && !current.verified && (
         <p className="text-meta text-warning" role="status">
-          {providerLabel(provider)} is not verified. Add its key and run Test Connection in Global settings.{" "}
+          {providerLabel(provider)} is not verified.{" "}
+          {KEYLESS_PROVIDERS.includes(provider)
+            ? "Sign in with the official CLI and run Check connection in Global settings."
+            : "Add its key and run Test Connection in Global settings."}{" "}
           <button type="button" className="underline" onClick={onOpenGlobal}>Global settings</button>
         </p>
       )}

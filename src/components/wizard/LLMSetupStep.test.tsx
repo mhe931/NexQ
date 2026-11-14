@@ -46,4 +46,15 @@ describe("LLMSetupStep (first-run wizard)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Use Claude" }));
     await waitFor(() => expect(activate).toHaveBeenCalledWith("claude_cli"));
   });
+
+  it("offers GitHub Copilot as a cloud provider that needs no API key", async () => {
+    render(<LLMSetupStep ollamaRunning={false} ollamaModels={[]} lmStudioRunning={false} lmStudioModels={[]} />);
+    fireEvent.click(await screen.findByRole("button", { name: /GitHub Copilot/ }));
+    // The honest note replaces the key field.
+    expect(screen.getByText(/Requires an active GitHub Copilot plan and the official Copilot CLI/)).toBeInTheDocument();
+    expect(screen.getByText(/sent to GitHub Copilot/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    // Test Connection is usable without a key.
+    expect(screen.getByRole("button", { name: /test connection/i })).toBeEnabled();
+  });
 });

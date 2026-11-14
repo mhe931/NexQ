@@ -39,6 +39,7 @@ import type {
   ClaudeCliConfig,
   ClaudeCliStatus,
   ClaudeModelInfo,
+  CopilotStatus,
   MeetingChatMessage,
 } from "./types";
 
@@ -840,6 +841,26 @@ export async function getAgentSessions(): Promise<AgentSessionStatus[]> {
 /** Open a visible terminal running `claude` so the user can log in. */
 export async function openClaudeLoginTerminal(): Promise<void> {
   return invoke("open_claude_login_terminal");
+}
+
+// == IPC: GitHub Copilot (official CLI over ACP) ==
+
+/**
+ * Probe the Copilot CLI: installed, version, and a real ACP handshake plus
+ * `session/new` that returns the live model catalog. Makes no model call.
+ */
+export async function copilotStatus(): Promise<CopilotStatus> {
+  return invoke<CopilotStatus>("copilot_status");
+}
+
+/** What to do next: install the CLI, or run `copilot login` in a terminal. */
+export async function copilotLoginHint(): Promise<string> {
+  return invoke<string>("copilot_login_hint");
+}
+
+/** Open a visible terminal running `copilot login`; NexQ never sees the sign-in. */
+export async function openCopilotLoginTerminal(): Promise<void> {
+  return invoke("open_copilot_login_terminal");
 }
 
 /** Start the Claude session of a past meeting (no-op unless Claude CLI is active). */

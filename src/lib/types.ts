@@ -309,7 +309,53 @@ export type LLMProviderType =
   | "gemini"
   | "openrouter"
   | "custom"
-  | "claude_cli";
+  | "claude_cli"
+  | "github_copilot";
+
+// == GITHUB COPILOT (OFFICIAL CLI, ACP) TYPES ==
+
+/** Mirrors Rust `CopilotState`. */
+export type CopilotState =
+  | "not_installed"
+  | "not_logged_in"
+  | "no_entitlement"
+  | "timeout"
+  | "protocol_error"
+  | "ready";
+
+/** Mirrors Rust `CopilotModel`: one model of the live catalog the CLI reports. */
+export interface CopilotModel {
+  id: string;
+  name: string;
+  description: string | null;
+  /** The CLI's usage multiplier label ("1x", "0.33x"), when it gives one. */
+  usage: string | null;
+  /** False when the CLI marks the model as not enabled for this account. */
+  enabled: boolean;
+}
+
+/** Mirrors Rust `CopilotStatus` (`copilot_status` command). */
+export interface CopilotStatus {
+  state: CopilotState;
+  installed: boolean;
+  binary_path: string | null;
+  /** From `copilot --version`; null when that probe failed. */
+  version: string | null;
+  /** Only an npm shim (`copilot.cmd`) was found; NexQ needs the standalone executable. */
+  npm_only: boolean;
+  /** The ACP `initialize` was answered. */
+  handshake_ok: boolean;
+  /** `session/new` succeeded. */
+  session_ok: boolean;
+  /** The live catalog the CLI reported (empty unless `session_ok`). */
+  models: CopilotModel[];
+  /** The CLI's own default model for a new session. */
+  current_model: string | null;
+  /** The CLI's genuine failure text when `state` is not "ready". */
+  error: string | null;
+  /** What to do next: install the CLI or run `copilot login`. */
+  login_hint: string;
+}
 
 /** Auth mode for a user-supplied (custom) LLM endpoint. */
 export type CustomLlmAuthType = "none" | "bearer" | "api_key";

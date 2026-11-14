@@ -33,6 +33,7 @@ const LLM_LABELS: Record<string, string> = {
   openrouter: "OpenRouter",
   custom: "Custom",
   claude_cli: "Claude",
+  github_copilot: "GitHub Copilot",
 };
 
 export const STT_LABELS: Record<string, string> = {
@@ -102,6 +103,8 @@ const LLM_PROVIDER_OPTIONS: {
   { value: "gemini", label: "Gemini", IconComponent: Cloud, requiresKey: true, isLocal: false },
   { value: "openrouter", label: "OpenRouter", IconComponent: Globe, requiresKey: true, isLocal: false },
   { value: "custom", label: "Custom", IconComponent: HardDrive, requiresKey: false, isLocal: false },
+  // A cloud provider without a key: listed once verified in Settings (the official CLI holds the sign-in).
+  { value: "github_copilot", label: "GitHub Copilot", IconComponent: Cloud, requiresKey: false, isLocal: false },
 ];
 
 function formatModel(model: string): string {
@@ -958,7 +961,7 @@ function LLMPickerDropdown({
     (async () => {
       try {
         const { listModels } = await import("../lib/ipc");
-        const key = await getApiKey(pendingProvider).catch(() => null);
+        const key = pendingProvider === "github_copilot" ? null : await getApiKey(pendingProvider).catch(() => null);
         const config = JSON.stringify({
           provider_type: pendingProvider,
           ...(key && { api_key: key }),

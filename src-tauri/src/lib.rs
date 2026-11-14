@@ -64,6 +64,7 @@ use commands::tray_commands;
 use commands::updater_commands;
 // == MODULE COMMANDS: claude cli ==
 use commands::claude_cli_commands;
+use commands::copilot_commands;
 
 /// Show the launcher window and hide the overlay window.
 pub(crate) fn show_launcher(app: &tauri::AppHandle) {
@@ -744,6 +745,10 @@ pub fn run() {
             claude_cli_commands::seed_claude_cli_models,
             claude_cli_commands::get_agent_sessions,
             claude_cli_commands::open_claude_login_terminal,
+            // == COMMANDS: github copilot ==
+            copilot_commands::copilot_status,
+            copilot_commands::copilot_login_hint,
+            copilot_commands::open_copilot_login_terminal,
         ])
         .build(tauri::generate_context!())
         .expect("error while building NexQ")
