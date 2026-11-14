@@ -19,6 +19,7 @@ import {
 } from "../lib/ipc";
 import { useConfigStore } from "./configStore";
 import { showToast } from "./toastStore";
+import { load } from "@tauri-apps/plugin-store";
 
 interface IndexProgress {
   status: string;
@@ -82,6 +83,18 @@ interface RagState {
   autoRemoveFileIndex: (resourceId: string) => Promise<void>;
 }
 
+// Singleton plugin-store handle shared with the rest of the app's settings (config.json).
+async function persistRagConfig(config: RagConfig): Promise<void> {
+  const store = await load("config.json", { autoSave: true, defaults: {} });
+  await store.set("ragConfig", config);
+  await store.save();
+}
+
+async function savedRagConfig(): Promise<RagConfig | undefined> {
+  const store = await load("config.json", { autoSave: true, defaults: {} });
+  return (await store.get<RagConfig>("ragConfig")) ?? undefined;
+}
+
 export const useRagStore = create<RagState>((set) => ({
   ragConfig: null,
   indexStatus: null,
@@ -101,14 +114,16 @@ export const useRagStore = create<RagState>((set) => ({
 
   loadRagConfig: async () => {
     try {
-      const config = await getRagConfig();
+      // The saved settings win over the backend's in-memory default, so a
+      // restart keeps the user's retrieval choices.
+      const config = (await savedRagConfig()) ?? (await getRagConfig());
       // Sync enabled flag with persisted contextStrategy
       const strategy = useConfigStore.getState().contextStrategy;
       const shouldBeEnabled = strategy === "local_rag";
       if (config.enabled !== shouldBeEnabled) {
         config.enabled = shouldBeEnabled;
-        await updateRagConfig(config);
       }
+      await updateRagConfig(config);
       set({ ragConfig: config, error: null });
     } catch (e) {
       console.error("[ragStore] Failed to load RAG config:", e);
@@ -120,6 +135,7 @@ export const useRagStore = create<RagState>((set) => ({
     try {
       set({ ragConfig: config, error: null });
       await updateRagConfig(config);
+      await persistRagConfig(config);
     } catch (e) {
       console.error("[ragStore] Failed to save RAG config:", e);
       set({ error: e instanceof Error ? e.message : String(e) });
@@ -140,6 +156,7 @@ export const useRagStore = create<RagState>((set) => ({
         }
       }
       await updateRagConfig(config);
+      await persistRagConfig(config);
     } catch (e) {
       console.error("[ragStore] Failed to save RAG config:", e);
       set({ error: e instanceof Error ? e.message : String(e) });

@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 /// Progress event payload emitted during file indexing.
 #[derive(Debug, Clone, serde::Serialize)]
-struct IndexProgress {
+pub struct IndexProgress {
     file_id: String,
     file_name: String,
     chunks_total: usize,
@@ -108,6 +108,22 @@ impl RagManager {
         config: &RagConfig,
         embedder_url: &str,
     ) -> Result<usize, String> {
+        Self::index_file(
+            db, file_id, text, file_name, config, embedder_url,
+            |progress| { let _ = app_handle.emit("rag_index_progress", progress); },
+        ).await
+    }
+
+    /// Index documents without requiring a desktop window, also used by local imports.
+    pub async fn index_file(
+        db: &Arc<Mutex<DatabaseManager>>,
+        file_id: &str,
+        text: &str,
+        file_name: &str,
+        config: &RagConfig,
+        embedder_url: &str,
+        on_progress: impl Fn(IndexProgress),
+    ) -> Result<usize, String> {
         let embedder = OllamaEmbedder::new(embedder_url);
 
         // Phase 1: Chunk the text (no DB needed)
@@ -124,9 +140,8 @@ impl RagManager {
 
         let total_chunks = chunks.len();
 
-        let _ = app_handle.emit(
-            "rag_index_progress",
-            &IndexProgress {
+        on_progress(
+            IndexProgress {
                 file_id: file_id.to_string(),
                 file_name: file_name.to_string(),
                 chunks_total: total_chunks,
@@ -159,6 +174,7 @@ impl RagManager {
         let mut chunks_embedded: usize = 0;
         let mut batch_embeddings: Vec<(String, Vec<u8>)> = Vec::new();
 
+        if config.search_mode != "keyword" {
         for batch_start in (0..chunk_records.len()).step_by(config.batch_size) {
             let batch_end = (batch_start + config.batch_size).min(chunk_records.len());
             let batch = &chunk_records[batch_start..batch_end];
@@ -175,9 +191,8 @@ impl RagManager {
 
             chunks_embedded += batch.len();
 
-            let _ = app_handle.emit(
-                "rag_index_progress",
-                &IndexProgress {
+            on_progress(
+                IndexProgress {
                     file_id: file_id.to_string(),
                     file_name: file_name.to_string(),
                     chunks_total: total_chunks,
@@ -185,6 +200,7 @@ impl RagManager {
                     status: "embedding".to_string(),
                 },
             );
+        }
         }
 
         // Phase 4: Store all embeddings + update status (brief lock, no await)
@@ -199,13 +215,12 @@ impl RagManager {
                 .map_err(|e| format!("Failed to update index status: {}", e))?;
         }
 
-        let _ = app_handle.emit(
-            "rag_index_progress",
-            &IndexProgress {
+        on_progress(
+            IndexProgress {
                 file_id: file_id.to_string(),
                 file_name: file_name.to_string(),
                 chunks_total: total_chunks,
-                chunks_embedded: total_chunks,
+                chunks_embedded,
                 status: "complete".to_string(),
             },
         );
@@ -311,4 +326,65 @@ fn load_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>, Str
         .collect();
 
     Ok(embeddings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn keyword_index_is_ready_without_ollama() {
+        let dir = std::env::temp_dir().join(format!("nexq-keyword-{}", Uuid::new_v4()));
+        let db = Arc::new(Mutex::new(DatabaseManager::new(dir.clone()).unwrap()));
+        let resource = crate::db::context::ContextResource {
+            id: "test-context".into(),
+            name: "thesis.md".into(),
+            file_type: "md".into(),
+            file_path: "thesis.md".into(),
+            size_bytes: 100,
+            token_count: 20,
+            preview: String::new(),
+            loaded_at: chrono::Utc::now().to_rfc3339(),
+        };
+        crate::db::context::add_context_resource(
+            db.lock().unwrap().connection(), &resource,
+        ).unwrap();
+        let config = RagConfig {
+            enabled: true,
+            search_mode: "keyword".into(),
+            ..RagConfig::default()
+        };
+        let progress = Mutex::new(Vec::new());
+        let indexed = RagManager::index_file(
+            &db, &resource.id,
+            "Section 6.9: Sea ice candidates disagree with the optical proxy.",
+            &resource.name, &config, "http://127.0.0.1:1",
+            |event| progress.lock().unwrap().push(event),
+        ).await;
+        let results = RagManager::search_async(
+            &db, "optical proxy", &config, "http://127.0.0.1:1", "unavailable",
+        ).await;
+        let (status, embeddings) = {
+            let guard = db.lock().unwrap();
+            (
+                RagManager::get_status(guard.connection()).unwrap(),
+                load_all_embeddings(guard.connection()).unwrap(),
+            )
+        };
+        drop(db);
+        std::fs::remove_file(dir.join("nexq.db")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+
+        assert!(indexed.is_ok(), "Keyword indexing contacted Ollama: {indexed:?}");
+        assert_eq!(status.indexed_files, 1);
+        assert!(embeddings.is_empty());
+        let results = results.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_file, "thesis.md");
+        assert!(results[0].text.contains("Section 6.9"));
+        let events = progress.into_inner().unwrap();
+        let complete = events.last().unwrap();
+        assert_eq!(complete.status, "complete");
+        assert_eq!(complete.chunks_embedded, 0);
+    }
 }
