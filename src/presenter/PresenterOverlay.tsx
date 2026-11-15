@@ -15,6 +15,8 @@ import type { MeetingProfile } from "../lib/profileTypes";
 import { useMeetingStore } from "../stores/meetingStore";
 import { usePresenterStore } from "../stores/presenterStore";
 import { showToast } from "../stores/toastStore";
+import { LiveQAStatus } from "../components/LiveQAStatus";
+import { useLiveQAHealth } from "../hooks/useLiveQAHealth";
 
 // Spoken answers are optional: their code is only fetched for a meeting that asks for them.
 const SpokenControls = lazy(() => import("./SpokenControls"));
@@ -56,6 +58,8 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
   const toggleHidden = usePresenterStore((s) => s.toggleHidden);
   const backToPresentation = usePresenterStore((s) => s.backToPresentation);
   const listening = useMeetingStore((s) => s.listening);
+  const health = useLiveQAHealth();
+  const captureActive = health.youAudio.label === "Active" || health.themAudio.label === "Active";
   const endMeetingFlow = useMeetingStore((s) => s.endMeetingFlow);
 
   const t = profile.environment.teleprompter;
@@ -125,9 +129,9 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
     </span>
   );
   const listeningBadge = (
-    <span role="status" className="flex shrink-0 items-center gap-1 text-xs font-bold" style={{ color: listening ? colors.accent : colors.muted }}>
-      {listening ? <Mic className="h-3.5 w-3.5" aria-hidden="true" /> : <MicOff className="h-3.5 w-3.5" aria-hidden="true" />}
-      {listening ? "LISTENING" : "NOT LISTENING"}
+    <span role="status" className="flex shrink-0 items-center gap-1 text-xs font-bold" style={{ color: health.themSTT.tone === "warning" || health.themAudio.tone === "warning" ? "hsl(var(--warning))" : health.listeningLabel === "LISTENING" ? colors.accent : colors.muted }}>
+      {captureActive ? <Mic className="h-3.5 w-3.5" aria-hidden="true" /> : <MicOff className="h-3.5 w-3.5" aria-hidden="true" />}
+      {health.listeningLabel}
     </span>
   );
   const frame = "relative flex h-full flex-col overflow-hidden rounded-xl border shadow-xl";
@@ -162,7 +166,7 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
         badges={<>{sessionBadge}{listeningBadge}<BindStatusChip colors={colors} /></>}
       >
         {phase === "qa" && (
-          listening ? (
+          listening || captureActive ? (
             <button type="button" className={ctl} style={{ borderColor: colors.border }} onClick={pause} aria-label="Pause listening">Pause listening</button>
           ) : (
             <button type="button" className={ctl} style={{ borderColor: colors.border }} onClick={() => request("resume")} aria-label="Resume listening">Resume listening</button>
@@ -178,6 +182,8 @@ function PresenterFrame({ profile }: { profile: MeetingProfile }) {
       </Header>
 
       <PresenterToolbar t={t} colors={colors} />
+
+      <LiveQAStatus />
 
       {asking && <ListeningNotice colors={colors} onConfirm={() => void confirm()} onDecline={decline} />}
 

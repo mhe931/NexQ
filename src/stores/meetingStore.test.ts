@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 import { BUILT_IN_SCENARIOS } from "../lib/scenarios";
 import { useMeetingStore } from "./meetingStore";
 import { useScenarioStore } from "./scenarioStore";
+import { runUserAction } from "../lib/userAction";
 
 const boardReview = {
   id: "custom_1",
@@ -25,11 +26,13 @@ const boardReview = {
 };
 
 const calls = new Map<string, Record<string, unknown>>();
+let captureFails = false;
 
 beforeAll(() => {
   mockWindows("launcher");
   mockIPC((cmd, args) => {
     calls.set(cmd, args as Record<string, unknown>);
+    if (captureFails && (cmd === "start_capture" || cmd === "start_capture_per_party")) return Promise.reject("Audio device unavailable");
     return cmd === "start_meeting" ? JSON.stringify({ id: "meeting-1", title: "Standup" }) : [];
   });
 });
@@ -37,6 +40,7 @@ beforeAll(() => {
 beforeEach(() => {
   calls.clear();
   saved.config = {};
+  captureFails = false;
 });
 
 afterEach(() => {
@@ -47,6 +51,17 @@ afterEach(() => {
 });
 
 describe("startMeetingFlow's scenario", () => {
+  it("retains typed Q&A after a deferred profile's later capture failure", async () => {
+    captureFails = true;
+    await useMeetingStore.getState().startMeetingFlow("Typed Q&A", "online", "team_meeting", { profileId: "profile", deferCapture: true });
+    expect(calls.has("start_capture")).toBe(false);
+    expect(calls.has("start_capture_per_party")).toBe(false);
+    expect(useMeetingStore.getState()).toMatchObject({ profileId: "profile", listening: false, activeMeeting: { id: "meeting-1" } });
+    await useMeetingStore.getState().startListening();
+    expect(useMeetingStore.getState()).toMatchObject({ listening: false, activeMeeting: { id: "meeting-1" } });
+    await runUserAction("AskQuestion", "What is the next step?");
+    expect(calls.has("generate_assist")).toBe(true);
+  });
   it("uses a custom scenario's prompts, even one saved by another window", async () => {
     saved.config.customScenarios = [boardReview];
     await useMeetingStore.getState().startMeetingFlow("Standup", "online", "custom_1");

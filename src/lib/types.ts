@@ -765,6 +765,24 @@ export interface StreamThinkingEvent {
 export interface StreamErrorEvent {
   message: string;
   request_id: string | null;
+  code?: LLMFailureCode;
+  retryable?: boolean;
+}
+
+export type LLMFailureCode =
+  | "credits_exhausted" | "rate_limited" | "invalid_api_key" | "authentication"
+  | "unavailable" | "timeout" | "not_configured" | "invalid_response"
+  | "cancelled" | "provider_error";
+
+export interface QuestionHandlingStatusEvent {
+  request_id: string;
+  status: "retrieving_context" | "generating_answer";
+}
+
+export interface AudioCaptureStatusEvent {
+  party: "You" | "Them";
+  status: "active" | "paused" | "device_unavailable" | "permission_denied" | "failed";
+  message?: string | null;
 }
 
 export interface StreamSourcesEvent {

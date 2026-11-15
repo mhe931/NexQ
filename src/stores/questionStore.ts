@@ -7,6 +7,8 @@ export interface TrackedQuestion extends DetectedQuestion {
   segmentId?: string;
   /** Unanswered when the panel came back, so it may be old: Auto-Answer skips it. */
   heldBack?: boolean;
+  answerRequestId?: string;
+  answerStatus?: "requested" | "ready" | "unable";
 }
 
 /** An automatic answer NexQ started, so it knows what it may stop. */
@@ -41,6 +43,8 @@ interface QuestionState {
   setPanelSeen: () => void;
   holdBackUnanswered: () => void;
   markAssisted: (index: number) => void;
+  trackAnswer: (segmentId: string | undefined, text: string, requestId: string) => void;
+  settleAnswer: (requestId: string, status: "ready" | "unable" | "cancelled") => void;
   dismiss: (index: number) => void;
   clear: () => void;
 
@@ -97,6 +101,19 @@ export const useQuestionStore = create<QuestionState>((set) => ({
       questions: state.questions.map((q, i) => (i === index ? { ...q, assisted: true } : q)),
     })),
 
+  trackAnswer: (segmentId, text, requestId) => set((state) => ({
+    questions: state.questions.map((q) =>
+      (segmentId !== undefined ? q.segmentId === segmentId : q.text === text)
+        ? { ...q, assisted: true, heldBack: false, answerRequestId: requestId, answerStatus: "requested" }
+        : q),
+  })),
+
+  settleAnswer: (requestId, status) => set((state) => ({
+    questions: state.questions.map((q) => q.answerRequestId === requestId
+      ? { ...q, assisted: status === "ready", heldBack: status !== "ready", answerStatus: status === "cancelled" ? undefined : status, answerRequestId: undefined }
+      : q),
+  })),
+
   dismiss: (index) =>
     set((state) => ({ questions: state.questions.filter((_, i) => i !== index) })),
 
@@ -124,7 +141,7 @@ export const useQuestionStore = create<QuestionState>((set) => ({
     set((state) => ({
       questions: state.questions.map((q) =>
         (segmentId !== undefined ? q.segmentId === segmentId : q.text === text)
-          ? { ...q, assisted: false, heldBack: true }
+          ? { ...q, assisted: false, heldBack: true, answerRequestId: undefined, answerStatus: undefined }
           : q),
     })),
 

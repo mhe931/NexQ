@@ -67,6 +67,36 @@ This only appears the first time you install. Subsequent launches will not trigg
 
 ## Speech-to-Text Issues
 
+### Deepgram key missing, or local model unavailable
+
+Audio capture and transcription are separate. A **Them** transcription error
+does not mean your microphone is broken: Them normally captures the meeting
+app's output through WASAPI loopback, while You uses the microphone.
+
+- Open **Settings > STT** to configure the selected cloud provider's key.
+  Never put keys in source files. Test the provider before a rehearsal.
+- For offline transcription, explicitly select an existing supported local
+  engine and download its model in Settings. An installed engine without its
+  model is not ready. Whisper.cpp supports live microphone and system PCM
+  utterances, producing text after a speech pause. Windows Speech cannot
+  transcribe system output.
+- NexQ does not change a local STT selection to a cloud provider for you.
+  Audio is never sent to an alternative cloud engine without your selection.
+- Test You and Them separately with approved test speech. An active meter
+  proves audio is arriving, not that words are being recognized. Silence is
+  not a successful transcription test.
+
+**Settings > STT > Test transcription** can test an approved local audio file
+for either channel. Select Whisper.cpp and an installed model for that channel
+in **Audio & Devices**, then pause listening and choose a 16-bit PCM WAV of up
+to 30 seconds. This diagnostic does not record audio, use cloud fallback, or
+add words to the meeting. A passing file test does not verify live microphone
+or system-audio capture.
+
+The meeting's operational indicators report capture, transcription and AI
+separately. A failed transcription channel must not show **Listening for
+questions**. You can still type a question when transcription is unavailable.
+
 ### STT Not Working
 
 **Problem**: Audio levels show activity but no transcript appears. After about 30 seconds of audio with no text, the meeting window shows a "No transcript from You/Them" warning naming the provider.
@@ -116,6 +146,27 @@ This only appears the first time you install. Subsequent launches will not trigg
 - Close other CPU-intensive applications to free resources for the model
 
 ## LLM Issues
+
+### OpenAI credits exhausted (HTTP 429)
+
+`insufficient_quota` and `credit_balance_exhausted` mean the API account has no
+usable credit or has reached its billing limit. They are not an ordinary
+transient rate limit. NexQ stops automatic attempts against that exhausted
+provider; waiting a few seconds or switching its model does not fix the balance.
+A ChatGPT subscription does not include OpenAI API credits.
+
+Check API billing, or explicitly choose another configured provider in
+**Settings > LLM Providers** and in the meeting's AI selection. GitHub Copilot
+uses the existing official Copilot CLI and its separately authenticated
+account. Its model catalog and connection check do not prove chat entitlement:
+use **Test AI response** for a real, small public request without meeting
+documents. Once billing is corrected, an explicit retry or a successful
+response test clears the exhausted-credit block.
+
+Automatic fallback still requires the meeting's existing consent and cost
+permissions. NexQ never treats a provider error as permission to send your
+documents elsewhere. With no usable AI provider, transcription and manually
+typed questions remain available, but answers are blocked.
 
 ### AI Assist Not Responding
 

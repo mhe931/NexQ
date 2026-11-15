@@ -1,9 +1,13 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MeetingAudioConfig } from "../lib/types";
+import type { LocalSTTEngineInfo, MeetingAudioConfig } from "../lib/types";
 import type * as IPC from "../lib/ipc";
 
+const { listLocalSTTEngines } = vi.hoisted(() => ({
+  listLocalSTTEngines: vi.fn<() => Promise<LocalSTTEngineInfo[]>>(),
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => null }));
 vi.mock("@tauri-apps/plugin-store", () => ({
@@ -17,13 +21,14 @@ vi.mock("../lib/ipc", async (importOriginal) => ({
   }),
   getAudioSessions: async () => [],
   hasApiKey: async () => false,
-  listLocalSTTEngines: async () => [],
+  listLocalSTTEngines,
   startDeviceMonitor: async () => {},
   stopDeviceMonitor: async () => {},
   stopAudioTest: async () => false,
 }));
 
 import { MeetingAudioSettings } from "./MeetingAudioSettings";
+import { STTSettings } from "./STTSettings";
 import { AudioSetupStep } from "../components/wizard/AudioSetupStep";
 import { useConfigStore } from "../stores/configStore";
 
@@ -34,7 +39,22 @@ const initialConfig: MeetingAudioConfig = {
   preset_name: null,
 };
 
-beforeEach(() => useConfigStore.setState({ meetingAudioConfig: initialConfig }));
+const installedWhisper: LocalSTTEngineInfo[] = [{
+  engine: "whisper_cpp", name: "Whisper.cpp", description: "Local speech recognition",
+  models: [{
+    id: "tiny", engine: "whisper_cpp", name: "Whisper Tiny",
+    size_bytes: 77691713, accuracy_rating: 2, speed_rating: 5,
+    is_streaming: false, is_downloaded: true,
+  }],
+}];
+
+beforeEach(() => {
+  listLocalSTTEngines.mockReset().mockResolvedValue([]);
+  useConfigStore.setState({
+    meetingAudioConfig: initialConfig, activeWhisperModel: null,
+    activeModelPerEngine: {}, verifiedCloudProviders: [],
+  });
+});
 afterEach(cleanup);
 
 it("allows Vietnamese to be selected in Audio & Devices", async () => {
@@ -44,6 +64,38 @@ it("allows Vietnamese to be selected in Audio & Devices", async () => {
   await userEvent.setup().selectOptions(select, "vi-VN");
   expect(useConfigStore.getState().sttLanguage).toBe("vi-VN");
   expect(within(select).getByRole<HTMLOptionElement>("option", { name: "Vietnamese" }).selected).toBe(true);
+});
+
+it("allows the Them channel to select its installed local Whisper model", async () => {
+  listLocalSTTEngines.mockResolvedValue(installedWhisper);
+  render(<MeetingAudioSettings />);
+  await act(async () => {});
+  const user = userEvent.setup();
+  await user.click(screen.getAllByRole("button", { name: "Deepgram" })[1]);
+  await user.click(screen.getByRole("button", { name: "Whisper.cpp" }));
+  expect(useConfigStore.getState().meetingAudioConfig?.them).toMatchObject({
+    stt_provider: "whisper_cpp", local_model_id: "tiny",
+  });
+  expect(useConfigStore.getState().meetingAudioConfig?.you.stt_provider).toBe("deepgram");
+});
+
+it("does not change the selected STT provider when availability resolves again", async () => {
+  let resolveLater!: (engines: LocalSTTEngineInfo[]) => void;
+  const later = new Promise<LocalSTTEngineInfo[]>((resolve) => { resolveLater = resolve; });
+  listLocalSTTEngines.mockResolvedValueOnce(installedWhisper).mockReturnValueOnce(later);
+  render(<StrictMode><MeetingAudioSettings /></StrictMode>);
+  await act(async () => {});
+  await act(async () => resolveLater([]));
+  expect(useConfigStore.getState().meetingAudioConfig?.you.stt_provider).toBe("deepgram");
+  expect(useConfigStore.getState().meetingAudioConfig?.them.stt_provider).toBe("deepgram");
+});
+
+it("does not advertise provider catalog entries as operational STT readiness", async () => {
+  listLocalSTTEngines.mockResolvedValue(installedWhisper);
+  render(<STTSettings />);
+  await act(async () => {});
+  expect(screen.getByRole("button", { name: /Windows Speech/ })).not.toHaveTextContent("Ready");
+  expect(screen.getByRole("button", { name: /Whisper.cpp/ })).not.toHaveTextContent("Batch mode only");
 });
 
 describe.each([

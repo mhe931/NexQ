@@ -7,6 +7,8 @@ import {
   setActiveModel,
   setLLMProvider,
   testLLMConnection,
+  testLLMResponse,
+  clearProviderCreditFailure,
   storeApiKey,
   getApiKey,
   hasApiKey,
@@ -17,6 +19,9 @@ import { OpenRouterModelCatalog } from "./openrouter/OpenRouterModelCatalog";
 import { ClaudeCliSettings, claudeTierLabel } from "./ClaudeCliSettings";
 import { GitHubCopilotSettings } from "./GitHubCopilotSettings";
 import { useAgentStore } from "../stores/agentStore";
+import { safeServiceError } from "../lib/serviceHealth";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
+import { useStreamStore } from "../stores/streamStore";
 import {
   CheckCircle,
   XCircle,
@@ -84,9 +89,9 @@ function getBadgeState(
 ): BadgeState {
   const info = PROVIDER_DISPLAY[providerType];
 
-  // Verified providers (test passed) → Ready
+  // The existing test checks connectivity (/models), not generation or credits.
   if (verifiedProviders.includes(providerType)) {
-    return { text: "Ready", variant: "ready" };
+    return { text: "Configured", variant: "has-key" };
   }
 
   // Local providers — not verified yet
@@ -143,6 +148,9 @@ export function LLMSettings() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("idle");
   const [connectionMessage, setConnectionMessage] = useState("");
+  const [responseStatus, setResponseStatus] = useState<ConnectionStatus>("idle");
+  const [responseMessage, setResponseMessage] = useState("");
+  const responseAttempt = useRef(0);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState("");
   const [keyStatusMap, setKeyStatusMap] = useState<Record<string, boolean>>({});
@@ -233,6 +241,41 @@ export function LLMSettings() {
     return JSON.stringify(config);
   }, [selectedProvider, apiKey, customBaseUrl, customAuthType, customAuthValue]);
 
+  const responseTestModel = selectedProvider === "claude_cli" ? claudeCliConfig.fast_model
+    : selectedModel || useConfigStore.getState().lastModelByProvider[selectedProvider] || (selectedProvider === "github_copilot" ? "auto" : "");
+  useEffect(() => {
+    responseAttempt.current++;
+    setResponseStatus("idle");
+    setResponseMessage("");
+    useLiveQAHealthStore.getState().forgetAIReady(selectedProvider);
+  }, [selectedProvider, responseTestModel, apiKey, customBaseUrl, customAuthType, customAuthValue]);
+
+  const handleTestResponse = async () => {
+    const attempt = ++responseAttempt.current;
+    const provider = selectedProvider;
+    setResponseStatus("testing");
+    setResponseMessage("");
+    try {
+      // The backend command sends ONLY its built-in public synthetic prompt.
+      // Testing doesn't activate a provider or include meeting context.
+      const success = await testLLMResponse(buildProviderConfig(), responseTestModel);
+      if (success) await clearProviderCreditFailure(provider);
+      if (responseAttempt.current !== attempt) return;
+      if (success) {
+        useLiveQAHealthStore.getState().markAIReady(provider, responseTestModel);
+        const stream = useStreamStore.getState();
+        if (provider === useConfigStore.getState().llmProvider && !stream.isStreaming && stream.phase === "idle") stream.setError(null);
+      }
+      setResponseStatus(success ? "success" : "error");
+      setResponseMessage(success ? "AI response verified" : "AI returned no answer. Check the provider and model.");
+    } catch (error) {
+      if (responseAttempt.current !== attempt) return;
+      useLiveQAHealthStore.getState().forgetAIReady(provider);
+      setResponseStatus("error");
+      setResponseMessage(safeServiceError(error, "AI").message);
+    }
+  };
+
   // Custom is the provider in use: a changed base URL, auth type or token
   // applies to it at once, not only after a restart or a provider switch.
   const applyCustomIfActive = (custom: { authType?: CustomAuthType; authValue?: string } = {}) => {
@@ -280,7 +323,7 @@ export function LLMSettings() {
       const success = await testLLMConnection(configJson);
       if (success) {
         setConnectionStatus("success");
-        setConnectionMessage("Connected successfully");
+        setConnectionMessage("Connection checked — AI response not tested");
         // Mark as verified
         if (!verifiedCloudProviders.includes(selectedProvider)) {
           setVerifiedCloudProviders([...verifiedCloudProviders, selectedProvider]);
@@ -292,7 +335,7 @@ export function LLMSettings() {
       }
     } catch (err) {
       setConnectionStatus("error");
-      setConnectionMessage(err instanceof Error ? err.message : "Connection failed");
+      setConnectionMessage(safeServiceError(err, "AI").message);
     }
   };
 
@@ -600,6 +643,20 @@ export function LLMSettings() {
               </p>
             </div>
           )}
+
+          <div className="space-y-2 rounded-xl border border-border/30 bg-card/50 p-4">
+            <button type="button" onClick={() => void handleTestResponse()}
+              disabled={responseStatus === "testing" || !responseTestModel || (requiresApiKey && !apiKey) || (isCustom && !customBaseUrl)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+              {responseStatus === "testing" && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />}
+              Test AI response
+            </button>
+            <p className="text-xs text-muted-foreground">
+              Sends a short public test to {info.label}{responseTestModel ? ` / ${responseTestModel}` : " after you select a model"}. No meeting content. Provider usage may apply.
+            </p>
+            {responseMessage && <p role={responseStatus === "error" ? "alert" : "status"} aria-label="AI response test"
+              className={`text-xs ${responseStatus === "error" ? "text-destructive" : "text-success"}`}>{responseMessage}</p>}
+          </div>
         </div>
       )}
 

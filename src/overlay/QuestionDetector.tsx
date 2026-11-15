@@ -9,6 +9,8 @@ import {
 import { useTranscriptStore } from "../stores/transcriptStore";
 import { useAIActionsStore } from "../stores/aiActionsStore";
 import { useQuestionStore } from "../stores/questionStore";
+import { useStreamStore } from "../stores/streamStore";
+import { useLiveQAHealth } from "../hooks/useLiveQAHealth";
 import { showToast } from "../stores/toastStore";
 import type { DetectedQuestion, TranscriptSegment, TranscriptUpdateEvent } from "../lib/types";
 
@@ -91,6 +93,7 @@ function startAutoAnswer(question: DetectedQuestion, segmentId: string | undefin
   }
   if (segmentId !== undefined) store.answerLine(question, segmentId);
   const requestId = crypto.randomUUID();
+  store.trackAnswer(segmentId, question.text, requestId);
   const done = runUserAction("Assist", question.text, { requestId }).catch((err) => {
     // Refused: an answer started elsewhere in the meantime.
     if (!String(err).includes(REFUSED)) return;
@@ -142,6 +145,7 @@ export function QuestionPanel() {
 }
 
 export function QuestionDetector() {
+  const health = useLiveQAHealth();
   const questions = useQuestionStore((s) => s.questions);
   const addQuestion = useQuestionStore((s) => s.addQuestion);
   const justMountedRef = useRef(true);
@@ -214,13 +218,16 @@ export function QuestionDetector() {
   const handleAssist = useCallback((index: number) => {
     const question = questions[index];
     if (!question) return;
+    if (question.answerRequestId && useStreamStore.getState().isRunning(question.answerRequestId)) return;
     // Its automatic answer is on the way: a click doesn't restart it.
     const store = useQuestionStore.getState();
     if (autoAnswerRunning() && sameQuestion(store.autoAnswer?.question, question.text)) return;
     store.markAssisted(index);
-    runYourAction("Assist", question.text).catch((err) => {
+    const requestId = crypto.randomUUID();
+    store.trackAnswer(question.segmentId, question.text, requestId);
+    runYourAction("Assist", question.text, { requestId }).catch((err) => {
       // No answer came, so it stays a card to click.
-      useQuestionStore.getState().holdBack(question.segmentId, question.text);
+      useQuestionStore.getState().settleAnswer(requestId, "unable");
       showToast(String(err).includes(REFUSED) ? "Another answer is still running" : "Couldn't generate AI response", "error");
     });
   }, [questions]);
@@ -231,6 +238,8 @@ export function QuestionDetector() {
   }, []);
 
   const latest = questions.length > 0 ? questions[0] : null;
+  const latestReady = latest?.answerStatus === "ready";
+  const latestRequested = latest?.answerStatus === "requested";
   const previousQuestions = questions.slice(1, 4);
 
   // Auto-Trigger: answer the newest question once the other party has been
@@ -261,14 +270,14 @@ export function QuestionDetector() {
         onKeyDown={(e) => { if (latest && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); handleAssist(0); } }}
         role={latest ? "button" : undefined}
         tabIndex={latest ? 0 : undefined}
-        aria-label={latest ? `Question: ${latest.text}. ${latest.assisted ? "Answered" : "Click to assist"}` : undefined}
+        aria-label={latest ? `Question: ${latest.text}. ${latestReady ? "Answer ready" : latestRequested ? "Answer requested" : "Click to assist"}` : undefined}
       >
         <div className="relative mt-0.5 shrink-0" aria-hidden="true">
           <HelpCircle className={`h-5 w-5 transition-colors ${latest ? "text-info" : "text-muted-foreground/50"}`} />
           {latest && !latest.assisted && (
             <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-info animate-pulse" />
           )}
-          {latest?.assisted && (
+          {latestReady && (
             <span className="absolute -top-0.5 -right-0.5 flex h-3 w-3 items-center justify-center rounded-full bg-success">
               <Check className="h-2 w-2 text-white" />
             </span>
@@ -282,7 +291,7 @@ export function QuestionDetector() {
             </p>
           ) : (
             <p className="text-xs text-muted-foreground/50">
-              Listening for questions from the other party
+              {health.themAudio.tone === "warning" ? "Audio unavailable. Type a question with Ask." : health.themSTT.tone === "warning" ? "STT unavailable. Type a question with Ask." : health.themAudio.label === "Paused" || health.themSTT.label === "Paused" ? "Audio paused. Type a question with Ask." : health.themSTT.tone === "active" ? "Waiting for questions from the other party" : "Checking STT. You can type a question with Ask."}
             </p>
           )}
         </div>
@@ -291,17 +300,17 @@ export function QuestionDetector() {
           <div className="flex shrink-0 items-center gap-1">
             <button
               onClick={(e) => { e.stopPropagation(); handleAssist(0); }}
-              aria-label={latest.assisted ? "Already answered" : "Get AI assistance for this question"}
+              aria-label={latestReady ? "Answer ready" : latestRequested ? "Answer requested" : "Get AI assistance for this question"}
               className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all duration-150 cursor-pointer ${
-                latest.assisted
+                latestReady
                   ? "bg-success/10 border border-success/20 text-success"
                   : "bg-info/10 border border-info/20 text-info hover:bg-info/20"
               }`}
             >
-              {latest.assisted ? (
-                <><Check className="h-3.5 w-3.5" aria-hidden="true" />Answered</>
+              {latestReady ? (
+                <><Check className="h-3.5 w-3.5" aria-hidden="true" />Ready</>
               ) : (
-                <><Sparkles className="h-3.5 w-3.5" aria-hidden="true" />Assist</>
+                <><Sparkles className="h-3.5 w-3.5" aria-hidden="true" />{latestRequested ? "Requested" : latest.answerStatus === "unable" ? "Retry" : "Assist"}</>
               )}
             </button>
             <button
@@ -324,7 +333,7 @@ export function QuestionDetector() {
               <div
                 key={`q-${realIdx}-${q.timestamp_ms}`}
                 className={`group/q flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-all duration-150 question-card-enter ${
-                  q.assisted
+                  q.answerStatus === "ready"
                     ? "bg-success/5 border border-success/10"
                     : "bg-card/20 hover:bg-card/40 hover:border-border/20 cursor-pointer"
                 }`}
@@ -335,7 +344,7 @@ export function QuestionDetector() {
                 title={q.text}
               >
                 <div className="shrink-0">
-                  {q.assisted ? (
+                  {q.answerStatus === "ready" ? (
                     <div className="flex h-4 w-4 items-center justify-center rounded-full bg-success/20">
                       <Check className="h-2.5 w-2.5 text-success" />
                     </div>
@@ -347,7 +356,7 @@ export function QuestionDetector() {
                 </div>
 
                 <span className={`flex-1 truncate text-xs leading-snug transition-colors ${
-                  q.assisted
+                  q.answerStatus === "ready"
                     ? "text-success/70 font-medium"
                     : "text-muted-foreground/60 group-hover/q:text-foreground/80"
                 }`}>

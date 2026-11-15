@@ -34,6 +34,7 @@ import {
   Cpu,
 } from "lucide-react";
 import { LocalModelManager } from "./LocalModelManager";
+import { STTTranscriptionTest } from "./STTTranscriptionTest";
 
 // ── Provider definitions ──
 
@@ -47,10 +48,8 @@ interface ProviderOption {
   needsRegion?: boolean;
   /** Engine ID whose models must be downloaded + activated for readiness */
   requiresModels?: string;
-  /** Always ready (no download / key needed) */
+  /** Built-in configuration needs no download or key; not live readiness. */
   alwaysReady?: boolean;
-  /** Batch-only: cannot be used for live streaming; shown with badge */
-  batchOnly?: boolean;
 }
 
 const PROVIDER_OPTIONS: ProviderOption[] = [
@@ -93,12 +92,11 @@ const PROVIDER_OPTIONS: ProviderOption[] = [
   {
     value: "whisper_cpp",
     label: "Whisper.cpp",
-    description: "Batch transcription of recorded meetings",
+    description: "Local transcription after speech pauses",
     requiresApiKey: false,
     isLocal: true,
     credentialKey: "",
     requiresModels: "whisper_cpp",
-    batchOnly: true,
   },
   {
     value: "parakeet_tdt",
@@ -337,29 +335,21 @@ export function STTSettings() {
   }
 
   function getBadgeState(p: ProviderOption): BadgeState {
-    if (p.alwaysReady) return { text: "Ready", variant: "ready" };
-
-    // Batch-only: green "Batch" if model downloaded, amber "Batch" if not
-    if (p.batchOnly) {
-      const downloaded = p.requiresModels
-        ? getEngineDownloadedModels(p.requiresModels)
-        : [];
-      return { text: "Batch", variant: downloaded.length > 0 ? "ready" : "warning" };
-    }
+    if (p.alwaysReady) return { text: "Supported", variant: "ready" };
 
     if (p.requiresApiKey) {
       // Verified = key was saved+tested successfully (persisted across page navigations)
-      if (verifiedCloudProviders.includes(p.value)) return { text: "Ready", variant: "ready" };
+      if (verifiedCloudProviders.includes(p.value)) return { text: "Configured", variant: "ready" };
       return { text: "No Key", variant: "error" };
     }
 
     if (p.requiresModels) {
       const downloaded = getEngineDownloadedModels(p.requiresModels);
       if (downloaded.length === 0) return { text: "No Model", variant: "error" };
-      return { text: "Ready", variant: "ready" };
+      return { text: "Model installed", variant: "ready" };
     }
 
-    return { text: "Ready", variant: "ready" };
+    return { text: "Supported", variant: "ready" };
   }
 
   function isProviderReady(p: ProviderOption): boolean {
@@ -515,13 +505,13 @@ export function STTSettings() {
           return;
         }
         setConnectionStatus("success");
-        setStatusMessage(`Ready — ${downloaded.length} model${downloaded.length > 1 ? "s" : ""} available`);
+        setStatusMessage(`${downloaded.length} model${downloaded.length > 1 ? "s" : ""} installed. Live transcription has not been tested.`);
         return;
       }
 
       const success = await testSTTConnection(selectedProvider);
       setConnectionStatus(success ? "success" : "error");
-      setStatusMessage(success ? "Ready" : "Connection failed");
+      setStatusMessage(success ? "Configuration checked. Live transcription has not been tested." : "Connection failed");
     } catch (e) {
       setConnectionStatus("error");
       setStatusMessage(`Test failed: ${e}`);
@@ -592,23 +582,11 @@ export function STTSettings() {
           <h3 className="mb-1 text-sm font-semibold text-primary/80 flex items-center gap-1.5">
             <HardDrive className="h-4 w-4" />
             {currentProviderOption?.label} Models
-            {currentProviderOption?.batchOnly && (
-              <span className="ml-1 rounded border border-warning/30 bg-warning/10 px-1.5 py-0.5 text-meta font-semibold text-warning uppercase tracking-wide">
-                Batch
-              </span>
-            )}
           </h3>
-          {currentProviderOption?.batchOnly && (
-            <p className="mb-3 text-xs text-muted-foreground/70">
-              Whisper.cpp is for post-meeting batch transcription only — not live streaming.
-              It will be available in the "Past Meetings" tab.
-            </p>
-          )}
-          {!currentProviderOption?.batchOnly && (
-            <p className="mb-3 text-xs text-muted-foreground">
-              Download a model, then click <strong>Activate</strong> to enable this provider.
-            </p>
-          )}
+          <p className="mb-3 text-xs text-muted-foreground">
+            Download and activate a model, then select this engine for each channel in Audio &amp; Devices.
+            Live readiness is checked when transcription starts.
+          </p>
           <LocalModelManager engineFilter={modelEngineId} />
         </div>
       )}
@@ -722,6 +700,9 @@ export function STTSettings() {
           </p>
         </div>
       )}
+
+      {/* Explicit file diagnostic — no capture or provider fallback */}
+      <STTTranscriptionTest />
 
       {/* Universal Pause Detection */}
       <PauseThresholdSetting />
@@ -855,7 +836,7 @@ function ProviderCard({
         />
       </div>
       <span className="text-meta text-muted-foreground/70 line-clamp-1 leading-tight">
-        {provider.batchOnly ? "Batch mode only" : provider.description}
+        {provider.description}
       </span>
     </button>
   );

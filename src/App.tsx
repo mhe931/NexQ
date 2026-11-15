@@ -38,6 +38,7 @@ import { DemoPicker } from "./demo/DemoPicker";
 import { DemoBadge } from "./demo/DemoBadge";
 import { SHOW_MEETING_OVERLAY_EVENT, showLauncherWindow, showMeetingOverlay, showOverlayWindow } from "./lib/windows";
 import { logToFile } from "./lib/logger";
+import { safeServiceError } from "./lib/serviceHealth";
 import { emitOverlayMeetingReady, onCaptureWarning, onOverlayMeetingReady, onStartDetectedMeeting, onStealthModeChanged } from "./lib/events";
 
 function App() {
@@ -371,7 +372,7 @@ function App() {
     }).then((unlisten) => unlisteners.push(unlisten));
 
     onCaptureWarning((message) => {
-      showToast(message, "error");
+      showToast(safeServiceError(message, "Audio").message, "error");
     }).then((unlisten) => unlisteners.push(unlisten));
 
     onStealthModeChanged((enabled) => {

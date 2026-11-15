@@ -4,7 +4,7 @@ import type { MeetingProfile } from "./profileTypes";
 import type { LLMProviderType } from "./types";
 import { useConfigStore } from "../stores/configStore";
 import { useMeetingStore } from "../stores/meetingStore";
-import { getAvailableSTTProviders } from "./ipc";
+import { listLocalSTTEngines } from "./ipc";
 
 /** Reasons a meeting cannot start yet. Empty means ready. */
 export function startBlockers(profile: MeetingProfile): string[] {
@@ -22,14 +22,17 @@ export function startBlockers(profile: MeetingProfile): string[] {
   return out;
 }
 
-/** Whisper is used only when it is installed; otherwise the automatic engine stays. */
+/** Missing local models block transcription, never authorize a cloud substitution. */
 export async function transcriptionNotice(profile: MeetingProfile): Promise<string | null> {
   if (profile.audio.transcriptionEngine !== "whisper") return null;
   try {
-    const available = await getAvailableSTTProviders();
-    if (available.includes("whisper_cpp")) return null;
-  } catch { /* fall through */ }
-  return "Whisper transcription is not installed; the automatic engine will be used.";
+    const engines = await listLocalSTTEngines();
+    if (engines.find((engine) => engine.engine === "whisper_cpp")?.models.some((model) => model.is_downloaded)) return null;
+  } catch (error) {
+    console.warn("[profile] Could not check local transcription models:", error);
+    return "Could not check the selected Whisper model. Configure STT before listening; typed Q&A is available.";
+  }
+  return "The selected Whisper engine has no downloaded model. Configure STT before listening; no other engine will be used. Typed Q&A is available.";
 }
 
 /**
@@ -69,7 +72,7 @@ export async function startProfileMeeting(profileId: string): Promise<{ notice: 
     // Listening starts when the presenter asks for it. A meeting whose transcription was never
     // acknowledged is asked once, inline, in the presenter view rather than blocking the start.
     deferCapture: profile.meetingType === "presentation_qa" || !profile.audio.listeningConsentConfirmed,
-    sttProvider: profile.audio.transcriptionEngine === "whisper" && !notice ? "whisper_cpp" : undefined,
+    sttProvider: profile.audio.transcriptionEngine === "whisper" ? "whisper_cpp" : undefined,
   });
   const meeting = useMeetingStore.getState().activeMeeting;
   if (meeting) await profileIpc.linkMeeting(meeting.id, profile.id);

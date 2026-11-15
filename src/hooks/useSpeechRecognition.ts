@@ -16,6 +16,9 @@ import { useMeetingStore } from "../stores/meetingStore";
 import { useTranscriptStore } from "../stores/transcriptStore";
 import { useConfigStore } from "../stores/configStore";
 import { pushTranscript, ensureIpolicyOverride } from "../lib/ipc";
+import { safeServiceError } from "../lib/serviceHealth";
+import type { Speaker } from "../lib/types";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
 
 // Web Speech API types (not in all TS libs)
 interface SpeechRecognitionEvent extends Event {
@@ -62,15 +65,6 @@ declare global {
   }
 }
 
-/** Determine speaker label from config — whichever party has web_speech gets the label. */
-function getSpeakerLabel(cfg: ReturnType<typeof useConfigStore.getState>["meetingAudioConfig"]): "User" | "Them" {
-  if (!cfg) return "User";
-  // If THEM has web_speech → label as "Them"
-  if (cfg.them.stt_provider === "web_speech" && cfg.them.is_input_device) return "Them";
-  // Default: label as "User" (You party)
-  return "User";
-}
-
 /**
  * Hook that runs browser-native speech recognition while a meeting is active.
  * Speaker label is determined by which party has web_speech configured —
@@ -78,6 +72,10 @@ function getSpeakerLabel(cfg: ReturnType<typeof useConfigStore.getState>["meetin
  */
 export function useSpeechRecognition() {
   const isRecording = useMeetingStore((s) => s.isRecording);
+  const listening = useMeetingStore((s) => s.listening);
+  const override = useMeetingStore((s) => s.sttOverride);
+  const mutedYou = useConfigStore((s) => s.mutedYou);
+  const mutedThem = useConfigStore((s) => s.mutedThem);
   const sttLanguage = useConfigStore((s) => s.sttLanguage);
 
   const audioMode = useMeetingStore((s) => s.audioMode);
@@ -85,16 +83,16 @@ export function useSpeechRecognition() {
   // Derive a stable boolean — only re-runs when web_speech status changes.
   // In in-person mode, SKIP web_speech for the "you" party — room mic captures everyone.
   // Only use web_speech if it's configured for the "them" (room) party in in-person mode.
-  const usesWebSpeech = useConfigStore((s) => {
+  const webParty = useConfigStore((s) => {
     const cfg = s.meetingAudioConfig;
-    if (!cfg) return false;
-    const youIsWebSpeech = cfg.you.stt_provider === "web_speech" && cfg.you.is_input_device;
-    const themIsWebSpeech = cfg.them.stt_provider === "web_speech" && cfg.them.is_input_device;
+    if (!cfg || (override && override !== "web_speech")) return null;
+    const youIsWebSpeech = (override ?? cfg.you.stt_provider) === "web_speech" && cfg.you.is_input_device && !mutedYou;
+    const themIsWebSpeech = (override ?? cfg.them.stt_provider) === "web_speech" && cfg.them.is_input_device && !mutedThem;
     if (audioMode === "in_person") {
       // In-person: only use web_speech for the room source (them), not for mic (you)
-      return themIsWebSpeech;
+      return themIsWebSpeech ? "them" : null;
     }
-    return youIsWebSpeech || themIsWebSpeech;
+    return themIsWebSpeech ? "them" : youIsWebSpeech ? "you" : null;
   });
 
   // Ref for store action — always fresh without being a dep.
@@ -121,19 +119,26 @@ export function useSpeechRecognition() {
       recognitionRef.current = null;
     }
 
-    if (!isRecording || !usesWebSpeech) return;
+    if (!isRecording || !listening || !webParty) return;
+
+    const status = (state: string, message?: string) => {
+      useLiveQAHealthStore.getState().observeSTT(webParty, { provider: "web_speech", status: state, message });
+      emit("stt_connection_status", { party: webParty, provider: "web_speech", status: state, message })
+        .catch(() => console.warn("[STT] Could not synchronize speech recognition status with other windows"));
+    };
 
     const SpeechRecognition =
       window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       console.warn("[STT] Web Speech API not supported in this WebView");
+      status("error", "Web Speech unavailable in this application.");
       return;
     }
 
     // Determine speaker label from config — symmetric for YOU and THEM
     const currentConfig = useConfigStore.getState().meetingAudioConfig;
     const currentLanguage = sttLanguage || "en-US";
-    const speakerLabel = getSpeakerLabel(currentConfig);
+    const speakerLabel: Speaker = webParty === "them" ? "Them" : "User";
 
     console.log(
       "[STT] Web Speech starting | speaker:", speakerLabel,
@@ -155,8 +160,13 @@ export function useSpeechRecognition() {
     sessionPrefixRef.current = Date.now().toString(36).slice(-4);
     restartFailCountRef.current = 0;
     const myInstanceId = ++instanceIdRef.current;
+    status("connecting");
+    recognition.onstart = () => {
+      if (instanceIdRef.current === myInstanceId && shouldRestartRef.current) status("connected");
+    };
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
+      if (instanceIdRef.current !== myInstanceId || !shouldRestartRef.current) return;
       // Reset fail count on successful result — recognition is healthy
       restartFailCountRef.current = 0;
 
@@ -204,10 +214,15 @@ export function useSpeechRecognition() {
     };
 
     recognition.onerror = (event: Event & { error: string }) => {
+      if (instanceIdRef.current !== myInstanceId) return;
       const error = event.error;
       // "no-speech" is normal — just silence, onend will fire and restart
       // "aborted" happens when we stop intentionally
       if (error === "no-speech" || error === "aborted") return;
+      status("error", safeServiceError(error, "STT").message);
+      if (["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"].includes(error)) {
+        shouldRestartRef.current = false;
+      }
       console.error("[STT] Speech recognition error:", error);
     };
 
@@ -215,6 +230,7 @@ export function useSpeechRecognition() {
       // Only restart if this is still the current instance
       if (instanceIdRef.current !== myInstanceId) return;
       if (!shouldRestartRef.current || !recognitionRef.current) return;
+      status("reconnecting");
 
       // Backoff: 300ms, 600ms, 1200ms, capped at 2000ms
       const delay = Math.min(300 * Math.pow(2, restartFailCountRef.current), 2000);
@@ -235,6 +251,7 @@ export function useSpeechRecognition() {
 
         // Verify IPolicy before restarting — never block restart on failure
         try {
+          status("connecting");
           const ipolicy = await ensureIpolicyOverride();
           if (ipolicy.was_drifted) {
             console.warn("[STT] IPolicy drift corrected before restart");
@@ -265,6 +282,7 @@ export function useSpeechRecognition() {
               } catch {
                 // proceed anyway
               }
+              if (instanceIdRef.current !== myInstanceId || !shouldRestartRef.current) return;
               const fresh = new SpeechRecognition();
               fresh.continuous = true;
               fresh.interimResults = true;
@@ -274,13 +292,15 @@ export function useSpeechRecognition() {
               fresh.onresult = recognitionRef.current!.onresult;
               fresh.onerror = recognitionRef.current!.onerror;
               fresh.onend = recognitionRef.current!.onend;
+              fresh.onstart = recognitionRef.current!.onstart;
               recognitionRef.current = fresh;
               fresh.start();
               console.log("[STT] Web Speech creating fresh instance (restart failed)");
             } catch {
+              status("error", "Web Speech failed. Check configuration, then retry.");
               console.error("[STT] Web Speech fresh instance creation also failed");
             }
-          }
+          } else status("error", "Web Speech failed. Check configuration, then retry.");
         }
       }, delay);
     };
@@ -289,15 +309,17 @@ export function useSpeechRecognition() {
       recognition.start();
       console.log("[STT] Web Speech recognition started");
     } catch (err) {
+      status("error", safeServiceError(err, "STT").message);
       console.warn("[STT] Recognition start deferred:", err);
     }
 
     return () => {
       shouldRestartRef.current = false;
+      instanceIdRef.current++;
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch {}
         recognitionRef.current = null;
       }
     };
-  }, [isRecording, usesWebSpeech, sttLanguage]);
+  }, [isRecording, listening, webParty, sttLanguage]);
 }

@@ -23,6 +23,9 @@ const ipc = vi.hoisted(() => ({
   setActiveModel: vi.fn(),
   setClaudeCliConfig: vi.fn(),
   storeApiKey: vi.fn(),
+  testLLMConnection: vi.fn(),
+  testLLMResponse: vi.fn(),
+  clearProviderCreditFailure: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => ({
@@ -34,6 +37,9 @@ vi.mock("../lib/ipc", async (importOriginal) => ({
   setActiveModel: (...a: unknown[]) => ipc.setActiveModel(...a),
   setClaudeCliConfig: (...a: unknown[]) => ipc.setClaudeCliConfig(...a),
   storeApiKey: (...a: unknown[]) => ipc.storeApiKey(...a),
+  testLLMConnection: (...a: unknown[]) => ipc.testLLMConnection(...a),
+  testLLMResponse: (...a: unknown[]) => ipc.testLLMResponse(...a),
+  clearProviderCreditFailure: (...a: unknown[]) => ipc.clearProviderCreditFailure(...a),
   getApiKey: async () => null,
   hasApiKey: async () => false,
   listModels: async () => [],
@@ -82,6 +88,9 @@ describe("Settings ↔ footer sync of the active LLM", () => {
     ipc.setActiveModel.mockReset().mockResolvedValue(undefined);
     ipc.setClaudeCliConfig.mockReset().mockResolvedValue(undefined);
     ipc.storeApiKey.mockReset().mockResolvedValue(undefined);
+    ipc.testLLMConnection.mockReset().mockResolvedValue(true);
+    ipc.testLLMResponse.mockReset().mockResolvedValue(true);
+    ipc.clearProviderCreditFailure.mockReset().mockResolvedValue(undefined);
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
 
@@ -111,8 +120,35 @@ describe("Settings ↔ footer sync of the active LLM", () => {
     expect(ipc.setActiveModel).toHaveBeenCalledWith("claude_cli", "haiku");
     expect(within(claudeCard()).getByText("Active")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Use Claude" })).not.toBeInTheDocument();
-    // Same side effects as every other activation path.
-    expect(useConfigStore.getState().verifiedCloudProviders).toContain("claude_cli");
+    // Router activation is not proof of an operational generation.
+    expect(useConfigStore.getState().verifiedCloudProviders).not.toContain("claude_cli");
+  });
+
+  it("connection checking does not test chat or clear a credit failure", async () => {
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(() => expect(ipc.testLLMConnection).toHaveBeenCalled());
+    expect(ipc.testLLMResponse).not.toHaveBeenCalled();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(screen.queryByText("AI response verified")).toBeNull();
+  });
+
+  it("tests a synthetic chat with the selected provider/model and clears credits only on success", async () => {
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await waitFor(() => expect(ipc.testLLMResponse).toHaveBeenCalledWith('{"provider_type":"ollama"}', "llama3.2"));
+    await waitFor(() => expect(ipc.clearProviderCreditFailure).toHaveBeenCalledWith("ollama"));
+    expect(screen.getByRole("status", { name: "AI response test" })).toHaveTextContent("AI response verified");
+    expect(ipc.setLLMProvider).not.toHaveBeenCalled();
+  });
+
+  it("does not clear a credit failure or show success after an empty/failed chat test", async () => {
+    ipc.testLLMResponse.mockResolvedValue(false);
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await waitFor(() => expect(screen.getByRole("alert", { name: "AI response test" })).toHaveTextContent("AI returned no answer"));
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(screen.queryByText("AI response verified")).toBeNull();
   });
 
   describe("Custom endpoint", () => {

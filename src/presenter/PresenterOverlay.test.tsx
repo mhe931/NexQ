@@ -21,6 +21,8 @@ import { usePresenterStore } from "../stores/presenterStore";
 import { useStreamStore } from "../stores/streamStore";
 import { makeProfile, makeSlide, profileIpcMock as ipc, resetProfileIpcMock } from "../test/profileFixtures";
 import type { MeetingProfile } from "../lib/profileTypes";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
+import { useConfigStore } from "../stores/configStore";
 
 /** Every Tauri command the overlay sent. */
 let invoked: string[] = [];
@@ -61,6 +63,7 @@ beforeEach(() => {
     endMeetingFlow: vi.fn().mockResolvedValue(undefined),
   });
   useStreamStore.getState().resetForMeeting();
+  useLiveQAHealthStore.getState().reset();
 });
 
 afterEach(() => {
@@ -128,6 +131,17 @@ describe("PresenterOverlay slides", () => {
 });
 
 describe("PresenterOverlay badges and focus", () => {
+  it("keeps typed Ask functional when Them STT is blocked", async () => {
+    present(makeProfile(), { phase: "qa" });
+    const provider = useConfigStore.getState().meetingAudioConfig?.them.stt_provider ?? useConfigStore.getState().sttProvider;
+    act(() => useLiveQAHealthStore.getState().observeSTT("them", { provider, status: "error", message: "Missing API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Ask a question" }));
+    const input = screen.getByRole("textbox", { name: "Type your question" });
+    expect(input).not.toBeDisabled();
+    fireEvent.change(input, { target: { value: "What is the next step?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send question" }));
+    await waitFor(() => expect(invoked).toContain("generate_assist"));
+  });
   it("labels a rehearsal and a live session", () => {
     const { unmount } = present(makeProfile({ sessionKind: "rehearsal" }));
     expect(screen.getByText("REHEARSAL — AI assisted")).toBeInTheDocument();
@@ -136,11 +150,38 @@ describe("PresenterOverlay badges and focus", () => {
     expect(screen.getByText("LIVE — AI assisted")).toBeInTheDocument();
   });
 
-  it("shows whether it is listening", () => {
+  it("shows capture separately and does not claim listening without STT readiness", () => {
     present(makeProfile());
     expect(screen.getByText("NOT LISTENING")).toBeInTheDocument();
     act(() => useMeetingStore.setState({ listening: true }));
+    expect(screen.getByText("CHECKING AUDIO / STT")).toBeInTheDocument();
+    const provider = useConfigStore.getState().meetingAudioConfig?.them.stt_provider ?? useConfigStore.getState().sttProvider;
+    act(() => useLiveQAHealthStore.getState().observeSTT("them", { provider, status: "error", message: "401 secret" }));
+    expect(screen.queryByText(/^LISTENING$/)).toBeNull();
+    expect(screen.getByText("STT BLOCKED")).toBeInTheDocument();
+  });
+
+  it("does not retain LISTENING when physical Them capture fails while STT stays connected", () => {
+    present(makeProfile());
+    const provider = useConfigStore.getState().meetingAudioConfig?.them.stt_provider ?? useConfigStore.getState().sttProvider;
+    act(() => {
+      useMeetingStore.setState({ listening: true });
+      useLiveQAHealthStore.getState().observeAudioStatus("them", { status: "active" });
+      useLiveQAHealthStore.getState().observeSTT("them", { provider, status: "connected" });
+    });
     expect(screen.getByText("LISTENING")).toBeInTheDocument();
+    act(() => useLiveQAHealthStore.getState().observeAudioStatus("them", { status: "device_unavailable" }));
+    expect(screen.queryByText(/^LISTENING$/)).toBeNull();
+    expect(screen.getByText("AUDIO BLOCKED")).toBeInTheDocument();
+  });
+
+  it("offers Pause while any physical channel remains active despite an aggregate capture failure", () => {
+    useLiveQAHealthStore.getState().observeAudioStatus("you", { status: "active" });
+    useLiveQAHealthStore.getState().observeAudioStatus("them", { status: "failed" });
+    present(makeProfile(), { phase: "qa" });
+    expect(useMeetingStore.getState().listening).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Pause listening" }));
+    expect(useMeetingStore.getState().pauseListening).toHaveBeenCalled();
   });
 
   it("never steals focus or focuses an input by itself", async () => {
@@ -324,13 +365,11 @@ describe("PresenterOverlay answers", () => {
 
   it("tells the user when the provider was switched", async () => {
     qa(REPLY);
-    await waitFor(() => expect(listeners.has("profile_fallback")).toBe(true));
     act(() => {
-      listeners.get("profile_fallback")?.({
-        payload: { from_provider: "openai", from_model: "gpt-4o", to_provider: "groq", to_model: "llama", reason: "rate limited", request_id: null },
-      });
+      useStreamStore.setState({ isStreaming: true, streamRequestId: "reply" });
+      useStreamStore.getState().applyProfileFallback({ from_provider: "openai", from_model: "gpt-4o", to_provider: "groq", to_model: "llama", reason: "rate_limited", request_id: "reply" });
     });
-    expect(screen.getByText("Switched to groq (rate limited) — openai was unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Switched to groq — openai: rate limited.")).toBeInTheDocument();
   });
 
   it("loads no speech code in text mode and offers controls in spoken mode", async () => {

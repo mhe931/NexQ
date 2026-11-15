@@ -11,6 +11,8 @@ import type { IntelligenceMode } from "./types";
 import { useConfigStore } from "../stores/configStore";
 import { useStreamStore } from "../stores/streamStore";
 import { useAIActionsStore } from "../stores/aiActionsStore";
+import { useQuestionStore } from "../stores/questionStore";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
 
 /** The name the action row shows for `mode` ("F/U", a custom action's name...). */
 export function actionLabel(mode: string): string {
@@ -37,7 +39,7 @@ export async function runUserAction(
   // Another action is already on its way: the backend will refuse this one.
   const busy = stream.isStreaming || stream.phase === "sending";
 
-  stream.setPending(mode, requestId);
+  stream.setPending(mode, requestId, config.llmProvider, customQuestion, config.llmModel);
   // A one-off scope is used up by this action (not by a click the running
   // stream will refuse).
   if (!config.contextScopeSticky && setting.kind !== "default" && !busy) {
@@ -47,7 +49,14 @@ export async function runUserAction(
   try {
     await generateAssist(mode, customQuestion, { requestId, scope });
   } catch (err) {
-    useStreamStore.getState().clearPending(requestId);
+    const current = useStreamStore.getState();
+    if (current.isRunning(requestId) && !String(err).includes("Generation already in progress")) {
+      if (current.handlingStatus !== "retrieving_context") {
+        useLiveQAHealthStore.getState().forgetAIReady(config.llmProvider);
+      }
+      current.setError(err instanceof Error ? err.message : String(err));
+      useQuestionStore.getState().settleAnswer(requestId, "unable");
+    } else current.clearPending(requestId);
     throw err;
   }
 }

@@ -116,7 +116,7 @@ describe("an answer you ask for", () => {
 
   it("runs at once when nothing has to stop first", () => {
     void runYourAction("Recap");
-    expect(runUserAction).toHaveBeenCalledWith("Recap", undefined);
+    expect(runUserAction).toHaveBeenCalledWith("Recap", undefined, {});
   });
 
   it("stops a running automatic answer, then runs yours", async () => {
@@ -126,7 +126,7 @@ describe("an answer you ask for", () => {
 
     await runYourAction("WhatToSay");
     expect(cancelGeneration).toHaveBeenCalledWith("auto-1");
-    expect(runUserAction).toHaveBeenCalledWith("WhatToSay", undefined);
+    expect(runUserAction).toHaveBeenCalledWith("WhatToSay", undefined, {});
     expect(vi.mocked(cancelGeneration).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(runUserAction).mock.invocationCallOrder[0]);
   });
