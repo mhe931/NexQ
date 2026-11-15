@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use thiserror::Error;
 use tokio::sync::Notify;
 
 /// Per-request generation parameters.
@@ -32,6 +31,11 @@ pub struct GenerationParams {
     /// `LLMError::Cancelled` once it fires. Never serialized.
     #[serde(skip)]
     pub cancel: Option<Arc<CancelToken>>,
+    /// In-process metadata for routed attempts. `silent` still suppresses
+    /// global events; this callback lets the publisher retain their metadata.
+    /// Ordinary silent probes/translations leave this unset.
+    #[serde(skip)]
+    pub metadata_sink: Option<MetadataSink>,
 }
 
 impl Default for GenerationParams {
@@ -44,6 +48,7 @@ impl Default for GenerationParams {
             request_id: None,
             silent: false,
             cancel: None,
+            metadata_sink: None,
         }
     }
 }
@@ -123,6 +128,35 @@ pub fn check_cancelled(params: &GenerationParams) -> Result<(), LLMError> {
 /// Callback that receives each streamed token for an in-process caller.
 pub type TokenSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Provider metadata, using the existing event payloads. Attempt errors/end
+/// events are staged by routing, never published before its decision.
+#[derive(Debug, Clone)]
+pub enum StreamMetadata {
+    Thinking,
+    Sources(Vec<StreamSource>),
+    End(StreamEndPayload),
+    Error(StreamErrorPayload),
+}
+
+#[derive(Clone)]
+pub struct MetadataSink(Arc<dyn Fn(StreamMetadata) + Send + Sync>);
+
+impl MetadataSink {
+    pub fn new(callback: impl Fn(StreamMetadata) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn emit(&self, event: StreamMetadata) {
+        (self.0)(event);
+    }
+}
+
+impl std::fmt::Debug for MetadataSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MetadataSink")
+    }
+}
+
 /// Where a streamed token is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -143,6 +177,18 @@ fn route_token(params: &GenerationParams, token: &str, sink: Option<&TokenSink>)
     } else {
         Route::Global
     }
+}
+
+/// The same routing rule as tokens, without AppHandle so silent/cancelled
+/// metadata delivery can be tested directly.
+pub(crate) fn route_metadata(params: &GenerationParams, event: &StreamMetadata) -> Route {
+    if is_cancelled(params) {
+        return Route::Sink;
+    }
+    if let Some(sink) = &params.metadata_sink {
+        sink.emit(event.clone());
+    }
+    if params.silent { Route::Sink } else { Route::Global }
 }
 
 /// Delivers one streamed token: to the sink, and as `llm_stream_token` unless the stream is silent.
@@ -171,19 +217,16 @@ pub fn emit_end_with_usage(
     latency_ms: u64,
     usage: Option<StreamUsage>,
 ) {
-    if params.silent {
-        return;
+    let payload = StreamEndPayload {
+        total_tokens,
+        latency_ms,
+        request_id: params.request_id.clone(),
+        cancelled: false,
+        usage,
+    };
+    if route_metadata(params, &StreamMetadata::End(payload.clone())) == Route::Global {
+        let _ = app.emit("llm_stream_end", payload);
     }
-    let _ = app.emit(
-        "llm_stream_end",
-        StreamEndPayload {
-            total_tokens,
-            latency_ms,
-            request_id: params.request_id.clone(),
-            cancelled: false,
-            usage,
-        },
-    );
 }
 
 /// [`emit_end`] for a provider that reports real prompt/completion counts in
@@ -201,7 +244,7 @@ pub fn emit_end_with_stats(app: &AppHandle, params: &GenerationParams, stats: &C
 /// Emits `llm_stream_thinking` for this request (nothing for silent
 /// streams): the model is thinking before its first words. Once per request.
 pub fn emit_thinking(app: &AppHandle, params: &GenerationParams) {
-    if params.silent {
+    if route_metadata(params, &StreamMetadata::Thinking) != Route::Global {
         return;
     }
     let _ = app.emit(
@@ -215,22 +258,27 @@ pub fn emit_thinking(app: &AppHandle, params: &GenerationParams) {
 /// Emits `llm_stream_error` for this request (nothing for silent streams — the
 /// caller gets the error from the returned `Result`).
 pub fn emit_error(app: &AppHandle, params: &GenerationParams, message: &str) {
+    // Legacy providers pass strings. Classify them before redacting, never
+    // forward a provider body or CLI stderr to the UI.
+    let error = LLMError::ProviderError(message.to_string());
+    emit_llm_error(app, params, &error);
+}
+
+/// Emits a typed, sanitized failure, preserving its classification.
+pub fn emit_llm_error(app: &AppHandle, params: &GenerationParams, error: &LLMError) {
     // A stopped stream already got its cancelled end event; no error on top of it.
-    if params.silent || is_cancelled(params) {
+    if is_cancelled(params) || error.kind() == LLMFailureKind::Cancelled {
         return;
     }
-    let _ = app.emit(
-        "llm_stream_error",
-        StreamErrorPayload {
-            message: message.to_string(),
-            request_id: params.request_id.clone(),
-        },
-    );
+    let payload = StreamErrorPayload::from_error(params, error);
+    if route_metadata(params, &StreamMetadata::Error(payload.clone())) == Route::Global {
+        let _ = app.emit("llm_stream_error", payload);
+    }
 }
 
 /// Emits `llm_stream_sources` for this request (nothing for silent streams).
 pub fn emit_sources(app: &AppHandle, params: &GenerationParams, sources: Vec<StreamSource>) {
-    if params.silent {
+    if route_metadata(params, &StreamMetadata::Sources(sources.clone())) != Route::Global {
         return;
     }
     let _ = app.emit(
@@ -264,31 +312,250 @@ pub struct LLMMessage {
     pub content: String,
 }
 
-#[derive(Debug, Error)]
-pub enum LLMError {
-    #[error("HTTP request failed: {0}")]
-    HttpError(#[from] reqwest::Error),
-
-    #[error("JSON parse error: {0}")]
-    JsonError(#[from] serde_json::Error),
-
-    #[error("Provider not configured: {0}")]
-    NotConfigured(String),
-
-    #[error("Authentication failed: {0}")]
-    AuthError(String),
-
-    #[error("Stream cancelled")]
+/// Stable failure contract shared by providers, routing and the frontend.
+/// Retryability describes the failed provider, NOT permission to switch
+/// providers, send private context elsewhere, or incur another charge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LLMFailureKind {
+    CreditsExhausted,
+    RateLimited,
+    InvalidApiKey,
+    Authentication,
+    Unavailable,
+    Timeout,
+    NotConfigured,
+    InvalidResponse,
     Cancelled,
+    #[default]
+    ProviderError,
+}
 
-    #[error("Connection failed: {0}")]
+impl LLMFailureKind {
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::Unavailable | Self::Timeout)
+    }
+
+    /// Only known provider names enter the message. Unknown/custom names
+    /// might contain a URL or other private configuration.
+    pub fn safe_message(self, provider: &str) -> String {
+        let name = match provider {
+            "openai" => "OpenAI",
+            "groq" => "Groq",
+            "openrouter" => "OpenRouter",
+            "lm_studio" => "LM Studio",
+            "anthropic" => "Anthropic",
+            "gemini" => "Gemini",
+            "ollama" => "Ollama",
+            "github_copilot" => "GitHub Copilot",
+            "claude_cli" => "Claude CLI",
+            _ => "The selected provider",
+        };
+        match self {
+            Self::CreditsExhausted if provider == "github_copilot" => format!(
+                "{name} credits are exhausted or the request allowance has been reached. \
+                 Check the account's Copilot usage, billing and organization policy before trying again."
+            ),
+            Self::CreditsExhausted => format!(
+                "{name} API credits are exhausted or the billing limit has been reached. \
+                 Check the account's API billing and credit balance before trying again. \
+                 A chat subscription does not provide API credits."
+            ),
+            Self::RateLimited => format!(
+                "{name} is rate limited. Wait before trying again, or reduce the request rate."
+            ),
+            Self::InvalidApiKey => format!(
+                "{name} API key is invalid or expired. Check the saved API key in Settings."
+            ),
+            Self::Authentication if provider == "github_copilot" => format!(
+                "{name} authentication or account access failed. Run `copilot login` if signed out; \
+                 otherwise check the account's Copilot plan and organization policy."
+            ),
+            Self::Authentication => format!(
+                "{name} authentication or account access failed. Check sign-in, credentials, \
+                 account permissions and provider entitlement."
+            ),
+            Self::Unavailable => format!(
+                "{name} is unavailable. Check the provider's service and your connection, then try again."
+            ),
+            Self::Timeout => format!(
+                "{name} request timed out. Check the connection and try again."
+            ),
+            Self::NotConfigured if provider == "github_copilot" => format!(
+                "{name} is not configured. Install the official standalone Copilot CLI and run `copilot login`."
+            ),
+            Self::NotConfigured => format!(
+                "{name} is not configured. Choose a provider and model and check its settings."
+            ),
+            Self::InvalidResponse => format!(
+                "{name} returned an invalid response. Check the selected model and provider settings."
+            ),
+            Self::Cancelled => "Stream cancelled".to_string(),
+            Self::ProviderError => format!(
+                "{name} could not complete the request. Check the selected model and provider settings."
+            ),
+        }
+    }
+}
+
+/// Classify legacy provider text without retaining or exposing it.
+/// Explicit billing exhaustion MUST win over generic quota / HTTP 429.
+/// A generic request/token quota can be transient; it is not proof of an
+/// empty credit balance.
+pub fn classify_failure(message: &str) -> LLMFailureKind {
+    let lower = message.to_lowercase();
+    let has = |patterns: &[&str]| patterns.iter().any(|p| lower.contains(p));
+    let status = |code: &str| lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|s| s == code);
+    if has(&[
+        "insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached",
+        "credits exhausted", "credits are exhausted", "credit balance is exhausted",
+        "credit balance exhausted", "insufficient credits", "not enough credits",
+        "no credits", "out of credits", "exceeded your current quota",
+        "billing limit", "payment required",
+    ]) || status("402") {
+        LLMFailureKind::CreditsExhausted
+    } else if has(&["not configured", "not installed", "api key required", "no llm provider"]) {
+        LLMFailureKind::NotConfigured
+    } else if has(&[
+        "invalid_api_key", "invalid api key", "incorrect api key",
+        "api key is invalid", "api key expired", "expired api key",
+    ]) {
+        LLMFailureKind::InvalidApiKey
+    } else if has(&[
+        "authentication", "unauthorized", "unauthenticated", "forbidden",
+        "not logged in", "not signed in", "copilot login", "bad credentials",
+        "invalid token", "token expired", "no entitlement", "access denied",
+    ]) || status("401") || status("403") {
+        LLMFailureKind::Authentication
+    } else if has(&[
+        "rate_limit", "rate limit", "rate-limit", "too many requests",
+        "quota exceeded", "resource_exhausted",
+    ]) || status("429") {
+        LLMFailureKind::RateLimited
+    } else if has(&["timeout", "timed out", "deadline exceeded"]) || status("408") || status("504") {
+        LLMFailureKind::Timeout
+    } else if has(&[
+        "unavailable", "connection refused", "connection failed", "connection reset",
+        "connection dropped", "failed to connect", "service overloaded", "overloaded_error",
+        "connection error", "network error", "error sending request",
+    ]) || ["500", "502", "503", "529"].iter().any(|code| status(code)) {
+        LLMFailureKind::Unavailable
+    } else if has(&["invalid response", "json parse error"]) {
+        LLMFailureKind::InvalidResponse
+    } else if has(&["stream cancelled"]) {
+        LLMFailureKind::Cancelled
+    } else {
+        LLMFailureKind::ProviderError
+    }
+}
+
+/// Classify an HTTP failure using both status and the private response body.
+/// Bodies may contain keys / prompts; callers must discard them after this.
+pub fn classify_http_failure(status: u16, body: &str) -> LLMFailureKind {
+    let detail = classify_failure(body);
+    if matches!(detail, LLMFailureKind::CreditsExhausted | LLMFailureKind::InvalidApiKey) {
+        return detail;
+    }
+    match status {
+        402 => LLMFailureKind::CreditsExhausted,
+        401 | 403 => LLMFailureKind::Authentication,
+        429 => LLMFailureKind::RateLimited,
+        408 | 504 => LLMFailureKind::Timeout,
+        500..=599 => LLMFailureKind::Unavailable,
+        _ => detail,
+    }
+}
+
+#[derive(Debug)]
+pub enum LLMError {
+    HttpError(reqwest::Error),
+    JsonError(serde_json::Error),
+    NotConfigured(String),
+    AuthError(String),
+    Cancelled,
     ConnectionFailed(String),
-
-    #[error("Invalid response: {0}")]
     InvalidResponse(String),
-
-    #[error("Provider error: {0}")]
     ProviderError(String),
+    /// No raw body, URL, stderr, API key or user content is stored here.
+    Failure { kind: LLMFailureKind, provider: String },
+}
+
+impl LLMError {
+    pub fn classified(kind: LLMFailureKind, provider: &str) -> Self {
+        Self::Failure { kind, provider: provider.to_string() }
+    }
+
+    pub fn from_http_failure(provider: &str, status: u16, body: &str) -> Self {
+        Self::classified(classify_http_failure(status, body), provider)
+    }
+
+    pub fn kind(&self) -> LLMFailureKind {
+        match self {
+            Self::Failure { kind, .. } => *kind,
+            Self::HttpError(error) if error.is_timeout() => LLMFailureKind::Timeout,
+            Self::HttpError(error) if error.is_connect() => LLMFailureKind::Unavailable,
+            Self::HttpError(error) if error.is_decode() => LLMFailureKind::InvalidResponse,
+            Self::HttpError(error) => error.status().map_or(
+                LLMFailureKind::Unavailable,
+                |status| classify_http_failure(status.as_u16(), ""),
+            ),
+            Self::JsonError(_) | Self::InvalidResponse(_) => LLMFailureKind::InvalidResponse,
+            Self::NotConfigured(_) => LLMFailureKind::NotConfigured,
+            Self::AuthError(message) => match classify_failure(message) {
+                LLMFailureKind::InvalidApiKey => LLMFailureKind::InvalidApiKey,
+                LLMFailureKind::CreditsExhausted => LLMFailureKind::CreditsExhausted,
+                _ => LLMFailureKind::Authentication,
+            },
+            Self::Cancelled => LLMFailureKind::Cancelled,
+            Self::ConnectionFailed(message) => match classify_failure(message) {
+                LLMFailureKind::ProviderError => LLMFailureKind::Unavailable,
+                kind => kind,
+            },
+            Self::ProviderError(message) => classify_failure(message),
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.kind().is_retryable()
+    }
+
+    pub fn safe_message(&self) -> String {
+        let provider = match self {
+            Self::Failure { provider, .. } => provider.as_str(),
+            _ => "",
+        };
+        self.kind().safe_message(provider)
+    }
+}
+
+// Display and serialization are always user-safe, including legacy variants.
+// Keep the actual transport error as a source for in-process diagnostics only.
+impl std::fmt::Display for LLMError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.safe_message())
+    }
+}
+
+impl std::error::Error for LLMError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HttpError(error) => Some(error),
+            Self::JsonError(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<reqwest::Error> for LLMError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::HttpError(error)
+    }
+}
+
+impl From<serde_json::Error> for LLMError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::JsonError(error)
+    }
 }
 
 impl Serialize for LLMError {
@@ -400,6 +667,21 @@ pub struct StreamThinkingPayload {
 pub struct StreamErrorPayload {
     pub message: String,
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub code: LLMFailureKind,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+impl StreamErrorPayload {
+    pub fn from_error(params: &GenerationParams, error: &LLMError) -> Self {
+        Self {
+            message: error.safe_message(),
+            request_id: params.request_id.clone(),
+            code: error.kind(),
+            retryable: error.is_retryable(),
+        }
+    }
 }
 
 /// A single web search result/source surfaced by provider-native grounding (e.g. Gemini).
@@ -447,6 +729,164 @@ pub trait LLMProvider: Send + Sync {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn silent_metadata_reaches_its_sink_without_global_events() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let target = received.clone();
+        let params = GenerationParams {
+            silent: true,
+            request_id: Some("public-request".into()),
+            metadata_sink: Some(MetadataSink::new(move |event| target.lock().unwrap().push(event))),
+            ..Default::default()
+        };
+        let end = StreamMetadata::End(StreamEndPayload {
+            total_tokens: 12, latency_ms: 23, request_id: params.request_id.clone(),
+            cancelled: false, usage: Some(StreamUsage { input_tokens: 10, output_tokens: 2, ..Default::default() }),
+        });
+        for event in [
+            StreamMetadata::Thinking,
+            StreamMetadata::Sources(vec![StreamSource { title: "Public source".into(), url: "https://example.com".into() }]),
+            end,
+            StreamMetadata::Error(StreamErrorPayload::from_error(&params,
+                &LLMError::classified(LLMFailureKind::CreditsExhausted, "openai"))),
+        ] {
+            assert_eq!(route_metadata(&params, &event), Route::Sink);
+        }
+        let events = received.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[2], StreamMetadata::End(payload)
+            if payload.request_id.as_deref() == Some("public-request") && payload.usage.as_ref().unwrap().input_tokens == 10));
+        assert!(matches!(&events[3], StreamMetadata::Error(payload)
+            if payload.code == LLMFailureKind::CreditsExhausted && !payload.retryable));
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("metadata_sink").is_none());
+    }
+
+    #[test]
+    fn ordinary_silent_calls_and_cancelled_metadata_stay_silent() {
+        let silent = GenerationParams { silent: true, ..Default::default() };
+        assert_eq!(route_metadata(&silent, &StreamMetadata::Thinking), Route::Sink);
+        assert_eq!(route_metadata(&GenerationParams::default(), &StreamMetadata::Thinking), Route::Global);
+        let token = Arc::new(CancelToken::new());
+        let received = Arc::new(Mutex::new(0));
+        let target = received.clone();
+        let params = GenerationParams {
+            cancel: Some(token.clone()),
+            metadata_sink: Some(MetadataSink::new(move |_| *target.lock().unwrap() += 1)),
+            ..Default::default()
+        };
+        token.cancel();
+        assert_eq!(route_metadata(&params, &StreamMetadata::Thinking), Route::Sink);
+        assert_eq!(*received.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn credit_exhaustion_wins_over_http_429_and_is_never_retryable() {
+        for marker in [
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "billing_hard_limit_reached",
+            "You have no credits",
+            "Your credit balance is exhausted",
+            "You exceeded your current quota, please check your plan and billing details",
+        ] {
+            let body = serde_json::json!({
+                "error": { "code": marker, "message": "HTTP 429 Too Many Requests" }
+            }).to_string();
+            assert_eq!(classify_http_failure(429, &body), LLMFailureKind::CreditsExhausted, "{marker}");
+            assert_eq!(classify_failure(&format!("HTTP 429: {marker}")), LLMFailureKind::CreditsExhausted);
+            let error = LLMError::from_http_failure("openai", 429, &body);
+            assert_eq!(error.kind(), LLMFailureKind::CreditsExhausted);
+            assert!(!error.is_retryable());
+            assert!(error.safe_message().contains("billing"));
+        }
+        // Providers using 402 for payment-required belong to the same bucket.
+        assert_eq!(classify_http_failure(402, ""), LLMFailureKind::CreditsExhausted);
+    }
+
+    #[test]
+    fn transient_limits_auth_and_timeout_have_distinct_classifications() {
+        for (status, body, expected) in [
+            (429, r#"{"error":{"code":"rate_limit_exceeded"}}"#, LLMFailureKind::RateLimited),
+            (429, "Too Many Requests", LLMFailureKind::RateLimited),
+            (401, r#"{"error":{"code":"invalid_api_key"}}"#, LLMFailureKind::InvalidApiKey),
+            (401, "Unauthorized", LLMFailureKind::Authentication),
+            (403, "Forbidden", LLMFailureKind::Authentication),
+            (408, "", LLMFailureKind::Timeout),
+            (504, "", LLMFailureKind::Timeout),
+            (503, "", LLMFailureKind::Unavailable),
+            (500, "", LLMFailureKind::Unavailable),
+            (400, "Bad request", LLMFailureKind::ProviderError),
+        ] {
+            let error = LLMError::from_http_failure("openai", status, body);
+            assert_eq!(error.kind(), expected);
+            assert_eq!(error.is_retryable(), matches!(expected,
+                LLMFailureKind::RateLimited | LLMFailureKind::Unavailable | LLMFailureKind::Timeout));
+            assert_eq!(classify_failure(&error.to_string()), expected);
+        }
+        // Generic quota wording is not proof that paid credits are exhausted.
+        assert_eq!(classify_failure("quota exceeded: requests per minute"), LLMFailureKind::RateLimited);
+        assert_eq!(classify_failure("request timed out"), LLMFailureKind::Timeout);
+        assert_eq!(classify_failure("connection refused"), LLMFailureKind::Unavailable);
+        assert_eq!(classify_failure("Unknown failure 1429"), LLMFailureKind::ProviderError);
+    }
+
+    #[test]
+    fn safe_error_payload_preserves_request_identity_without_provider_secrets() {
+        let raw = r#"{"error":{"code":"insufficient_quota","message":"Bearer secret-sentinel; private-meeting-sentinel; https://private.invalid/?key=secret-sentinel"}}"#;
+        let error = LLMError::from_http_failure("openai", 429, raw);
+        let params = GenerationParams { request_id: Some("request-public".into()), ..Default::default() };
+        let payload = StreamErrorPayload::from_error(&params, &error);
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["code"], "credits_exhausted");
+        assert_eq!(json["retryable"], false);
+        assert_eq!(json["request_id"], "request-public");
+        assert!(json["message"].as_str().unwrap().contains("OpenAI"));
+        for serialized in [json.to_string(), error.to_string(), serde_json::to_string(&error).unwrap()] {
+            assert!(!serialized.contains("sentinel"), "{serialized}");
+            assert!(!serialized.contains("private.invalid"), "{serialized}");
+        }
+        // Legacy errors also never echo a raw provider body, URL, or stderr.
+        let legacy = LLMError::ProviderError(format!("HTTP 429 insufficient_quota {raw}"));
+        assert_eq!(legacy.kind(), LLMFailureKind::CreditsExhausted);
+        assert!(!legacy.to_string().contains("sentinel"));
+        let unknown = LLMError::ConnectionFailed("private-meeting-sentinel".into());
+        assert_eq!(unknown.kind(), LLMFailureKind::Unavailable);
+        assert!(!unknown.safe_message().contains("sentinel"));
+        let custom = LLMError::classified(LLMFailureKind::Unavailable, "https://private.invalid/private-provider-sentinel");
+        assert!(!custom.safe_message().contains("sentinel"));
+        assert!(!custom.safe_message().contains("private.invalid"));
+    }
+
+    #[test]
+    fn legacy_stream_error_payload_still_deserializes() {
+        let payload: StreamErrorPayload =
+            serde_json::from_str(r#"{"message":"old error","request_id":"req"}"#).unwrap();
+        assert_eq!(payload.code, LLMFailureKind::ProviderError);
+        assert!(!payload.retryable);
+    }
+
+    #[test]
+    fn every_failure_kind_round_trips_through_safe_legacy_messages() {
+        for kind in [
+            LLMFailureKind::CreditsExhausted,
+            LLMFailureKind::RateLimited,
+            LLMFailureKind::InvalidApiKey,
+            LLMFailureKind::Authentication,
+            LLMFailureKind::Unavailable,
+            LLMFailureKind::Timeout,
+            LLMFailureKind::NotConfigured,
+            LLMFailureKind::InvalidResponse,
+            LLMFailureKind::Cancelled,
+            LLMFailureKind::ProviderError,
+        ] {
+            for provider in ["openai", "github_copilot", ""] {
+                let message = kind.safe_message(provider);
+                assert_eq!(classify_failure(&message), kind, "{message}");
+            }
+        }
+    }
 
     fn collecting_sink() -> (TokenSink, Arc<Mutex<String>>) {
         let collected = Arc::new(Mutex::new(String::new()));

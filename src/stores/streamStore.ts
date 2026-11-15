@@ -2,6 +2,8 @@ import { create } from "zustand";
 import type { AIResponse, IntelligenceMode, StreamSource } from "../lib/types";
 import { stripThinkTags } from "../lib/utils";
 import { NO_USER_REQUESTS, type LastUserRequests } from "../lib/contextScope";
+import { safeServiceError } from "../lib/serviceHealth";
+import type { FallbackNotice } from "../lib/profileTypes";
 
 /** Every answer of the meeting is kept, up to this many (newest first). */
 export const RESPONSE_HISTORY_CAP = 100;
@@ -41,12 +43,21 @@ interface StreamState {
   currentMode: IntelligenceMode | null;
   currentModel: string;
   currentProvider: string;
+  /** Provider selected when this request was sent (not an old answer's provider). */
+  requestProvider: string | null;
+  requestModel: string | null;
+  /** Latest accepted switch for this answer; never an uncorrelated notice. */
+  profileFallback: FallbackNotice | null;
+  lastAction: { mode: string; question?: string } | null;
+  answerOutcome: "ready" | "unable" | "cancelled" | null;
   currentSources: StreamSource[];
   error: string | null;
+  errorRetryable: boolean | null;
   latencyMs: number | null;
 
   // Progress of the current request
   phase: StreamPhase;
+  handlingStatus: "retrieving_context" | "generating_answer" | null;
   /** Epoch ms the user acted (or the stream started, when not user-invoked). */
   requestStartedAt: number | null;
   /** Epoch ms the first visible words arrived. */
@@ -70,7 +81,7 @@ interface StreamState {
   setStreaming: (streaming: boolean) => void;
   appendToken: (token: string) => void;
   /** A user action was invoked: show "Sending…" until its start event. No-op while streaming. */
-  setPending: (mode: IntelligenceMode | string, requestId: string) => void;
+  setPending: (mode: IntelligenceMode | string, requestId: string, provider?: string, question?: string, model?: string) => void;
   /** The pending action failed before starting (only clears that request). */
   clearPending: (requestId: string) => void;
   /** Whether `requestId` is the request being sent or streamed now. */
@@ -78,10 +89,13 @@ interface StreamState {
   /** When `requestId` ends, drop it: not kept in History, not left on screen. */
   discardRequest: (requestId: string) => void;
   setPhase: (phase: StreamPhase) => void;
+  setHandlingStatus: (status: "retrieving_context" | "generating_answer") => void;
   startStream: (mode: IntelligenceMode, model: string, provider: string, details?: StreamStartDetails) => void;
+  /** Change serving attribution only; preserve content, progress and requested primary. */
+  applyProfileFallback: (notice: FallbackNotice) => boolean;
   setSources: (sources: StreamSource[]) => void;
-  endStream: (latencyMs: number) => void;
-  setError: (error: string | null) => void;
+  endStream: (latencyMs: number, cancelled?: boolean) => void;
+  setError: (error: string | null, details?: { code?: string | null; retryable?: boolean | null }) => void;
   clearCurrent: () => void;
   pinResponse: (id: string) => void;
   unpinResponse: (id: string) => void;
@@ -97,6 +111,7 @@ const IDLE_PROGRESS = {
   streamMeta: null,
   pendingRequestId: null,
   streamRequestId: null,
+  handlingStatus: null,
 };
 
 /** Requests to drop when they end (automatic answers NexQ stopped). */
@@ -109,8 +124,14 @@ export const useStreamStore = create<StreamState>((set, get) => ({
   currentMode: null,
   currentModel: "",
   currentProvider: "",
+  requestProvider: null,
+  requestModel: null,
+  profileFallback: null,
+  lastAction: null,
+  answerOutcome: null,
   currentSources: [],
   error: null,
+  errorRetryable: null,
   latencyMs: null,
   ...IDLE_PROGRESS,
   currentId: null,
@@ -135,13 +156,20 @@ export const useStreamStore = create<StreamState>((set, get) => ({
       return { _rawContent: raw, currentContent: content, ...progress };
     }),
 
-  setPending: (mode, requestId) => {
+  setPending: (mode, requestId, provider, question, model) => {
     // A second press while one is running or still sending is refused by the
     // backend; it must not take over the first request's progress.
     if (get().isStreaming || get().phase === "sending") return;
     set({
       phase: "sending",
       pendingRequestId: requestId,
+      requestProvider: provider ?? null,
+      requestModel: model ?? null,
+      currentProvider: "",
+      currentModel: "",
+      profileFallback: null,
+      lastAction: { mode, question },
+      answerOutcome: null,
       requestStartedAt: Date.now(),
       firstTokenAt: null,
       streamMeta: null,
@@ -151,12 +179,14 @@ export const useStreamStore = create<StreamState>((set, get) => ({
       currentSources: [],
       currentId: null,
       error: null,
+      errorRetryable: null,
+      handlingStatus: null,
     });
   },
 
   clearPending: (requestId) => {
     if (get().pendingRequestId !== requestId) return;
-    set({ ...IDLE_PROGRESS, currentMode: get().isStreaming ? get().currentMode : null });
+    set({ ...IDLE_PROGRESS, profileFallback: null, currentMode: get().isStreaming ? get().currentMode : null });
   },
 
   isRunning: (requestId) => {
@@ -169,9 +199,14 @@ export const useStreamStore = create<StreamState>((set, get) => ({
   },
 
   setPhase: (phase) => set({ phase }),
+  setHandlingStatus: (handlingStatus) => set({ handlingStatus }),
 
   startStream: (mode, model, provider, details = {}) => {
     const state = get();
+    const fallback = details.requestId && state.profileFallback?.request_id === details.requestId
+      ? state.profileFallback : null;
+    const servingModel = fallback?.to_model ?? model;
+    const servingProvider = fallback?.to_provider ?? provider;
     const fromClick =
       state.pendingRequestId !== null &&
       state.requestStartedAt !== null &&
@@ -181,20 +216,26 @@ export const useStreamStore = create<StreamState>((set, get) => ({
       currentContent: "",
       _rawContent: "",
       currentMode: mode,
-      currentModel: model,
-      currentProvider: provider,
+      currentModel: servingModel,
+      currentProvider: servingProvider,
+      requestProvider: fromClick ? state.requestProvider : provider,
+      requestModel: fromClick ? state.requestModel : model,
+      profileFallback: fallback,
+      answerOutcome: null,
       currentSources: [],
       error: null,
+      errorRetryable: null,
       latencyMs: null,
       phase: "waiting",
+      handlingStatus: "generating_answer",
       requestStartedAt: fromClick ? state.requestStartedAt : Date.now(),
       firstTokenAt: null,
       pendingRequestId: null,
       streamRequestId: details.requestId ?? null,
       currentId: null,
       streamMeta: {
-        model,
-        provider,
+        model: servingModel,
+        provider: servingProvider,
         scopeLabel: details.scopeLabel ?? null,
         newLines: details.newLines ?? null,
         sessionKey: details.sessionKey ?? null,
@@ -202,9 +243,30 @@ export const useStreamStore = create<StreamState>((set, get) => ({
     });
   },
 
+  applyProfileFallback: (notice) => {
+    if (!notice.request_id || !get().isRunning(notice.request_id)
+      || !notice.to_provider.trim() || !notice.to_model.trim()) return false;
+    const state = get();
+    set({
+      currentProvider: notice.to_provider,
+      currentModel: notice.to_model,
+      // Fill only unknown pre-start attribution; never replace the requested primary.
+      requestProvider: state.requestProvider ?? notice.from_provider,
+      requestModel: state.requestModel ?? notice.from_model,
+      profileFallback: notice,
+      streamMeta: {
+        scopeLabel: null, newLines: null, sessionKey: null,
+        ...state.streamMeta,
+        provider: notice.to_provider,
+        model: notice.to_model,
+      },
+    });
+    return true;
+  },
+
   setSources: (sources) => set({ currentSources: sources }),
 
-  endStream: (latencyMs) => {
+  endStream: (latencyMs, cancelled = false) => {
     const state = get();
     // Strip <think> tags from the final stored content
     const content = stripThinkTags(state._rawContent);
@@ -232,6 +294,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
     set((s) => ({
       isStreaming: false,
       currentContent: dropped ? "" : content,
+      answerOutcome: cancelled || dropped ? "cancelled" : keep ? "ready" : "unable",
       latencyMs,
       ...IDLE_PROGRESS,
       currentId: keep ? response.id : null,
@@ -239,7 +302,15 @@ export const useStreamStore = create<StreamState>((set, get) => ({
     }));
   },
 
-  setError: (error) => set({ error, isStreaming: false, ...IDLE_PROGRESS }),
+  setError: (error, details = {}) => set((state) => ({
+    error: error && details.code !== "cancelled" ? safeServiceError(error, "AI", details.code).message : null,
+    errorRetryable: details.retryable ?? null,
+    answerOutcome: details.code === "cancelled" ? "cancelled" : error ? "unable" : null,
+    isStreaming: false, ...IDLE_PROGRESS,
+    // Retain failure attribution, not running progress: AI was not invoked.
+    handlingStatus: error && details.code !== "cancelled" && state.handlingStatus === "retrieving_context"
+      ? "retrieving_context" : null,
+  })),
   clearCurrent: () =>
     set({
       currentContent: "",
@@ -247,8 +318,14 @@ export const useStreamStore = create<StreamState>((set, get) => ({
       currentMode: null,
       currentModel: "",
       currentProvider: "",
+      requestProvider: null,
+      requestModel: null,
+      profileFallback: null,
+      lastAction: null,
+      answerOutcome: null,
       currentSources: [],
       error: null,
+      errorRetryable: null,
       latencyMs: null,
       currentId: null,
       ...IDLE_PROGRESS,

@@ -192,6 +192,14 @@ export async function testLLMConnection(provider: string): Promise<boolean> {
   return invoke("test_llm_connection", { provider });
 }
 
+export async function testLLMResponse(provider: string, model: string): Promise<boolean> {
+  return invoke("test_llm_response", { provider, model });
+}
+
+export async function clearProviderCreditFailure(provider: string): Promise<void> {
+  return invoke("clear_provider_credit_failure", { provider });
+}
+
 export async function getLLMProviders(): Promise<string[]> {
   const result = await invoke<string>("get_llm_providers");
   return JSON.parse(result);
@@ -337,6 +345,10 @@ export async function deleteApiKey(provider: string): Promise<void> {
 
 export async function hasApiKey(provider: string): Promise<boolean> {
   return invoke("has_api_key", { provider });
+}
+
+export async function testSTTTranscription(filePath: string, party: "You" | "Them"): Promise<string> {
+  return invoke("test_stt_transcription", { filePath, party });
 }
 
 // == IPC: Meetings (Sub-PRD 1/8) ==

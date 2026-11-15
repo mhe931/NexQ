@@ -19,6 +19,7 @@ import { ColorPickerButton } from "../components/ColorPickerButton";
 import { ResponseProgress } from "./ResponseProgress";
 import { ResponseHistoryList } from "./ResponseHistoryList";
 import { formatDuration } from "./responseFormat";
+import { safeServiceError } from "../lib/serviceHealth";
 
 /** "current", "resp-<id>" (a history answer) or "pinned-<id>". */
 type TabId = "current" | `resp-${string}` | `pinned-${string}`;
@@ -128,7 +129,7 @@ export function AIResponsePanel() {
   if (error) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2">
-        <p className="text-xs text-destructive/70">{error}</p>
+        <p className="text-xs text-destructive" role="alert">{safeServiceError(error, "AI").message}</p>
       </div>
     );
   }

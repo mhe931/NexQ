@@ -9,6 +9,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 import { runUserAction } from "./userAction";
 import { useConfigStore } from "../stores/configStore";
 import { useStreamStore } from "../stores/streamStore";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
 
 const T0 = 1_700_000_000_000;
 
@@ -17,6 +18,7 @@ describe("runUserAction", () => {
     generateAssist.mockReset();
     generateAssist.mockResolvedValue(undefined);
     useStreamStore.getState().resetForMeeting();
+    useLiveQAHealthStore.getState().reset();
     useConfigStore.setState({ contextScope: { kind: "default", minutes: 5 }, contextScopeSticky: true });
     vi.spyOn(Date, "now").mockReturnValue(T0);
   });
@@ -81,5 +83,30 @@ describe("runUserAction", () => {
     generateAssist.mockRejectedValueOnce(new Error("Generation already in progress"));
     await expect(runUserAction("Assist")).rejects.toThrow("already in progress");
     expect(useStreamStore.getState().phase).toBe("idle");
+  });
+
+  it("retains a safe pre-stream failure and permits another typed question", async () => {
+    generateAssist.mockRejectedValueOnce('{"error":{"code":"insufficient_quota","message":"secret"}}');
+    await expect(runUserAction("AskQuestion", "Why?")).rejects.toBeDefined();
+    expect(useStreamStore.getState().phase).toBe("idle");
+    expect(useStreamStore.getState().error).toBe("AI credits exhausted. Check provider billing.");
+    await runUserAction("AskQuestion", "Try this question");
+    expect(useStreamStore.getState().error).toBeNull();
+    expect(generateAssist.mock.calls[1][1]).toBe("Try this question");
+  });
+
+  it("retains an actionable document error without invalidating AI proof on IPC rejection", async () => {
+    const message = "Meeting documents are unavailable. Restart NexQ before asking again.";
+    useConfigStore.setState({ llmProvider: "openai", llmModel: "gpt-4o" });
+    useLiveQAHealthStore.getState().markAIReady("openai", "gpt-4o");
+    generateAssist.mockImplementationOnce(async () => {
+      useStreamStore.getState().setHandlingStatus("retrieving_context");
+      throw new Error(message);
+    });
+    await expect(runUserAction("AskQuestion", "Why?")).rejects.toThrow(message);
+    expect(useStreamStore.getState()).toMatchObject({ phase: "idle", handlingStatus: "retrieving_context", error: message, answerOutcome: "unable" });
+    expect(useLiveQAHealthStore.getState().aiReadyModels.openai).toBe("gpt-4o");
+    await runUserAction("AskQuestion", "Try after refreshing");
+    expect(useStreamStore.getState()).toMatchObject({ handlingStatus: null, error: null, phase: "sending" });
   });
 });

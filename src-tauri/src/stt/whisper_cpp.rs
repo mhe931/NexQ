@@ -37,6 +37,26 @@ const SPEECH_RMS_THRESHOLD: f64 = 200.0;
 /// Maximum number of pending tasks before we start dropping old fast passes.
 const MAX_QUEUE_SIZE: usize = 6;
 
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn corrupt_model_fails_before_stream_is_ready() {
+        let path = std::env::temp_dir().join(format!("nexq-whisper-invalid-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"not a whisper model").unwrap();
+        let mut provider = WhisperCppSTT::new(path.clone(), Arc::new(RwLock::new(DualPassConfig::default())));
+        let (tx, _rx) = mpsc::channel(8);
+        let result = provider.start_stream(tx).await;
+        let was_streaming = provider.is_streaming;
+        provider.stop_stream().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err(), "a file existing is not model readiness");
+        assert!(!was_streaming);
+        assert!(provider.inference_thread.is_none());
+    }
+}
+
 // ── Hallucination filter ──
 
 /// Strip whisper hallucination artifacts from output text.
@@ -300,7 +320,7 @@ impl STTProvider for WhisperCppSTT {
             return Err("Stream already active".into());
         }
 
-        if !self.model_path.exists() {
+        if !self.model_path.is_file() {
             return Err(format!(
                 "Whisper model not found at: {}",
                 self.model_path.display()
@@ -323,8 +343,10 @@ impl STTProvider for WhisperCppSTT {
         let language = self.language.clone();
         let stop_flag = Arc::clone(&self.stop_flag);
         let tx = result_tx.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        self.stop_flag.store(false, AtomicOrdering::SeqCst);
 
-        let thread = std::thread::spawn(move || {
+        let thread = std::thread::Builder::new().name("whisper-stt-inference".into()).spawn(move || {
             use whisper_rs::{
                 FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
             };
@@ -340,6 +362,7 @@ impl STTProvider for WhisperCppSTT {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     log::error!("WhisperCppSTT: Failed to load model: {}", e);
+                    let _ = ready_tx.send(Err(format!("Failed to load Whisper model: {}", e)));
                     return;
                 }
             };
@@ -348,11 +371,15 @@ impl STTProvider for WhisperCppSTT {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("WhisperCppSTT: Failed to create state: {}", e);
+                    let _ = ready_tx.send(Err(format!("Failed to initialize Whisper model: {}", e)));
                     return;
                 }
             };
 
             log::info!("WhisperCppSTT: Model loaded, inference thread ready");
+            if ready_tx.send(Ok(())).is_err() {
+                return; // startup was cancelled; do not keep an orphan worker
+            }
 
             let mut pending = BinaryHeap::<PrioritizedTask>::new();
             let mut seq_counter = 0u64;
@@ -556,14 +583,27 @@ impl STTProvider for WhisperCppSTT {
             }
 
             log::info!("WhisperCppSTT: Inference thread exiting");
-        });
+        })?;
+
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            outcome => {
+                drop(inf_tx);
+                let _ = thread.join();
+                let message = match outcome {
+                    Ok(Err(message)) => message,
+                    Err(_) => "Whisper inference worker ended before becoming ready".into(),
+                    Ok(Ok(())) => unreachable!(),
+                };
+                return Err(message.into());
+            }
+        }
 
         self.result_tx = Some(result_tx);
         self.inference_tx = Some(inf_tx);
         self.feedback_rx = Some(std::sync::Mutex::new(fb_rx));
         self.inference_thread = Some(thread);
         self.is_streaming = true;
-        self.stop_flag.store(false, AtomicOrdering::SeqCst);
         self.start_time = Some(Instant::now());
         self.fast_buffer.clear();
         self.line_audio.clear();
@@ -585,6 +625,9 @@ impl STTProvider for WhisperCppSTT {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.is_streaming || self.stop_flag.load(AtomicOrdering::SeqCst) {
             return Ok(());
+        }
+        if self.inference_thread.as_ref().is_some_and(|thread| thread.is_finished()) {
+            return Err("Whisper inference worker stopped. Restart listening or check the local model.".into());
         }
 
         // Drain feedback
@@ -741,6 +784,55 @@ impl STTProvider for WhisperCppSTT {
 
     async fn test_connection(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.model_path.exists())
+    }
+
+    async fn transcribe_pcm(
+        &mut self,
+        samples: Vec<i16>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if self.is_streaming {
+            return Err("Cannot run a file diagnostic on an active STT stream".into());
+        }
+        if samples.is_empty() || samples.len() > 30 * SAMPLE_RATE as usize {
+            return Err("File diagnostic requires between 0 and 30 seconds of 16 kHz mono PCM".into());
+        }
+        let model_path = self.model_path.clone();
+        let language = self.language.clone();
+        // The live engine's aggressive stop/queue limits intentionally discard
+        // pending work. A selected finite WAV instead uses one complete inference
+        // with the same model, parameters and hallucination filter.
+        let text = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+            let context = WhisperContext::new_with_params(
+                &model_path, WhisperContextParameters::default(),
+            ).map_err(|error| format!("Whisper model failed to load: {}", error))?;
+            let mut state = context.create_state()
+                .map_err(|error| format!("Whisper model initialization failed: {}", error))?;
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            params.set_language(Some(&language));
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            params.set_n_threads(4);
+            params.set_no_context(true);
+            params.set_suppress_blank(true);
+            params.set_suppress_nst(true);
+            params.set_no_speech_thold(0.6);
+            state.full(params, &Self::i16_to_f32(&samples))
+                .map_err(|error| format!("Whisper inference failed: {}", error))?;
+            let mut text = String::new();
+            for index in 0..state.full_n_segments() {
+                let segment = state.get_segment(index).ok_or("Whisper returned an invalid segment")?;
+                text.push_str(segment.to_str().map_err(|error| format!("Invalid Whisper transcript: {}", error))?);
+            }
+            let text = clean_whisper_text(&text);
+            if text.is_empty() {
+                return Err("Whisper produced no transcript. Select a WAV containing clear speech and check the model/language.".into());
+            }
+            Ok(text)
+        }).await.map_err(|error| format!("Whisper diagnostic worker failed: {}", error))??;
+        Ok(text)
     }
 
     fn set_language(&mut self, language: &str) {

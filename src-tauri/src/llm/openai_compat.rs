@@ -3,13 +3,24 @@
 
 use futures::StreamExt;
 use serde_json::json;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::provider::{
     CompletionStats, GenerationParams, LLMError, LLMMessage, LLMProvider, ModelInfo,
-    cancellable, check_cancelled, is_cancelled, emit_end, emit_error, emit_token, TokenSink,
+    cancellable, check_cancelled, is_cancelled, emit_end, emit_llm_error, emit_token, TokenSink,
 };
 use super::stream_parser::{LineBuffer, SSEParser};
+
+/// Bound both requests and stalled streaming responses; reqwest's default
+/// client otherwise has no total request timeout.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Some compatible providers report a failure inside a successful SSE
+/// response. Do not silently turn those frames into an empty success.
+fn stream_error(provider: &str, data: &serde_json::Value) -> Option<LLMError> {
+    let error = data.get("error").filter(|error| !error.is_null())?;
+    Some(LLMError::from_http_failure(provider, 0, &error.to_string()))
+}
 
 /// Configuration for an OpenAI-compatible provider instance.
 #[derive(Debug, Clone)]
@@ -46,7 +57,12 @@ impl OpenAICompatClient {
         for (key, val) in &self.config.extra_headers {
             builder = builder.header(key.as_str(), val.as_str());
         }
-        builder
+        builder.timeout(REQUEST_TIMEOUT)
+    }
+
+    fn transport_error(&self, error: reqwest::Error) -> LLMError {
+        let kind = LLMError::from(error).kind();
+        LLMError::classified(kind, &self.config.provider_name)
     }
 }
 
@@ -60,24 +76,15 @@ impl LLMProvider for OpenAICompatClient {
         let url = format!("{}/models", self.config.base_url);
         let request = self.apply_auth(self.client.get(&url));
 
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|error| self.transport_error(error))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(LLMError::AuthError(format!(
-                    "Authentication failed ({}): {}",
-                    status, body
-                )));
-            }
-            return Err(LLMError::ProviderError(format!(
-                "Failed to list models ({}): {}",
-                status, body
-            )));
+            return Err(LLMError::from_http_failure(&self.config.provider_name, status.as_u16(), &body));
         }
 
-        let body: serde_json::Value = response.json().await?;
+        let body: serde_json::Value = response.json().await.map_err(|error| self.transport_error(error))?;
 
         let models = body
             .get("data")
@@ -120,8 +127,16 @@ impl LLMProvider for OpenAICompatClient {
         };
         let request = self.apply_auth(self.client.get(&url));
 
-        let response = request.send().await?;
-        Ok(response.status().is_success())
+        let response = request.send().await.map_err(|error| self.transport_error(error))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(LLMError::from_http_failure(&self.config.provider_name, status, &body));
+        }
+        // This proves endpoint/key access, not a funded completion. In
+        // particular OpenAI /models may succeed while chat returns 429
+        // insufficient_quota. Never make a billable chat as a settings probe.
+        Ok(true)
     }
 
     async fn stream_completion(
@@ -178,17 +193,18 @@ impl LLMProvider for OpenAICompatClient {
             if is_cancelled(&params) {
                 return LLMError::Cancelled;
             }
-            emit_error(&app_handle, &params, &e.to_string());
-            LLMError::HttpError(e)
+            let error = self.transport_error(e);
+            emit_llm_error(&app_handle, &params, &error);
+            error
         })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let err_msg = format!("Completion request failed ({}): {}", status, body);
+            let body = cancellable(&params, response.text()).await?.unwrap_or_default();
+            let error = LLMError::from_http_failure(&self.config.provider_name, status.as_u16(), &body);
             check_cancelled(&params)?;
-            emit_error(&app_handle, &params, &err_msg);
-            return Err(LLMError::ProviderError(err_msg));
+            emit_llm_error(&app_handle, &params, &error);
+            return Err(error);
         }
 
         let mut stream = response.bytes_stream();
@@ -201,8 +217,9 @@ impl LLMProvider for OpenAICompatClient {
                 if is_cancelled(&params) {
                     return LLMError::Cancelled;
                 }
-                emit_error(&app_handle, &params, &e.to_string());
-                LLMError::HttpError(e)
+                let error = self.transport_error(e);
+                emit_llm_error(&app_handle, &params, &error);
+                error
             })?;
 
             let chunk_str = String::from_utf8_lossy(&chunk);
@@ -213,6 +230,10 @@ impl LLMProvider for OpenAICompatClient {
                 for event in events {
                     match event {
                         Some(data) => {
+                            if let Some(error) = stream_error(&self.config.provider_name, &data) {
+                                emit_llm_error(&app_handle, &params, &error);
+                                return Err(error);
+                            }
                             if let Some(token) = SSEParser::extract_openai_token(&data) {
                                 if !token.is_empty() {
                                     token_count += 1;
@@ -234,6 +255,10 @@ impl LLMProvider for OpenAICompatClient {
             let events = SSEParser::parse_chunk(&remaining);
             for event in events {
                 if let Some(data) = event {
+                    if let Some(error) = stream_error(&self.config.provider_name, &data) {
+                        emit_llm_error(&app_handle, &params, &error);
+                        return Err(error);
+                    }
                     if let Some(token) = SSEParser::extract_openai_token(&data) {
                         if !token.is_empty() {
                             token_count += 1;
@@ -307,4 +332,117 @@ pub fn create_lm_studio_client(base_url: Option<&str>) -> OpenAICompatClient {
         auth_value: None,
         extra_headers: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::provider::LLMFailureKind;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An unauthenticated loopback stub, never the user's configured provider.
+    async fn stub(status: u16, body: &str) -> (OpenAICompatClient, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_string();
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            let request_line = String::from_utf8_lossy(&request[..n]).lines().next().unwrap().to_string();
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            request_line
+        });
+        let mut client = OpenAICompatClient::new(OpenAICompatConfig {
+            provider_name: "openai".into(),
+            base_url,
+            auth_header: None,
+            auth_value: None,
+            extra_headers: vec![],
+        });
+        // Local tests must not use the machine's HTTP proxy configuration.
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        (client, served)
+    }
+
+    #[tokio::test]
+    async fn model_listing_classifies_credit_exhaustion_and_redacts_the_body() {
+        let (client, served) = stub(429, r#"{"error":{"code":"insufficient_quota","message":"private-body-sentinel"}}"#).await;
+        let error = client.list_models().await.unwrap_err();
+        assert_eq!(error.kind(), LLMFailureKind::CreditsExhausted);
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("sentinel"));
+        assert_eq!(served.await.unwrap(), "GET /models HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn connection_probe_reports_actionable_failure_instead_of_false() {
+        for (status, body, expected) in [
+            (401, r#"{"error":{"code":"invalid_api_key","message":"private-key-sentinel"}}"#, LLMFailureKind::InvalidApiKey),
+            (403, "private-body-sentinel", LLMFailureKind::Authentication),
+            (429, r#"{"error":{"code":"rate_limit_exceeded"}}"#, LLMFailureKind::RateLimited),
+            (429, r#"{"error":{"code":"credit_balance_exhausted"}}"#, LLMFailureKind::CreditsExhausted),
+            (503, "private-body-sentinel", LLMFailureKind::Unavailable),
+            (504, "private-body-sentinel", LLMFailureKind::Timeout),
+        ] {
+            let (client, served) = stub(status, body).await;
+            let error = client.test_connection().await.unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert!(!error.to_string().contains("sentinel"));
+            assert_eq!(served.await.unwrap(), "GET /models HTTP/1.1");
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_model_access_does_not_make_a_billable_chat_probe() {
+        let (client, served) = stub(200, r#"{"data":[]}"#).await;
+        assert!(client.test_connection().await.unwrap());
+        assert_eq!(served.await.unwrap(), "GET /models HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn stalled_requests_are_classified_as_timeout_without_url_leakage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = OpenAICompatClient::new(OpenAICompatConfig {
+            provider_name: "openai".into(),
+            base_url: format!("http://{}/private-url-sentinel", listener.local_addr().unwrap()),
+            auth_header: None,
+            auth_value: None,
+            extra_headers: vec![],
+        });
+        client.client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(20))
+            .build().unwrap();
+        // apply_auth sets a per-request timeout, so exercise the same error
+        // conversion with a short bounded request to the local listener.
+        let error = client.client.get(&client.config.base_url)
+            .timeout(Duration::from_millis(20)).send().await.unwrap_err();
+        let error = client.transport_error(error);
+        assert_eq!(error.kind(), LLMFailureKind::Timeout);
+        assert!(error.is_retryable());
+        assert!(!error.to_string().contains("sentinel"));
+    }
+
+    #[test]
+    fn sse_failure_frames_are_errors_not_an_empty_success() {
+        for (code, expected) in [
+            ("insufficient_quota", LLMFailureKind::CreditsExhausted),
+            ("credit_balance_exhausted", LLMFailureKind::CreditsExhausted),
+            ("rate_limit_exceeded", LLMFailureKind::RateLimited),
+            ("invalid_api_key", LLMFailureKind::InvalidApiKey),
+        ] {
+            let data = json!({"error":{"code":code, "message":"private-sse-sentinel"}});
+            let error = stream_error("openai", &data).unwrap();
+            assert_eq!(error.kind(), expected);
+            assert!(!error.to_string().contains("sentinel"));
+        }
+        assert!(stream_error("openai", &json!({"choices":[{"delta":{"content":"Public reply"}}]})).is_none());
+        assert!(stream_error("openai", &json!({"error":null})).is_none());
+    }
 }

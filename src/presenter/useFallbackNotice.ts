@@ -1,31 +1,27 @@
-import { useCallback, useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { useCallback, useState } from "react";
 import type { FallbackNotice } from "../lib/profileTypes";
+import { useStreamStore } from "../stores/streamStore";
 
 /** Wording for the provider-switch notice. */
 export function fallbackMessage(n: FallbackNotice): string {
-  return `Switched to ${n.to_provider} (${n.reason}) — ${n.from_provider} was unavailable`;
+  const reasons: Record<string, string> = {
+    credits_exhausted: "credits exhausted",
+    rate_limited: "rate limited",
+    timeout: "request timed out",
+    auth: "authentication required",
+    unavailable: "provider unavailable",
+    other: "provider could not answer",
+  };
+  const reason = Object.prototype.hasOwnProperty.call(reasons, n.reason) ? reasons[n.reason] : reasons.other;
+  return `Switched to ${n.to_provider} — ${n.from_provider}: ${reason}.`;
 }
 
 /** The latest `profile_fallback` event of this meeting, until dismissed. */
 export function useFallbackNotice(): { notice: FallbackNotice | null; dismiss: () => void } {
-  const [notice, setNotice] = useState<FallbackNotice | null>(null);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    listen<FallbackNotice>("profile_fallback", (e) => setNotice(e.payload))
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
-
-  const dismiss = useCallback(() => setNotice(null), []);
+  // Stream buffer owns event correlation; display must not adopt stale switches.
+  const accepted = useStreamStore((s) => s.profileFallback);
+  const [dismissed, setDismissed] = useState<FallbackNotice | null>(null);
+  const notice = accepted === dismissed ? null : accepted;
+  const dismiss = useCallback(() => setDismissed(accepted), [accepted]);
   return { notice, dismiss };
 }

@@ -45,7 +45,7 @@ describe("ModeButtons while an answer runs", () => {
     expect(recap.disabled).toBe(false);
 
     fireEvent.click(recap);
-    await waitFor(() => expect(runUserAction).toHaveBeenCalledWith("Recap", undefined));
+    await waitFor(() => expect(runUserAction).toHaveBeenCalledWith("Recap", undefined, {}));
     expect(cancelGeneration).toHaveBeenCalledWith("auto-1");
   });
 

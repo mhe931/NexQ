@@ -38,6 +38,45 @@ describe("configStore: Claude CLI config", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([false, true])("keeps legacy cloud selection on Them, without authorizing microphone transfer (devices: %s)", async (hasDevices) => {
+    saved.set("sttProvider", "deepgram");
+    if (hasDevices) {
+      saved.set("micDeviceId", "mic");
+      saved.set("systemDeviceId", "system");
+    }
+    const store = await freshStore();
+    await store.getState().loadConfig();
+    expect(store.getState().meetingAudioConfig?.you.stt_provider).toBe("web_speech");
+    expect(store.getState().meetingAudioConfig?.them.stt_provider).toBe("deepgram");
+  });
+
+  it("preserves explicitly saved local STT providers and model choices without a cloud migration", async () => {
+    const audio = {
+      you: { role: "You", device_id: "mic", is_input_device: true, stt_provider: "whisper_cpp", local_model_id: "local-model" },
+      them: { role: "Them", device_id: "system", is_input_device: false, stt_provider: "whisper_cpp", local_model_id: "local-model" },
+      recording_enabled: false, preset_name: null,
+    };
+    saved.set("meetingAudioConfig", audio);
+    saved.set("sttProvider", "whisper_cpp");
+    const store = await freshStore();
+    await store.getState().loadConfig();
+    expect(store.getState().meetingAudioConfig).toEqual(audio);
+    expect(store.getState().sttProvider).toBe("whisper_cpp");
+    expect(saved.get("meetingAudioConfig")).toEqual(audio);
+  });
+
+  it("does not silently fix incompatible or dual-exclusive selections by sending Them to a cloud provider", async () => {
+    const audio = {
+      you: { role: "You", device_id: "mic", is_input_device: true, stt_provider: "web_speech" },
+      them: { role: "Them", device_id: "system", is_input_device: false, stt_provider: "windows_native" },
+      recording_enabled: false, preset_name: null,
+    };
+    saved.set("meetingAudioConfig", audio);
+    const store = await freshStore();
+    await store.getState().loadConfig();
+    expect(store.getState().meetingAudioConfig).toEqual(audio);
+  });
+
   it("starts with the defaults and the last active provider as fallback, and pushes it on load", async () => {
     saved.set("llmProvider", "openai");
     saved.set("llmModel", "gpt-4o");

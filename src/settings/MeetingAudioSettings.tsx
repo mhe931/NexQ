@@ -42,7 +42,7 @@ import {
 } from "lucide-react";
 import { BUILT_IN_PRESETS, type MeetingPreset, applyPreset } from "./presets";
 
-// STT provider options — whisper_cpp excluded (batch-only, not for live STT)
+// Providers consume the selected device unless marked input-only.
 const STT_OPTIONS: {
   value: STTProviderType;
   label: string;
@@ -70,6 +70,15 @@ const STT_OPTIONS: {
     requiresKey: false,
     isCloud: false,
     inputOnly: true,
+  },
+  {
+    value: "whisper_cpp",
+    label: "Whisper.cpp",
+    shortLabel: "Whisper.cpp",
+    icon: <HardDrive className="h-3.5 w-3.5" />,
+    requiresKey: false,
+    isCloud: false,
+    requiresDownload: "whisper_cpp",
   },
   {
     value: "sherpa_onnx",
@@ -693,10 +702,13 @@ function PartyPanel({
 
   function handleProviderChange(newProvider: STTProviderType) {
     const updates: Partial<PartyAudioConfig> = { stt_provider: newProvider };
-    if (newProvider === "sherpa_onnx" || newProvider === "ort_streaming" || newProvider === "parakeet_tdt") {
+    if (newProvider === "whisper_cpp" || newProvider === "sherpa_onnx" || newProvider === "ort_streaming" || newProvider === "parakeet_tdt") {
       // Use per-engine active model, falling back to legacy activeWhisperModel
       const activeModelPerEngine = useConfigStore.getState().activeModelPerEngine;
       const DEFAULT_MODEL_PER_ENGINE: Record<string, string> = {
+        whisper_cpp: activeWhisperModel
+          ?? localEngines.find((e) => e.engine === "whisper_cpp")?.models.find((m) => m.is_downloaded && !m.id.startsWith("binary-"))?.id
+          ?? "base",
         sherpa_onnx: "streaming-zipformer-en-20M",
         ort_streaming: "zipformer-en-20M",
         parakeet_tdt: "parakeet-tdt-0.6b-v3-int8",
@@ -880,7 +892,7 @@ function ProviderSelect({
   }, [open]);
 
   function isLocalEngineReady(engineId: string): boolean {
-    if (localEngines.length === 0) return true; // Still loading — don't trigger fallback
+    if (localEngines.length === 0) return false;
     const eng = localEngines.find((e) => e.engine === engineId);
     if (!eng) return false;
     return eng.models.some((m) => !m.id.startsWith("binary-") && m.is_downloaded);
@@ -890,8 +902,7 @@ function ProviderSelect({
     // Don't show providers that require downloads/keys even if currently selected
     if (opt.inputOnly && !isInput) return false;
     if (opt.requiresDownload) return isLocalEngineReady(opt.requiresDownload);
-    // If API key status hasn't loaded yet, assume available to prevent false fallbacks
-    if (opt.requiresKey) return apiKeyStatus[opt.value] ?? true;
+    if (opt.requiresKey) return apiKeyStatus[opt.value] === true;
     return true;
   }
 
@@ -955,37 +966,6 @@ function ProviderSelect({
     setStealTarget(null);
     setOpen(false);
   }
-
-  // Auto-reset to a working provider if the current one is no longer available.
-  //
-  // IMPORTANT: this must NOT run on the initial load. Availability resolves
-  // asynchronously (local engines + API-key status), and reacting to the first
-  // resolution would silently overwrite the user's saved provider every time the
-  // settings page is opened. So we wait until BOTH lists have been populated once,
-  // then only react to later changes.
-  const initialAvailabilityLoadedRef = useRef(false);
-
-  useEffect(() => {
-    if (!initialAvailabilityLoadedRef.current) {
-      const enginesReady = localEngines.length > 0;
-      const keysReady = Object.keys(apiKeyStatus).length > 0;
-      if (enginesReady && keysReady) {
-        initialAvailabilityLoadedRef.current = true;
-      }
-      return; // Skip fallback on initial load
-    }
-    const currentOpt = STT_OPTIONS.find((o) => o.value === value);
-    if (currentOpt && !isAvailable(currentOpt)) {
-      // Never fall back to an exclusive provider (Web Speech / Windows Speech):
-      // they capture the OS default mic and can only serve one party at a time.
-      const fallback = STT_OPTIONS.find(
-        (o) => o.value !== value && isAvailable(o) && !isExclusiveProvider(o.value)
-      );
-      if (fallback) {
-        onChange(fallback.value);
-      }
-    }
-  }, [localEngines, apiKeyStatus]);
 
   const localOptions = STT_OPTIONS.filter((o) => !o.isCloud && isAvailable(o));
   const cloudOptions = STT_OPTIONS.filter((o) => o.isCloud && isAvailable(o));

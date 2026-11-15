@@ -58,7 +58,7 @@ describe("NoTranscriptBanner", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     logToFile.mockClear();
-    useMeetingStore.setState({ isRecording: true, activeMeeting: { id: "m1" } as never });
+    useMeetingStore.setState({ isRecording: true, listening: true, activeMeeting: { id: "m1" } as never });
     useConfigStore.setState({ meetingAudioConfig: audioConfig, mutedYou: false, mutedThem: false });
     useTranscriptStore.setState({ segments: [] });
   });
@@ -106,5 +106,36 @@ describe("NoTranscriptBanner", () => {
       });
     });
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not let historical text suppress a failed provider restart", async () => {
+    useTranscriptStore.setState({
+      segments: [{ id: "old", text: "Earlier words", speaker: "Them", timestamp_ms: 0, is_final: true, confidence: 1 }],
+    });
+    render(<NoTranscriptBanner />);
+    await act(async () => {});
+    hear("System", 31);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    act(() => useConfigStore.setState({
+      meetingAudioConfig: { ...audioConfig, them: { ...audioConfig.them, stt_provider: "deepgram" } },
+    }));
+    hear("System", 31);
+    expect(screen.getByRole("alert")).toHaveTextContent("No transcript from Them");
+    act(() => useTranscriptStore.setState({
+      segments: [{ id: "new", text: "Recovered words", speaker: "Them", timestamp_ms: Date.now(), is_final: true, confidence: 1 }],
+    }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("pauses the watchdog and checks fresh text after resume", async () => {
+    render(<NoTranscriptBanner />);
+    await act(async () => {});
+    act(() => useMeetingStore.setState({ listening: false }));
+    hear("System", 35);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    act(() => useMeetingStore.setState({ listening: true }));
+    await act(async () => {});
+    hear("System", 31);
+    expect(screen.getByRole("alert")).toHaveTextContent("No transcript from Them");
   });
 });

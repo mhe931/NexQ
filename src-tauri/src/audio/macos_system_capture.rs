@@ -18,6 +18,7 @@ use objc2::msg_send;
 use tokio::sync::mpsc;
 
 use super::super::AudioChunk;
+use super::super::capture_status::StreamCaptureStatusReporter;
 
 type CreateTap = unsafe extern "C" fn(*mut AnyObject, *mut AudioObjectID) -> OSStatus;
 type DestroyTap = unsafe extern "C" fn(AudioObjectID) -> OSStatus;
@@ -31,15 +32,18 @@ pub(super) fn start(
     tx: mpsc::Sender<AudioChunk>,
     stop: Arc<AtomicBool>,
     device_name: Option<String>,
+    status: Option<StreamCaptureStatusReporter>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = sync_mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
         .name("system-audio-capture".into())
         .spawn(move || {
             objc2::rc::autoreleasepool(|_| {
-                if let Err(error) = run(tx, stop, device_name, &ready_tx) {
+                let runtime_status = status.clone();
+                if let Err(error) = run(tx, stop, device_name, &ready_tx, status) {
                     let _ = ready_tx.send(Err(error.clone()));
                     log::error!("System audio capture failed: {error}");
+                    if let Some(status) = &runtime_status { status.error(&error); }
                 }
             });
         })
@@ -188,6 +192,7 @@ fn run(
     stop: Arc<AtomicBool>,
     name: Option<String>,
     ready: &sync_mpsc::SyncSender<Result<(), String>>,
+    status: Option<StreamCaptureStatusReporter>,
 ) -> Result<(), String> {
     let create = unsafe {
         dlsym((-2isize) as *mut c_void, c"AudioHardwareCreateProcessTap".as_ptr())
@@ -272,6 +277,9 @@ fn run(
     let queue = capture.queue.as_deref().unwrap();
     if queue.invalid.load(Ordering::Acquire) {
         return Err("CoreAudio returned an unsupported output-tap buffer layout".into());
+    }
+    if let Some(status) = &status {
+        status.active(format!("Capturing output '{}'", name.as_deref().unwrap_or("default")));
     }
     ready.send(Ok(())).map_err(|_| "System audio capture startup cancelled")?;
     log::info!(

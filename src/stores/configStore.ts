@@ -544,9 +544,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
     if (providerConfig == null) providerConfig = await storedProviderConfig(provider);
     await ipc.setLLMProvider(providerConfig);
     before.setLLMProvider(provider);
-    // An activated provider counts as verified (the "Ready" badge in Settings).
-    const verified = useConfigStore.getState().verifiedCloudProviders;
-    if (!verified.includes(provider)) useConfigStore.getState().setVerifiedCloudProviders([...verified, provider]);
+    // Selecting a router isn't a connection test or a successful generation.
     // Claude ignores the model (Fast / Deep come from its settings) but the
     // backend needs one: its Fast model fills the slot.
     const model =
@@ -1048,7 +1046,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
             role: "Them",
             device_id: systemDeviceId ?? "default",
             is_input_device: false,
-            stt_provider: "deepgram",
+            stt_provider: sttProvider ?? "deepgram",
           },
           recording_enabled: recordingEnabled ?? false,
           preset_name: null,
@@ -1057,50 +1055,12 @@ export const useConfigStore = create<ConfigState>((set) => ({
         console.log("[configStore] Migrated legacy audio config to meetingAudioConfig");
       }
 
-      // Migrate whisper_cpp → correct defaults (whisper_cpp is batch-only, not for live STT)
-      // Only run on first load to avoid overwriting user settings mid-meeting.
-      if (!alreadyLoaded && resolvedMeetingConfig) {
-        let migrated = false;
-        if ((resolvedMeetingConfig.you.stt_provider as string) === "whisper_cpp") {
-          resolvedMeetingConfig.you = { ...resolvedMeetingConfig.you, stt_provider: "web_speech", local_model_id: undefined };
-          migrated = true;
-        }
-        if ((resolvedMeetingConfig.them.stt_provider as string) === "whisper_cpp") {
-          resolvedMeetingConfig.them = { ...resolvedMeetingConfig.them, stt_provider: "deepgram", local_model_id: undefined };
-          migrated = true;
-        }
-        // windows_native only works with mic input; migrate Them (non-input) away from it
-        if (
-          (resolvedMeetingConfig.them.stt_provider as string) === "windows_native" &&
-          !resolvedMeetingConfig.them.is_input_device
-        ) {
-          resolvedMeetingConfig.them = { ...resolvedMeetingConfig.them, stt_provider: "deepgram" };
-          migrated = true;
-        }
-        // Mutual exclusion: Web Speech / Windows Speech can only be used by one party.
-        // If both parties have exclusive providers (from old config), keep "You" and fallback "Them".
-        const exclusiveProviders = ["web_speech", "windows_native"];
-        if (
-          exclusiveProviders.includes(resolvedMeetingConfig.you.stt_provider) &&
-          exclusiveProviders.includes(resolvedMeetingConfig.them.stt_provider)
-        ) {
-          resolvedMeetingConfig.them = {
-            ...resolvedMeetingConfig.them,
-            stt_provider: "deepgram",
-            local_model_id: undefined,
-          };
-          migrated = true;
-          console.log("[configStore] Migrated dual-exclusive STT: kept You, fell back Them to deepgram");
-        }
-        if (migrated) {
-          await store.set("meetingAudioConfig", resolvedMeetingConfig);
-          console.log("[configStore] Migrated meetingAudioConfig providers");
-        }
-      }
+      // Preserve explicit providers, even when incompatible or unavailable.
+      // Recovery must be a user choice, never a silent audio transfer.
 
-      // Migrate top-level sttProvider away from whisper_cpp (first load only)
+      // Supply a default only when no legacy provider was selected.
       let resolvedSttProvider = sttProvider;
-      if (!alreadyLoaded && (!resolvedSttProvider || (resolvedSttProvider as string) === "whisper_cpp")) {
+      if (!alreadyLoaded && !resolvedSttProvider) {
         resolvedSttProvider = "windows_native" as STTProviderType;
         await store.set("sttProvider", resolvedSttProvider);
         console.log("[configStore] Migrated top-level sttProvider to windows_native");
@@ -1119,7 +1079,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
             role: "Them",
             device_id: "default",
             is_input_device: false,
-            stt_provider: "deepgram",
+            stt_provider: sttProvider ?? "deepgram",
           },
           recording_enabled: false,
           preset_name: null,

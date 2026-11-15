@@ -4,16 +4,19 @@
 
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { StartChoice } from "./meetingChoice";
+import type { FallbackNotice } from "./profileTypes";
 import type {
   AIScenario,
   MeetingPromptInfo,
   AgentSessionStatus,
   AgentFallbackEvent,
   AudioLevelEvent,
+  AudioCaptureStatusEvent,
   BatchTranslationProgress,
   ModelDownloadProgress,
   OllamaPullProgressEvent,
   QuestionDetectedEvent,
+  QuestionHandlingStatusEvent,
   RagIndexProgressEvent,
   StreamEndEvent,
   StreamErrorEvent,
@@ -99,12 +102,27 @@ export function onStreamError(
   );
 }
 
+/** The actual serving provider changed for a specific profile request. */
+export function onProfileFallback(
+  handler: (event: FallbackNotice) => void
+): Promise<UnlistenFn> {
+  return listen<FallbackNotice>("profile_fallback", (e) => handler(e.payload));
+}
+
 // == QUESTION DETECTION EVENTS ==
 
 export function onQuestionDetected(
   handler: (event: QuestionDetectedEvent) => void
 ): Promise<UnlistenFn> {
   return listen<QuestionDetectedEvent>("question_detected", (e) =>
+    handler(e.payload)
+  );
+}
+
+export function onQuestionHandlingStatus(
+  handler: (event: QuestionHandlingStatusEvent) => void
+): Promise<UnlistenFn> {
+  return listen<QuestionHandlingStatusEvent>("question_handling_status", (e) =>
     handler(e.payload)
   );
 }
@@ -121,6 +139,14 @@ export function onAudioDeviceChange(
   handler: () => void
 ): Promise<UnlistenFn> {
   return listen("audio_device_change", () => handler());
+}
+
+export function onAudioCaptureStatus(
+  handler: (event: AudioCaptureStatusEvent) => void
+): Promise<UnlistenFn> {
+  return listen<AudioCaptureStatusEvent>("audio_capture_status", (e) =>
+    handler(e.payload)
+  );
 }
 
 // == MEETING EVENTS ==

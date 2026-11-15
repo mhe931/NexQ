@@ -11,6 +11,7 @@ import { runYourAction, useAutoAnswerRunning } from "../lib/autoAnswer";
 import type { MeetingProfile } from "../lib/profileTypes";
 import { showToast } from "../stores/toastStore";
 import { useStreamStore } from "../stores/streamStore";
+import { safeServiceError } from "../lib/serviceHealth";
 
 interface Props {
   profile: MeetingProfile;
@@ -54,7 +55,7 @@ export function AnswerPanel({ profile, colors }: Props) {
     const text = question.trim();
     if (!text || locked) return;
     runYourAction("AskQuestion", text).catch((err) => {
-      showToast(err instanceof Error ? err.message : "Couldn't send the question", "error");
+      showToast(safeServiceError(err, "AI").message, "error");
     });
     setQuestion("");
     setAskOpen(false);
@@ -86,12 +87,12 @@ export function AnswerPanel({ profile, colors }: Props) {
       <div className="min-h-0 flex-1 overflow-y-auto scroll-smooth rounded-lg px-1" role="region" aria-label="Answer" tabIndex={0}>
         <ResponseProgress />
         {error ? (
-          <p className="text-sm text-destructive" role="alert">{error}</p>
+          <p className="text-sm text-destructive" role="alert">{safeServiceError(error, "AI").message}</p>
         ) : content ? (
           <AnswerView content={content} streaming={isStreaming} t={t} colors={colors} />
         ) : !inFlight ? (
           <p style={{ ...textColumn({ ...t, fontSize: Math.min(t.fontSize, 20) }), color: colors.muted }}>
-            Listening for questions. You can also type one with Ask.
+            Ask a question below, or use a detected question above.
           </p>
         ) : null}
       </div>

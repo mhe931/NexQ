@@ -13,9 +13,13 @@ import { useDevLogStore } from "../stores/devLogStore";
 import { useTranscriptStore } from "../stores/transcriptStore";
 import { stopCapture, startCapturePerParty } from "../lib/ipc";
 import { skipYouStt } from "../lib/audioMode";
+import { emit } from "@tauri-apps/api/event";
+import { safeServiceError } from "../lib/serviceHealth";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
 
 export function useAudioConfigSync() {
   const isRecording = useMeetingStore((s) => s.isRecording);
+  const listening = useMeetingStore((s) => s.listening);
   const meetingAudioConfig = useConfigStore((s) => s.meetingAudioConfig);
 
   // What Rust currently has running — only updated after successful restart
@@ -28,7 +32,7 @@ export function useAudioConfigSync() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (!isRecording || !meetingAudioConfig) return;
+    if (!isRecording || !listening || !meetingAudioConfig) return;
 
     const configKey = JSON.stringify(meetingAudioConfig);
 
@@ -62,6 +66,8 @@ export function useAudioConfigSync() {
 
     debounceRef.current = setTimeout(async () => {
       debounceRef.current = null;
+      const meetingId = useMeetingStore.getState().activeMeeting?.id;
+      if (!useMeetingStore.getState().listening) return;
 
       // If already restarting, clear pending so next effect re-schedules
       if (restartingRef.current) {
@@ -105,22 +111,32 @@ export function useAudioConfigSync() {
 
         // Re-read config in case it changed during the stop
         const freshConfig = useConfigStore.getState().meetingAudioConfig;
-        if (!freshConfig) {
+        const meeting = useMeetingStore.getState();
+        if (!freshConfig || !meeting.listening || meeting.activeMeeting?.id !== meetingId) {
           log("warn", "config", "Hot-swap: no config available after stop");
           return;
         }
 
         log("info", "config", "Hot-swap: starting new capture pipeline...");
-        await startCapturePerParty(freshConfig.you, freshConfig.them, {
-          skipYouStt: skipYouStt(useMeetingStore.getState().audioMode),
-        });
+        const override = meeting.sttOverride;
+        await startCapturePerParty(
+          override ? { ...freshConfig.you, stt_provider: override } : freshConfig.you,
+          override ? { ...freshConfig.them, stt_provider: override } : freshConfig.them,
+          { skipYouStt: skipYouStt(useMeetingStore.getState().audioMode) },
+        );
         const freshKey = JSON.stringify(freshConfig);
         appliedConfigRef.current = freshKey;
         pendingConfigRef.current = freshKey;
         log("info", "config", "Hot-swap complete — new STT pipeline active");
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = safeServiceError(err, "Audio").message;
         log("error", "config", `Hot-swap FAILED: ${msg}`);
+        if (useMeetingStore.getState().activeMeeting?.id === meetingId) {
+          useLiveQAHealthStore.getState().audioFailed(msg);
+          useMeetingStore.setState({ listening: false });
+          emit("capture_warning", msg).catch(() => log("error", "config", "Could not notify other windows of the capture failure"));
+          emit("nexq:listening_changed", { listening: false }).catch(() => log("error", "config", "Could not synchronize paused listening with other windows"));
+        }
         // Reset both refs so next config change retries
         appliedConfigRef.current = null;
         pendingConfigRef.current = null;
@@ -128,18 +144,21 @@ export function useAudioConfigSync() {
         restartingRef.current = false;
       }
     }, 300);
-  }, [isRecording, meetingAudioConfig]);
+  }, [isRecording, listening, meetingAudioConfig]);
 
   // Reset when meeting ends
   useEffect(() => {
-    if (!isRecording) {
+    if (!isRecording || !listening) {
       appliedConfigRef.current = null;
       pendingConfigRef.current = null;
-      restartingRef.current = false;
       if (debounceRef.current) {
         clearTimeout(debounceRef.current);
         debounceRef.current = null;
       }
     }
-  }, [isRecording]);
+  }, [isRecording, listening]);
+
+  useEffect(() => () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+  }, []);
 }

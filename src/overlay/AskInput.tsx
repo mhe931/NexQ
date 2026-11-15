@@ -3,6 +3,7 @@ import { useStreamStore } from "../stores/streamStore";
 import { runYourAction, useAutoAnswerRunning } from "../lib/autoAnswer";
 import { showToast } from "../stores/toastStore";
 import { Send, X } from "lucide-react";
+import { safeServiceError } from "../lib/serviceHealth";
 
 interface AskInputProps {
   visible: boolean;
@@ -13,9 +14,10 @@ interface AskInputProps {
 export function AskInput({ visible, onClose }: AskInputProps) {
   const [inputText, setInputText] = useState("");
   const isStreaming = useStreamStore((s) => s.isStreaming);
+  const phase = useStreamStore((s) => s.phase);
   // An automatic answer gives way to what you ask; an answer you asked for does not.
   const autoRunning = useAutoAnswerRunning();
-  const locked = isStreaming && !autoRunning;
+  const locked = (isStreaming || phase !== "idle") && !autoRunning;
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Focus the input when made visible
@@ -31,8 +33,7 @@ export function AskInput({ visible, onClose }: AskInputProps) {
 
     // Send question in AskQuestion mode (with the picked transcript scope)
     runYourAction("AskQuestion", text).catch((err) => {
-      const msg = err instanceof Error ? err.message : "Failed to send question";
-      showToast(msg, "error");
+      showToast(safeServiceError(err, "AI").message, "error");
     });
     setInputText("");
     onClose();

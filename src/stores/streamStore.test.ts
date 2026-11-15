@@ -1,8 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useStreamStore, RESPONSE_HISTORY_CAP } from "./streamStore";
+import type { FallbackNotice } from "../lib/profileTypes";
 
 const T0 = 1_700_000_000_000;
 const s = () => useStreamStore.getState();
+const FALLBACK: FallbackNotice = {
+  request_id: "r1", from_provider: "openai", from_model: "gpt-4o",
+  to_provider: "groq", to_model: "llama", reason: "credits_exhausted",
+};
 
 /** One full answer: pending → start → token → end. */
 function answer(mode: string, text: string, requestId = crypto.randomUUID()) {
@@ -87,7 +92,23 @@ describe("streamStore", () => {
 
     s().setPending("Assist", "r2");
     s().setError("boom");
-    expect(s()).toMatchObject({ phase: "idle", error: "boom" });
+    expect(s()).toMatchObject({ phase: "idle", error: "AI failed. Check configuration, then retry." });
+  });
+
+  it("retains the failed retrieval stage without leaving progress running, then clears it on a new question", () => {
+    const message = "Meeting documents are unavailable. Restart NexQ before asking again.";
+    s().setPending("AskQuestion", "docs", "openai");
+    s().setHandlingStatus("retrieving_context");
+    s().setError(message);
+    expect(s()).toMatchObject({
+      phase: "idle", isStreaming: false, pendingRequestId: null,
+      handlingStatus: "retrieving_context", answerOutcome: "unable", error: message,
+    });
+    s().setPending("AskQuestion", "next", "openai");
+    expect(s()).toMatchObject({ handlingStatus: null, error: null, phase: "sending" });
+    s().setHandlingStatus("retrieving_context");
+    s().setError("stopped", { code: "cancelled" });
+    expect(s()).toMatchObject({ handlingStatus: null, error: null, answerOutcome: "cancelled" });
   });
 
   it("a click while streaming does not disturb the running stream", () => {
@@ -158,5 +179,53 @@ describe("streamStore", () => {
       currentContent: "",
       currentId: null,
     });
+  });
+
+  it("updates the serving provider without resetting content, timing, scope or requested primary", () => {
+      s().setPending("AskQuestion", "r1", "openai", "Why?", "gpt-4o");
+      s().startStream("AskQuestion", "gpt-4o", "openai", { requestId: "r1", scopeLabel: "Last 5 min", newLines: 3, sessionKey: "session" });
+      s().appendToken("Some words");
+      const before = s();
+      expect(s().applyProfileFallback(FALLBACK)).toBe(true);
+      expect(s()).toMatchObject({
+        currentProvider: "groq", currentModel: "llama",
+        requestProvider: "openai", requestModel: "gpt-4o",
+        currentContent: "Some words", _rawContent: "Some words",
+        phase: "writing", isStreaming: true, streamRequestId: "r1",
+        requestStartedAt: before.requestStartedAt, firstTokenAt: before.firstTokenAt,
+        streamMeta: { provider: "groq", model: "llama", scopeLabel: "Last 5 min", newLines: 3, sessionKey: "session" },
+      });
+      s().endStream(10);
+      expect(s().responseHistory[0]).toMatchObject({ provider: "groq", model: "llama", content: "Some words" });
+      expect(s().requestProvider).toBe("openai");
+  });
+
+  it("preserves pre-start fallback attribution when the original start arrives", () => {
+      s().setPending("AskQuestion", "r1", "openai", "Why?", "gpt-4o");
+      const at = s().requestStartedAt;
+      s().applyProfileFallback(FALLBACK);
+      expect(s()).toMatchObject({ phase: "sending", pendingRequestId: "r1", currentProvider: "groq", requestStartedAt: at });
+      s().startStream("AskQuestion", "gpt-4o", "openai", { requestId: "r1", scopeLabel: "Last 5 min", newLines: 2 });
+      expect(s()).toMatchObject({
+        currentProvider: "groq", currentModel: "llama", requestProvider: "openai", requestModel: "gpt-4o",
+        streamMeta: { provider: "groq", model: "llama", scopeLabel: "Last 5 min", newLines: 2 },
+      });
+  });
+
+  it("ignores stale, missing and completed request switches and clears attribution for a new action", () => {
+      s().setPending("AskQuestion", "r1", "openai", "Why?", "gpt-4o");
+      const before = s();
+      expect(s().applyProfileFallback({ ...FALLBACK, request_id: "old" })).toBe(false);
+      expect(s().applyProfileFallback({ ...FALLBACK, request_id: null })).toBe(false);
+      expect(s()).toBe(before);
+      s().startStream("AskQuestion", "gpt-4o", "openai", { requestId: "r1" });
+      s().applyProfileFallback(FALLBACK);
+      s().appendToken("Answer");
+      s().endStream(10);
+      const completed = s();
+      expect(s().applyProfileFallback(FALLBACK)).toBe(false);
+      expect(s()).toBe(completed);
+      s().setPending("AskQuestion", "r2", "openai", "Next?", "gpt-4o");
+      expect(s()).toMatchObject({ currentProvider: "", currentModel: "", profileFallback: null, requestProvider: "openai" });
   });
 });

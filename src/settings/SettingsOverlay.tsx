@@ -96,13 +96,18 @@ export function SettingsOverlay({ isModal = false }: SettingsOverlayProps) {
   const setSettingsOpen = useMeetingStore((s) => s.setSettingsOpen);
   const setCurrentView = useMeetingStore((s) => s.setCurrentView);
   const previousView = useMeetingStore((s) => s.previousView);
+  const requestedTab = useMeetingStore((s) => s.settingsTab);
   const [activeTab, setActiveTab] = useState<SettingsTab>(
-    () => (useMeetingStore.getState().settingsTab as SettingsTab | null) ?? "meeting_audio",
+    () => ALL_TABS.find((tab) => tab.id === requestedTab)?.id ?? "meeting_audio",
   );
-  // The requested tab applies to this opening only.
+  // Recovery links can request another tab without closing settings.
   useEffect(() => {
+    if (requestedTab === null) return;
+    const tab = ALL_TABS.find((item) => item.id === requestedTab);
+    if (tab) setActiveTab(tab.id);
+    else console.warn("[SettingsOverlay] Unsupported settings tab requested.");
     useMeetingStore.setState({ settingsTab: null });
-  }, []);
+  }, [requestedTab]);
   const [isVisible, setIsVisible] = useState(false);
   const backdropRef = useRef<HTMLDivElement>(null);
 

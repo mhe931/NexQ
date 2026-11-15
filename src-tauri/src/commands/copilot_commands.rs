@@ -18,7 +18,8 @@ async fn resolve_binary() -> Option<PathBuf> {
 
 /// Probe the Copilot CLI: installed? version? and, from a real ACP handshake
 /// plus a throw-away `session/new`, whether it answers and lists models for
-/// this account. Makes no model call. Errors are the CLI's own words.
+/// this account. Makes no model call, so readiness does not establish chat
+/// entitlement. Errors are sanitized; raw RPC text/stderr never enters IPC.
 #[command]
 pub async fn copilot_status() -> Result<CopilotStatus, String> {
     Ok(check_status(&CopilotHub::global()).await)

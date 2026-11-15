@@ -116,11 +116,11 @@ export async function makeWayForYou(): Promise<void> {
  * stops for it; an answer you asked for earlier doesn't, so this one is refused.
  * Settles with your answer, without holding up the Auto-Answer steps meanwhile.
  */
-export function runYourAction(mode: string, question?: string): Promise<void> {
+export function runYourAction(mode: string, question?: string, opts: { requestId?: string } = {}): Promise<void> {
   let answer: Promise<void> = Promise.resolve();
   return inTurn(async () => {
     if (autoAnswerRunning()) await makeWayForYou();
-    answer = runUserAction(mode, question);
+    answer = runUserAction(mode, question, opts);
   }).then(() => answer);
 }
 

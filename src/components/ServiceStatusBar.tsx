@@ -11,7 +11,8 @@ import { useConfigStore } from "../stores/configStore";
 import { useStreamStore } from "../stores/streamStore";
 import { useMeetingStore } from "../stores/meetingStore";
 import { useSpeakerStore } from "../stores/speakerStore";
-import { useAudioLevel } from "../hooks/useAudioLevel";
+import { useLiveQAHealth } from "../hooks/useLiveQAHealth";
+import { safeServiceError } from "../lib/serviceHealth";
 import { hasApiKey, listLocalSTTEngines, getApiKey } from "../lib/ipc";
 import type { STTProviderType, LLMProviderType, LocalSTTEngineInfo } from "../lib/types";
 import { showToast } from "../stores/toastStore";
@@ -155,11 +156,19 @@ export function ServiceStatusBar({ compact = false }: { compact?: boolean }) {
   // Active state
   const isRecording = useMeetingStore((s) => s.isRecording);
   const audioMode = useMeetingStore((s) => s.audioMode);
+  const sttOverride = useMeetingStore((s) => s.sttOverride);
+  const profileId = useMeetingStore((s) => s.profileId);
   const speakerOrder = useSpeakerStore((s) => s.speakerOrder);
   const isStreaming = useStreamStore((s) => s.isStreaming);
   const streamProvider = useStreamStore((s) => s.currentProvider);
   const streamModel = useStreamStore((s) => s.currentModel);
-  const { micLevel, systemLevel } = useAudioLevel();
+  const health = useLiveQAHealth();
+  const openAIChoice = () => {
+    // A profile's actual routing policy belongs to the backend. Never mutate
+    // only the global router behind that policy from the quick picker.
+    if (profileId) useMeetingStore.getState().openSettings("llm");
+    else setPickerOpen(pickerOpen === "llm" ? null : "llm");
+  };
 
   // Mute state (session-only, not persisted)
   const mutedYou = useConfigStore((s) => s.mutedYou);
@@ -186,21 +195,21 @@ export function ServiceStatusBar({ compact = false }: { compact?: boolean }) {
     parakeet_tdt: "parakeet-tdt-0.6b-v3-int8",
   };
 
-  const youSttProvider = meetingAudioConfig?.you.stt_provider ?? "web_speech";
+  const youSttProvider = sttOverride ?? meetingAudioConfig?.you.stt_provider ?? "web_speech";
   const youLocalModel = meetingAudioConfig?.you.local_model_id
     || activeModelPerEngine[youSttProvider]
     || DEFAULT_MODEL_PER_ENGINE[youSttProvider]
     || (youSttProvider === "whisper_cpp" ? activeWhisperModel : undefined);
   const youStt = formatSttLabel(youSttProvider, youLocalModel || undefined);
-  const youActive = isRecording && !mutedYou && micLevel > 0.02;
+  const youActive = isRecording && health.youSTT.tone === "active";
 
-  const themSttProvider = meetingAudioConfig?.them.stt_provider ?? "—";
+  const themSttProvider = sttOverride ?? meetingAudioConfig?.them.stt_provider ?? "—";
   const themLocalModel = meetingAudioConfig?.them.local_model_id
     || activeModelPerEngine[themSttProvider]
     || DEFAULT_MODEL_PER_ENGINE[themSttProvider]
     || (themSttProvider === "whisper_cpp" ? activeWhisperModel : undefined);
   const themStt = formatSttLabel(themSttProvider, themLocalModel || undefined);
-  const themActive = isRecording && !mutedThem && systemLevel > 0.02;
+  const themActive = isRecording && health.themSTT.tone === "active";
 
   // ── Provider change handler ──
   // Updates meetingAudioConfig; useAudioConfigSync automatically restarts capture.
@@ -226,24 +235,24 @@ export function ServiceStatusBar({ compact = false }: { compact?: boolean }) {
     <div className={`flex flex-wrap items-center gap-2.5 ${compact ? "px-3 py-2" : "px-5 py-2.5"}`}>
       {/* LLM — always interactive */}
       <div className="relative">
-        {llmProvider === "claude_cli" ? (
+        {llmProvider === "claude_cli" && health.ai.tone !== "warning" ? (
           <AgentStatusChip
             compact={compact}
             pickerOpen={pickerOpen === "llm"}
-            onClick={() => setPickerOpen(pickerOpen === "llm" ? null : "llm")}
+            onClick={openAIChoice}
           />
         ) : (
           <STTChip
             icon={<Brain className="h-3.5 w-3.5" />}
             provider={llmProviderLabel}
-            model={llmModelLabel}
+            model={`${health.ai.label} · ${llmModelLabel}`}
             active={isStreaming}
             color="blue"
             label=""
             muted={false}
             interactive={true}
             pickerOpen={pickerOpen === "llm"}
-            onClick={() => setPickerOpen(pickerOpen === "llm" ? null : "llm")}
+            onClick={openAIChoice}
             tooltip={`LLM: ${llmProviderLabel} / ${llmModelLabel}`}
           />
         )}
@@ -256,7 +265,7 @@ export function ServiceStatusBar({ compact = false }: { compact?: boolean }) {
                 await activateLLMProvider(provider as LLMProviderType, { model });
               } catch (e) {
                 console.warn("[ServiceStatusBar] Failed to switch LLM:", e);
-                showToast(`Couldn't switch the AI provider: ${e instanceof Error ? e.message : String(e)}`, "error");
+                showToast(safeServiceError(e, "AI").message, "error");
               }
               setPickerOpen(null);
             }}
@@ -274,8 +283,8 @@ export function ServiceStatusBar({ compact = false }: { compact?: boolean }) {
             <STTChip
               icon={<Mic className="h-3.5 w-3.5" />}
               provider={themStt.provider}
-              model={themStt.model}
-              active={themActive || youActive}
+              model={isRecording ? health.themSTT.label : themStt.model}
+              active={themActive}
               color="purple"
               label="ROOM"
               muted={mutedThem}
@@ -309,7 +318,7 @@ export function ServiceStatusBar({ compact = false }: { compact?: boolean }) {
               <STTChip
                 icon={<Mic className="h-3.5 w-3.5" />}
                 provider={youStt.provider}
-                model={youStt.model}
+                model={isRecording ? health.youSTT.label : youStt.model}
                 active={youActive}
                 color="sky"
                 label="You"
@@ -343,7 +352,7 @@ export function ServiceStatusBar({ compact = false }: { compact?: boolean }) {
               <STTChip
                 icon={<Volume2 className="h-3.5 w-3.5" />}
                 provider={themStt.provider}
-                model={themStt.model}
+                model={isRecording ? health.themSTT.label : themStt.model}
                 active={themActive}
                 color="amber"
                 label="Them"

@@ -32,6 +32,7 @@ import { useQuestionStore } from "../stores/questionStore";
 import { useToastStore } from "../stores/toastStore";
 import { resetMeetingScopedStores } from "../stores/resetMeeting";
 import { useTranscriptStore } from "../stores/transcriptStore";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
 import type { GlobalDefaults, TranscriptSegment, TurnSignal } from "../lib/types";
 
 const seg = (text: string, is_final = true): TranscriptSegment =>
@@ -51,6 +52,7 @@ afterEach(() => {
   vi.mocked(cancelGeneration).mockClear();
   useQuestionStore.getState().clear();
   useStreamStore.getState().resetForMeeting();
+  useLiveQAHealthStore.getState().reset();
   listeners.update.length = 0;
   listeners.final.length = 0;
 });
@@ -89,6 +91,16 @@ function answersRunUntilStopped() {
 const askedFor = () => vi.mocked(runUserAction).mock.calls.map((c) => c[1]);
 const requestOf = (n: number) => vi.mocked(runUserAction).mock.calls[n][2]?.requestId;
 
+describe("QuestionDetector capture failure", () => {
+  it("offers typed questions instead of claiming it is waiting for audio questions", () => {
+    useTranscriptStore.setState({ segments: [] });
+    useLiveQAHealthStore.getState().observeAudioStatus("them", { status: "device_unavailable" });
+    render(<QuestionDetector />);
+    expect(screen.getByText("Audio unavailable. Type a question with Ask.")).toBeTruthy();
+    expect(screen.queryByText("Waiting for questions from the other party")).toBeNull();
+  });
+});
+
 describe("Auto-Answer with the provider's turn signals (Cartesia, Deepgram Flux)", () => {
   it("answers as soon as the provider says the speaker finished, with no quiet wait", async () => {
     vi.useFakeTimers();
@@ -100,7 +112,7 @@ describe("Auto-Answer with the provider's turn signals (Cartesia, Deepgram Flux)
     // The quiet wait doesn't answer it a second time.
     await act(async () => { await vi.advanceTimersByTimeAsync(AUTO_TRIGGER_DELAY_MS * 3); });
     expect(runUserAction).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("Answered")).toBeTruthy();
+    expect(screen.getByText("Requested")).toBeTruthy();
   });
 
   it("starts early on 'probably done' and keeps that answer when the turn ends the same", async () => {
@@ -305,7 +317,9 @@ describe("QuestionPanel", () => {
     expect(runUserAction).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Get AI assistance for this question" }));
-    expect(runUserAction).toHaveBeenCalledWith("Assist", "What would you do first?");
+    expect(runUserAction).toHaveBeenCalledWith(
+      "Assist", "What would you do first?", expect.objectContaining({ requestId: expect.any(String) }),
+    );
   });
 
   it("shows nothing and answers nothing with detection off", () => {
@@ -331,11 +345,12 @@ describe("QuestionPanel coming back (layout switch, Settings)", () => {
     act(() => vi.advanceTimersByTime(AUTO_TRIGGER_DELAY_MS));
     expect(runUserAction).toHaveBeenCalledTimes(1);
 
+    act(() => useQuestionStore.getState().settleAnswer(requestOf(0)!, "ready"));
     unmount();
     render(<QuestionPanel />);
     act(() => vi.advanceTimersByTime(AUTO_TRIGGER_DELAY_MS * 3));
     expect(runUserAction).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("button", { name: "Already answered" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Answer ready" })).toBeTruthy();
   });
 
   it("shows a question asked while away without answering it, then answers the next one", () => {

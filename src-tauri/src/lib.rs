@@ -552,6 +552,7 @@ pub fn run() {
             // == COMMANDS: audio ==
             audio_commands::list_audio_devices,
             audio_commands::start_capture,
+            audio_commands::test_stt_transcription,
             audio_commands::stop_capture,
             audio_commands::get_audio_level,
             audio_commands::test_audio_device,
@@ -583,6 +584,8 @@ pub fn run() {
             llm_commands::list_models,
             llm_commands::set_active_model,
             llm_commands::test_llm_connection,
+            llm_commands::test_llm_response,
+            llm_commands::clear_provider_credit_failure,
             llm_commands::get_llm_providers,
             llm_commands::list_openrouter_models,
             // == COMMANDS: intelligence ==

@@ -12,8 +12,8 @@
 use super::hub::{AskEvent, CopilotError, CopilotErrorKind, CopilotHub};
 use super::status::{check_status, CopilotState};
 use crate::llm::provider::{
-    emit_end_with_usage, emit_error, emit_thinking, emit_token, is_cancelled, CancelToken,
-    CompletionStats, GenerationParams, LLMError, LLMMessage, LLMProvider, ModelInfo, StreamUsage,
+    emit_end_with_usage, emit_llm_error, emit_thinking, emit_token, is_cancelled, CancelToken,
+    classify_failure, CompletionStats, GenerationParams, LLMError, LLMFailureKind, LLMMessage, LLMProvider, ModelInfo, StreamUsage,
     TokenSink,
 };
 use std::sync::Arc;
@@ -89,16 +89,27 @@ pub fn build_prompt(messages: &[LLMMessage]) -> String {
 
 /// Map a Copilot failure onto the provider errors the callers already handle.
 pub fn to_llm_error(error: CopilotError) -> LLMError {
-    let message = error.message;
-    match error.kind {
-        CopilotErrorKind::Cancelled => LLMError::Cancelled,
-        CopilotErrorKind::NotInstalled => LLMError::NotConfigured(message),
-        CopilotErrorKind::NotLoggedIn | CopilotErrorKind::NoEntitlement => LLMError::AuthError(message),
-        CopilotErrorKind::Timeout | CopilotErrorKind::Protocol => LLMError::ConnectionFailed(message),
-        CopilotErrorKind::ModelUnavailable | CopilotErrorKind::ToolBlocked | CopilotErrorKind::Refused => {
-            LLMError::ProviderError(message)
+    // ACP may wrap a provider's billing / limit failure in a generic RPC
+    // error. Preserve its nontransient meaning before discarding the text.
+    if !matches!(error.kind, CopilotErrorKind::Cancelled | CopilotErrorKind::NotInstalled) {
+        let detail = classify_failure(&error.message);
+        if matches!(detail, LLMFailureKind::CreditsExhausted | LLMFailureKind::RateLimited | LLMFailureKind::InvalidApiKey) {
+            return LLMError::classified(detail, PROVIDER_NAME);
         }
     }
+    let kind = match error.kind {
+        CopilotErrorKind::Cancelled => return LLMError::Cancelled,
+        CopilotErrorKind::NotInstalled => LLMFailureKind::NotConfigured,
+        CopilotErrorKind::NotLoggedIn | CopilotErrorKind::NoEntitlement => LLMFailureKind::Authentication,
+        CopilotErrorKind::Timeout => LLMFailureKind::Timeout,
+        CopilotErrorKind::Protocol => LLMFailureKind::Unavailable,
+        CopilotErrorKind::ModelUnavailable | CopilotErrorKind::ToolBlocked | CopilotErrorKind::Refused => {
+            LLMFailureKind::ProviderError
+        }
+    };
+    // Raw RPC text / stderr can echo credentials or the prompt. The status
+    // state retains the entitlement distinction; the LLM error stays safe.
+    LLMError::classified(kind, PROVIDER_NAME)
 }
 
 /// What a finished completion reports.
@@ -188,9 +199,7 @@ impl LLMProvider for CopilotProvider {
             })
             .collect();
         if models.is_empty() {
-            return Err(LLMError::AuthError(
-                "The Copilot CLI lists no model enabled for this account".to_string(),
-            ));
+            return Err(LLMError::classified(LLMFailureKind::Authentication, PROVIDER_NAME));
         }
         Ok(models)
     }
@@ -199,16 +208,12 @@ impl LLMProvider for CopilotProvider {
     /// session listed models for this account.
     async fn test_connection(&self) -> Result<bool, LLMError> {
         let status = check_status(&self.hub).await;
-        let error = status.error.clone().unwrap_or_else(|| "unknown error".to_string());
         match status.state {
             CopilotState::Ready => Ok(true),
-            CopilotState::NotInstalled => Err(LLMError::NotConfigured(format!(
-                "{error}. {}",
-                status.login_hint
-            ))),
-            CopilotState::NotLoggedIn => Err(LLMError::AuthError(format!("{error}. {}", status.login_hint))),
-            CopilotState::NoEntitlement => Err(LLMError::AuthError(error)),
-            CopilotState::Timeout | CopilotState::ProtocolError => Err(LLMError::ConnectionFailed(error)),
+            CopilotState::NotInstalled => Err(LLMError::classified(LLMFailureKind::NotConfigured, PROVIDER_NAME)),
+            CopilotState::NotLoggedIn | CopilotState::NoEntitlement => Err(LLMError::classified(LLMFailureKind::Authentication, PROVIDER_NAME)),
+            CopilotState::Timeout => Err(LLMError::classified(LLMFailureKind::Timeout, PROVIDER_NAME)),
+            CopilotState::ProtocolError => Err(LLMError::classified(LLMFailureKind::Unavailable, PROVIDER_NAME)),
         }
     }
 
@@ -256,7 +261,7 @@ impl LLMProvider for CopilotProvider {
                 if matches!(err, LLMError::Cancelled) || is_cancelled(&params) {
                     return Err(LLMError::Cancelled);
                 }
-                emit_error(&app_handle, &params, &err.to_string());
+                emit_llm_error(&app_handle, &params, &err);
                 Err(err)
             }
         }
@@ -303,16 +308,71 @@ mod tests {
     }
 
     #[test]
+    fn meeting_instructions_and_context_survive_copilot_prompt_assembly() {
+        let instructions = "Public test scenario: answer briefly as an interview candidate.";
+        let context = "Public test context: the demo meeting is about Rust lifetimes.";
+        let question = "How do lifetimes avoid dangling references?";
+        let prompt = build_prompt(&[
+            msg("system", instructions),
+            msg("user", context),
+            msg("assistant", "I will use that demo context."),
+            msg("user", question),
+        ]);
+        for content in [instructions, context, question] {
+            assert_eq!(prompt.matches(content).count(), 1);
+        }
+        assert!(prompt.find(instructions).unwrap() < prompt.find(context).unwrap());
+        assert!(prompt.find(context).unwrap() < prompt.find(question).unwrap());
+    }
+
+    #[test]
+    fn copilot_error_messages_are_safe_actionable_and_keep_timeout_distinct() {
+        use crate::llm::provider::LLMFailureKind;
+        for (kind, expected) in [
+            (CopilotErrorKind::NotLoggedIn, LLMFailureKind::Authentication),
+            (CopilotErrorKind::NoEntitlement, LLMFailureKind::Authentication),
+            (CopilotErrorKind::Timeout, LLMFailureKind::Timeout),
+            (CopilotErrorKind::Protocol, LLMFailureKind::Unavailable),
+        ] {
+            let error = to_llm_error(CopilotError::new(kind, "private-stderr-sentinel"));
+            assert_eq!(error.kind(), expected);
+            assert!(!error.to_string().contains("sentinel"));
+            assert!(error.safe_message().contains("Copilot"));
+        }
+        let login = to_llm_error(CopilotError::new(CopilotErrorKind::NotLoggedIn, "raw"));
+        assert!(login.safe_message().contains("copilot login"));
+        let entitlement = to_llm_error(CopilotError::new(CopilotErrorKind::NoEntitlement, "raw"));
+        assert!(entitlement.safe_message().contains("plan"));
+        assert!(!entitlement.is_retryable());
+    }
+
+    #[test]
+    fn rpc_billing_errors_do_not_become_retryable_connection_failures() {
+        for marker in ["insufficient_quota", "credit_balance_exhausted", "no credits"] {
+            let error = to_llm_error(CopilotError::new(
+                CopilotErrorKind::Protocol, format!("HTTP 429 {marker}; private-sentinel"),
+            ));
+            assert_eq!(error.kind(), LLMFailureKind::CreditsExhausted);
+            assert!(!error.is_retryable());
+            assert!(!error.safe_message().contains("sentinel"));
+            assert!(error.safe_message().contains("Copilot"));
+        }
+        let rate = to_llm_error(CopilotError::new(CopilotErrorKind::Protocol, "HTTP 429 rate_limit_exceeded"));
+        assert_eq!(rate.kind(), LLMFailureKind::RateLimited);
+    }
+
+    #[test]
     fn copilot_errors_map_to_llm_errors() {
         let e = |kind| to_llm_error(CopilotError::new(kind, "x"));
         assert!(matches!(e(CopilotErrorKind::Cancelled), LLMError::Cancelled));
-        assert!(matches!(e(CopilotErrorKind::NotInstalled), LLMError::NotConfigured(_)));
-        assert!(matches!(e(CopilotErrorKind::NotLoggedIn), LLMError::AuthError(_)));
-        assert!(matches!(e(CopilotErrorKind::NoEntitlement), LLMError::AuthError(_)));
-        assert!(matches!(e(CopilotErrorKind::Timeout), LLMError::ConnectionFailed(_)));
-        assert!(matches!(e(CopilotErrorKind::Protocol), LLMError::ConnectionFailed(_)));
-        assert!(matches!(e(CopilotErrorKind::ModelUnavailable), LLMError::ProviderError(_)));
-        assert!(matches!(e(CopilotErrorKind::ToolBlocked), LLMError::ProviderError(_)));
+        use crate::llm::provider::LLMFailureKind;
+        assert_eq!(e(CopilotErrorKind::NotInstalled).kind(), LLMFailureKind::NotConfigured);
+        assert_eq!(e(CopilotErrorKind::NotLoggedIn).kind(), LLMFailureKind::Authentication);
+        assert_eq!(e(CopilotErrorKind::NoEntitlement).kind(), LLMFailureKind::Authentication);
+        assert_eq!(e(CopilotErrorKind::Timeout).kind(), LLMFailureKind::Timeout);
+        assert_eq!(e(CopilotErrorKind::Protocol).kind(), LLMFailureKind::Unavailable);
+        assert_eq!(e(CopilotErrorKind::ModelUnavailable).kind(), LLMFailureKind::ProviderError);
+        assert_eq!(e(CopilotErrorKind::ToolBlocked).kind(), LLMFailureKind::ProviderError);
     }
 
     #[test]

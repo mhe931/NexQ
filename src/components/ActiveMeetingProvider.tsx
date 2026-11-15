@@ -18,6 +18,7 @@ import { useSTTStatus } from "../hooks/useSTTStatus";
 import { useDevLog } from "../hooks/useDevLog";
 
 export function ActiveMeetingProvider({ isLauncherWindow = true }: { isLauncherWindow?: boolean }) {
+  useSTTStatus(); // subscribe before capture startup, not only after meeting creation
   const activeMeeting = useMeetingStore((s) => s.activeMeeting);
 
   if (!activeMeeting) return null;
@@ -33,7 +34,6 @@ function OverlayMeetingHooks() {
   useMeetingTimer();
   useTranscript();    // transcript_final/update → local store
   useStreamBuffer();  // AI streaming events → local store
-  useSTTStatus();     // STT connection status
   useDevLog();        // debug log entries
   return null;
 }
@@ -47,7 +47,6 @@ function LauncherMeetingHooks() {
   useTranscriptPersistence(); // transcript store → SQLite DB
   useStreamBuffer();
   useCallLogCapture();
-  useSTTStatus();
   useDevLog();
   return null;
 }

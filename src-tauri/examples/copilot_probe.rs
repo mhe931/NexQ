@@ -11,7 +11,8 @@
 
 use nexq_lib::llm::copilot::acp::{AcpConnection, SessionEvent, PROTOCOL_VERSION};
 use nexq_lib::llm::copilot::detect::{find_copilot_binary, launch_spec};
-use nexq_lib::llm::copilot::{check_status, CopilotHub};
+use nexq_lib::llm::copilot::{check_status, CopilotHub, CopilotProvider};
+use nexq_lib::llm::provider::{CancelToken, LLMMessage};
 use serde_json::json;
 use std::time::Duration;
 
@@ -28,7 +29,32 @@ async fn main() {
             let model = args.get(2).cloned().unwrap_or_else(|| "auto".into());
             raw(&prompt, &model).await;
         }
-        _ => eprintln!("usage: copilot_probe status | raw \"<prompt>\" [model]"),
+        Some("chat") => {
+            let model = args.get(1).map(String::as_str).unwrap_or("auto");
+            let mut text = String::new();
+            let result = CopilotProvider::new().complete(
+                &[LLMMessage {
+                    role: "user".into(),
+                    content: "Reply with NEXQ_CHAT_OK only. This is a public connectivity test.".into(),
+                }],
+                model,
+                &CancelToken::new(),
+                &mut |token| text.push_str(token),
+                &mut || {},
+            ).await;
+            match result {
+                Ok(_) if !text.trim().is_empty() => println!("{}", text.trim()),
+                Ok(_) => {
+                    eprintln!("Copilot returned no answer.");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    eprintln!("{}", error.safe_message());
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => eprintln!("usage: copilot_probe status | chat [model] | raw \"<prompt>\" [model]"),
     }
 }
 

@@ -3,6 +3,9 @@
 
 import { useEffect, useRef } from "react";
 import { useStreamStore } from "../stores/streamStore";
+import { useQuestionStore } from "../stores/questionStore";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
+import { useConfigStore } from "../stores/configStore";
 import {
   onStreamStart,
   onStreamToken,
@@ -10,6 +13,8 @@ import {
   onStreamSources,
   onStreamError,
   onStreamThinking,
+  onQuestionHandlingStatus,
+  onProfileFallback,
 } from "../lib/events";
 import type { IntelligenceMode } from "../lib/types";
 
@@ -63,6 +68,27 @@ export function useStreamBuffer() {
     const isActive = (requestId: string | null) =>
       activeRequestId.current !== null && requestId === activeRequestId.current;
 
+    const forgetAIReady = (...providers: Array<string | null>) => {
+      const providerKey = (provider: string) => provider.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const failed = new Set(providers.filter((provider): provider is string => !!provider).map(providerKey));
+      const health = useLiveQAHealthStore.getState();
+      for (const provider of Object.keys(health.aiReadyModels)) {
+        if (failed.has(providerKey(provider))) health.forgetAIReady(provider);
+      }
+    };
+
+    unlisteners.push(onQuestionHandlingStatus((event) => {
+      if (!useStreamStore.getState().isRunning(event.request_id)) return;
+      useStreamStore.getState().setHandlingStatus(event.status);
+    }));
+
+    unlisteners.push(onProfileFallback((event) => {
+      const store = useStreamStore.getState();
+      if (!store.applyProfileFallback(event)) return;
+      // A successful fallback does not verify the provider that just failed.
+      forgetAIReady(event.from_provider, store.requestProvider);
+    }));
+
     // Subscribe to stream start
     unlisteners.push(
       onStreamStart((event) => {
@@ -107,7 +133,7 @@ export function useStreamBuffer() {
     // Subscribe to stream end
     unlisteners.push(
       onStreamEnd((event) => {
-        if (!isActive(event.request_id)) return;
+        if (!isActive(event.request_id) && !(event.cancelled && event.request_id && useStreamStore.getState().pendingRequestId === event.request_id)) return;
         activeRequestId.current = null;
         // Flush any remaining buffered tokens immediately
         if (tokenBuffer.current.length > 0) {
@@ -118,7 +144,11 @@ export function useStreamBuffer() {
           cancelAnimationFrame(rafId.current);
           rafId.current = null;
         }
-        endStream(event.latency_ms);
+        endStream(event.latency_ms, event.cancelled);
+        if (event.request_id) useQuestionStore.getState().settleAnswer(
+          event.request_id,
+          event.cancelled ? "cancelled" : useStreamStore.getState().currentContent.trim() ? "ready" : "unable",
+        );
       })
     );
 
@@ -142,14 +172,19 @@ export function useStreamBuffer() {
     // Subscribe to stream errors
     unlisteners.push(
       onStreamError((event) => {
-        if (!isActive(event.request_id)) return;
+        if (!isActive(event.request_id) && !(event.request_id && useStreamStore.getState().pendingRequestId === event.request_id)) return;
         activeRequestId.current = null;
         tokenBuffer.current = "";
         if (rafId.current !== null) {
           cancelAnimationFrame(rafId.current);
           rafId.current = null;
         }
-        setError(event.message);
+        setError(event.message, { code: event.code, retryable: event.retryable });
+        if (event.code !== "cancelled" && useStreamStore.getState().handlingStatus !== "retrieving_context") {
+          const store = useStreamStore.getState();
+          forgetAIReady(store.currentProvider || store.requestProvider || useConfigStore.getState().llmProvider);
+        }
+        if (event.request_id) useQuestionStore.getState().settleAnswer(event.request_id, event.code === "cancelled" ? "cancelled" : "unable");
       })
     );
 

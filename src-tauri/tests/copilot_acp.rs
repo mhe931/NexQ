@@ -11,7 +11,7 @@ use nexq_lib::llm::copilot::hub::{CopilotHub, Timeouts};
 use nexq_lib::llm::copilot::{
     check_status, CopilotError, CopilotErrorKind, CopilotProvider, CopilotState,
 };
-use nexq_lib::llm::provider::{CancelToken, LLMError, LLMMessage, LLMProvider};
+use nexq_lib::llm::provider::{CancelToken, LLMError, LLMFailureKind, LLMMessage, LLMProvider};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -232,20 +232,20 @@ async fn a_missing_cli_is_reported_as_not_installed() {
     assert!(!status.installed && !status.handshake_ok);
     assert!(status.login_hint.contains("Install"));
     let provider = CopilotProvider::with_hub(hub);
-    assert!(matches!(provider.test_connection().await, Err(LLMError::NotConfigured(_))));
-    assert!(matches!(provider.list_models().await, Err(LLMError::NotConfigured(_))));
+    assert_eq!(provider.test_connection().await.unwrap_err().kind(), LLMFailureKind::NotConfigured);
+    assert_eq!(provider.list_models().await.unwrap_err().kind(), LLMFailureKind::NotConfigured);
     let (result, _) = run(&provider, &user("hi"), "auto", &CancelToken::new()).await;
-    assert!(matches!(result, Err(LLMError::NotConfigured(_))));
+    assert_eq!(result.err().unwrap().kind(), LLMFailureKind::NotConfigured);
 }
 
 #[tokio::test]
-async fn a_cli_that_dies_during_the_handshake_is_a_protocol_error_with_its_stderr() {
+async fn a_cli_that_dies_during_the_handshake_is_reported_without_raw_stderr() {
     let f = fixture("exit_on_start");
     let status = check_status(&f.hub).await;
     assert_eq!(status.state, CopilotState::ProtocolError);
     assert!(status.installed && !status.handshake_ok);
-    assert!(status.error.as_deref().unwrap().contains("refusing to start"), "{:?}", status.error);
-    assert!(matches!(f.provider().test_connection().await, Err(LLMError::ConnectionFailed(_))));
+    assert!(!status.error.as_deref().unwrap().contains("refusing to start"), "{:?}", status.error);
+    assert_eq!(f.provider().test_connection().await.unwrap_err().kind(), LLMFailureKind::Unavailable);
 }
 
 #[tokio::test]
@@ -253,8 +253,7 @@ async fn a_cli_that_never_answers_the_handshake_is_a_timeout() {
     let f = fixture_with("silent_start", Timeouts { handshake: Duration::from_millis(400), ..fast_timeouts() });
     let status = check_status(&f.hub).await;
     assert_eq!(status.state, CopilotState::Timeout, "{:?}", status.error);
-    assert!(status.error.as_deref().unwrap().contains("did not answer"), "{:?}", status.error);
-    assert!(matches!(f.provider().test_connection().await, Err(LLMError::ConnectionFailed(_))));
+    assert_eq!(f.provider().test_connection().await.unwrap_err().kind(), LLMFailureKind::Timeout);
 }
 
 // ── authentication / entitlement ──────────────────────────────────────
@@ -266,27 +265,21 @@ async fn an_authentication_error_from_session_new_means_not_logged_in() {
     assert_eq!(status.state, CopilotState::NotLoggedIn);
     assert!(status.handshake_ok && !status.session_ok);
     let error = status.error.as_deref().unwrap();
-    assert!(error.contains("Authentication required"), "genuine text kept: {error}");
+    assert!(error.contains("authentication"), "{error}");
     assert!(status.login_hint.contains("copilot login"));
 
     let provider = f.provider();
-    match provider.test_connection().await {
-        Err(LLMError::AuthError(m)) => assert!(m.contains("copilot login"), "{m}"),
-        other => panic!("expected AuthError, got {other:?}"),
-    }
-    assert!(matches!(provider.list_models().await, Err(LLMError::AuthError(_))));
+    assert_eq!(provider.test_connection().await.unwrap_err().kind(), LLMFailureKind::Authentication);
+    assert_eq!(provider.list_models().await.unwrap_err().kind(), LLMFailureKind::Authentication);
     let (result, _) = run(&provider, &user("hi"), "auto", &CancelToken::new()).await;
-    assert!(matches!(result, Err(LLMError::AuthError(_))));
+    assert_eq!(result.err().unwrap().kind(), LLMFailureKind::Authentication);
 }
 
 #[tokio::test]
 async fn an_authentication_error_while_prompting_is_an_auth_error() {
     let f = fixture("normal");
     let (result, run) = run(&f.provider(), &user("FAKE_AUTH"), "auto", &CancelToken::new()).await;
-    match result {
-        Err(LLMError::AuthError(m)) => assert!(m.contains("Authentication required"), "{m}"),
-        other => panic!("expected AuthError, got {:?}", other.err()),
-    }
+    assert_eq!(result.err().unwrap().kind(), LLMFailureKind::Authentication);
     assert!(run.text.is_empty());
 }
 
@@ -296,9 +289,9 @@ async fn no_enabled_model_means_no_entitlement() {
     let status = check_status(&f.hub).await;
     assert_eq!(status.state, CopilotState::NoEntitlement);
     assert!(status.session_ok);
-    assert!(status.error.as_deref().unwrap().contains("no model enabled"));
-    assert!(matches!(f.provider().list_models().await, Err(LLMError::AuthError(_))));
-    assert!(matches!(f.provider().test_connection().await, Err(LLMError::AuthError(_))));
+    assert!(status.error.as_deref().unwrap().contains("Copilot plan"));
+    assert_eq!(f.provider().list_models().await.unwrap_err().kind(), LLMFailureKind::Authentication);
+    assert_eq!(f.provider().test_connection().await.unwrap_err().kind(), LLMFailureKind::Authentication);
 }
 
 // ── streaming, usage, models ──────────────────────────────────────────
@@ -358,15 +351,10 @@ async fn the_selected_model_reaches_the_cli_and_auto_is_the_default() {
 }
 
 #[tokio::test]
-async fn a_model_the_cli_rejects_fails_with_its_message() {
+async fn a_model_the_cli_rejects_fails_without_sending_the_question() {
     let f = fixture("normal");
     let (result, run) = run(&f.provider(), &user("a"), "no-such-model", &CancelToken::new()).await;
-    match result {
-        Err(LLMError::ProviderError(m)) => {
-            assert!(m.contains("no-such-model") && m.contains("not one of this session's models"), "{m}")
-        }
-        other => panic!("expected ProviderError, got {:?}", other.err()),
-    }
+    assert_eq!(result.err().unwrap().kind(), LLMFailureKind::ProviderError);
     assert!(f.received_method("session/prompt").is_empty(), "nothing was sent to the wrong model");
     assert!(run.text.is_empty());
 }
@@ -470,10 +458,7 @@ async fn a_permission_request_is_always_refused() {
 async fn a_tool_call_stops_the_turn() {
     let f = fixture("normal");
     let (result, _) = run(&f.provider(), &user("FAKE_TOOL"), "auto", &CancelToken::new()).await;
-    match result {
-        Err(LLMError::ProviderError(m)) => assert!(m.contains("tried to use bash"), "{m}"),
-        other => panic!("expected ProviderError, got {:?}", other.err()),
-    }
+    assert_eq!(result.err().unwrap().kind(), LLMFailureKind::ProviderError);
     assert_eq!(f.wait_for("session/cancel", 1).await.len(), 1, "the agent was told to stop");
 }
 
@@ -521,10 +506,7 @@ async fn a_request_cancelled_before_it_starts_sends_nothing() {
 async fn a_silent_cli_times_out_and_is_told_to_stop() {
     let f = fixture_with("normal", Timeouts { idle: Duration::from_millis(400), ..fast_timeouts() });
     let (result, _) = run(&f.provider(), &user("FAKE_SILENT"), "auto", &CancelToken::new()).await;
-    match result {
-        Err(LLMError::ConnectionFailed(m)) => assert!(m.contains("sent nothing"), "{m}"),
-        other => panic!("expected a timeout, got {:?}", other.err()),
-    }
+    assert_eq!(result.err().unwrap().kind(), LLMFailureKind::Timeout);
     assert_eq!(f.wait_for("session/cancel", 1).await.len(), 1);
 }
 
@@ -533,10 +515,7 @@ async fn a_dead_process_is_restarted_for_the_next_request() {
     let f = fixture("normal");
     let provider = f.provider();
     let (crashed, run1) = run(&provider, &user("FAKE_CRASH"), "auto", &CancelToken::new()).await;
-    match crashed {
-        Err(LLMError::ConnectionFailed(m)) => assert!(m.contains("ended unexpectedly"), "{m}"),
-        other => panic!("expected a connection error, got {:?}", other.err()),
-    }
+    assert_eq!(crashed.err().unwrap().kind(), LLMFailureKind::Unavailable);
     assert_eq!(run1.text, "par", "what streamed before the crash was delivered");
     assert_eq!(f.hub.spawn_count(), 1);
 

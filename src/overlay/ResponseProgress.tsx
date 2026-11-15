@@ -30,11 +30,13 @@ function useElapsed(start: number | null, running: boolean): number {
  */
 export function ResponseProgress() {
   const phase = useStreamStore((s) => s.phase);
+  const handling = useStreamStore((s) => s.handlingStatus);
   const mode = useStreamStore((s) => s.currentMode);
   const startedAt = useStreamStore((s) => s.requestStartedAt);
   const meta = useStreamStore((s) => s.streamMeta);
   const running = phase !== "idle";
   const elapsed = useElapsed(startedAt, running);
+  const phaseText = handling === "retrieving_context" ? "Retrieving context…" : handling === "generating_answer" && phase === "sending" ? "Generating answer…" : PHASE_TEXT[phase];
 
   if (!running) return null;
 
@@ -48,7 +50,7 @@ export function ResponseProgress() {
     : [];
 
   return (
-    <div className="space-y-0.5" role="status" aria-live="polite" aria-label={`${label}: ${PHASE_TEXT[phase]}`}>
+    <div className="space-y-0.5" role="status" aria-live="polite" aria-label={`${label}: ${phaseText}`}>
       <div className="flex items-center gap-2">
         <span
           aria-hidden="true"
@@ -56,7 +58,7 @@ export function ResponseProgress() {
         />
         <span className="text-meta font-semibold text-primary">{label}</span>
         <span key={phase} className="progress-phase-enter min-w-0 truncate text-xs text-foreground/65">
-          {PHASE_TEXT[phase]}
+          {phaseText}
         </span>
         <span className="ml-auto shrink-0 font-mono text-meta tabular-nums text-muted-foreground/55" aria-hidden="true">
           {formatDuration(elapsed)}

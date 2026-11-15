@@ -11,6 +11,7 @@ import { AIResponsePanel } from "./AIResponsePanel";
 import { ModeButtons } from "./ModeButtons";
 import { AskInput } from "./AskInput";
 import { ServiceStatusBar } from "../components/ServiceStatusBar";
+import { LiveQAStatus } from "../components/LiveQAStatus";
 import { DevLogPanel } from "../components/DevLogPanel";
 import { SpeakerStatsPanel } from "./SpeakerStatsPanel";
 import { BookmarkToast } from "./BookmarkToast";
@@ -324,6 +325,8 @@ export function OverlayView() {
           </button>
         </div>
       </div>
+
+      <LiveQAStatus />
 
       {/* ═══ MAIN ═══ */}
       <div className="relative flex-1 min-h-0">
