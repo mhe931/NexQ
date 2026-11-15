@@ -149,23 +149,25 @@ fn retrieve_profile_context(
     question_text: Option<String>,
     transcript_excerpt: String,
     top_k: usize,
-) -> RagRetrieval {
+) -> Result<RagRetrieval, String> {
     let mut out = RagRetrieval::default();
     let query = question_text
         .filter(|q| !q.trim().is_empty())
         .or_else(|| Some(transcript_excerpt).filter(|t| !t.trim().is_empty()));
-    let (Some(query), Some(db)) = (query, state.database.as_ref()) else {
-        return out;
+    let Some(query) = query else {
+        return Ok(out);
     };
+    let db = state.database.as_ref()
+        .ok_or("Meeting documents are unavailable. Restart NexQ before asking again.")?;
     let started = std::time::Instant::now();
     let hits = match db.lock() {
         Ok(guard) => crate::profiles::retrieval::search(guard.connection(), profile_id, &query, top_k),
         Err(e) => Err(e.to_string()),
     };
-    let hits = hits.unwrap_or_else(|e| {
+    let hits = hits.map_err(|e| {
         log::warn!("Meeting document search failed: {e}");
-        Vec::new()
-    });
+        "Meeting document retrieval failed. Refresh this meeting's sources before asking again.".to_string()
+    })?;
     log::info!(
         "Meeting retrieval: {} hit(s) in {} ms",
         hits.len(),
@@ -188,7 +190,7 @@ fn retrieve_profile_context(
             hits.iter().map(|h| (h.citation(), h.text.clone())).collect();
         out.context_text = crate::profiles::prompt::wrap_reference_context(&sections);
     }
-    out
+    Ok(out)
 }
 
 /// A provider instance for a consented fallback, with its key from the credential store.
@@ -374,6 +376,14 @@ fn request_scope(state: &AppState, past_meeting_id: Option<&str>) -> (SessionSco
 
 /// Where this request goes (see `choose_route`).
 pub(crate) fn request_route(state: &AppState, mode: &str, scope: &SessionScope) -> Route {
+    match state.active_profile.read() {
+        Ok(profile) if profile.is_some() => return Route::Stateless,
+        Err(error) => {
+            log::error!("Cannot read profile routing policy: {error}");
+            return Route::Stateless;
+        }
+        _ => {}
+    }
     let active = state
         .llm
         .as_ref()
@@ -528,6 +538,10 @@ pub(crate) async fn session_assist(state: &AppState, app: &AppHandle, req: Sessi
     // Documents over the preload cap: retrieve the relevant excerpts per request.
     let mut rag = RagRetrieval::default();
     if record.rag_mode && req.include_rag {
+        let _ = app.emit("question_handling_status", serde_json::json!({
+            "request_id": params.request_id,
+            "status": "retrieving_context",
+        }));
         let question_text = req
             .custom_question
             .filter(|q| !q.is_empty())
@@ -880,10 +894,9 @@ pub async fn generate_assist(
 
     // A meeting profile owns its context: the Claude session path reads the
     // global document index, so profile meetings use the stateless path.
-    let active_profile = state.active_profile.read().ok().and_then(|g| g.clone());
-    if active_profile.is_some() && matches!(route, Route::ClaudeSession(_)) {
-        route = Route::Stateless;
-    }
+    let active_profile = state.active_profile.read()
+        .map_err(|_| "Cannot read the meeting's provider policy. Restart NexQ.".to_string())?
+        .clone();
     if let Route::ClaudeSession(key) = &route {
         // The action's own prompt (or the mode template) and presets travel in
         // the user message; the scenario prompt is the session's system prompt.
@@ -1004,23 +1017,12 @@ pub async fn generate_assist(
     let scenario_prompt = state.active_scenario.read()
         .map_err(|e| format!("Failed to read active scenario: {e}"))?
         .system_prompt.clone();
-    let base_system_prompt = {
-        let resolved = crate::intelligence::prompt_templates::resolve_system_prompt(
-            &mode, action_cfg.as_ref(), Some(&scenario_prompt),
-        );
-        // A customised action prompt replaces the scenario; the meeting's own
-        // instructions still lead so they always reach the model.
-        match &active_profile {
-            Some(p)
-                if include_instructions
-                    && crate::intelligence::prompt_templates::is_scenario_guided(&mode)
-                    && !resolved.contains(&p.system_prompt) =>
-            {
-                format!("{}\n\n{}", p.system_prompt, resolved)
-            }
-            _ => resolved,
-        }
-    };
+    let base_system_prompt = crate::intelligence::prompt_templates::resolve_meeting_system_prompt(
+        &mode,
+        action_cfg.as_ref(),
+        Some(&scenario_prompt),
+        active_profile.as_ref().map(|p| p.system_prompt.as_str()),
+    );
 
     // Append composed instructions (tone + format + length + custom text) to system prompt.
     // These are behavioral directives that belong in the system context, not as reference materials.
@@ -1071,6 +1073,10 @@ pub async fn generate_assist(
     // indexed files, we should search. (config.enabled defaults to false and is
     // inconsistently set, while Test Knowledge Base ignores it entirely.)
     let mut rag = if include_rag && active_cache_name.is_none() {
+        let _ = app_handle.emit("question_handling_status", serde_json::json!({
+            "request_id": params.request_id,
+            "status": "retrieving_context",
+        }));
         // RAG query sources (priority: custom_question > effective_question > transcript)
         // custom_question is what the user typed (Ask mode) or the clicked question (Assist mode)
         // effective_question is the auto-detected question from the meeting
@@ -1079,7 +1085,7 @@ pub async fn generate_assist(
             .map(|q| q.to_string())
             .or_else(|| effective_question.as_ref().map(|q| q.text.clone()));
         match &active_profile {
-            Some(p) => retrieve_profile_context(&state, &p.profile.id, question_text, tail_chars(&transcript_text, 500), rag_top_k),
+            Some(p) => retrieve_profile_context(&state, &p.profile.id, question_text, tail_chars(&transcript_text, 500), rag_top_k)?,
             None => retrieve_rag(&state, question_text, tail_chars(&transcript_text, 500), rag_top_k).await?,
         }
     } else {
@@ -1097,27 +1103,49 @@ pub async fn generate_assist(
     let context_text = rag.context_text;
     let include_context = !context_text.is_empty();
 
-    // Consented automatic fallback, when this meeting's policy allows one.
-    let failover = match &active_profile {
-        Some(p) if p.has_failover() => {
-            let policy = p.policy.clone().expect("has_failover implies a policy");
-            let fallback_ref = policy.fallback.clone().expect("has_failover implies a fallback");
-            match build_provider(&state, &fallback_ref) {
-                Ok(provider) => Some(crate::intelligence::Failover {
-                    policy,
-                    book: p.book.clone(),
-                    fallback: Some(provider),
-                }),
-                Err(reason) => {
-                    log::warn!("Automatic fallback disabled for this request: {reason}");
-                    None
-                }
+    let current = crate::profiles::routing::ModelRef::new(
+        provider_type.as_ref().map(ProviderType::as_str).unwrap_or("custom"),
+        &model,
+    );
+    // A manual provider change must not inherit a different primary's fallback.
+    let mut policy = active_profile.as_ref()
+        .and_then(|p| p.policy.as_ref())
+        .filter(|p| p.primary == current)
+        .cloned()
+        .unwrap_or(crate::profiles::routing::RoutingPolicy {
+            primary: current,
+            fallback: None,
+            consent_provider: None,
+            automatic: false,
+            strategy: crate::profiles::model::Strategy::Balanced,
+            max_response_ms: 20_000,
+            allow_paid_fallback: false,
+            spend_limit_usd: None,
+        });
+    let fallback = if policy.automatic {
+        match policy.fallback.as_ref().map(|target| build_provider(&state, target)) {
+            Some(Ok(provider)) => Some(provider),
+            Some(Err(reason)) => {
+                log::warn!("Automatic fallback unavailable for this request: {reason}");
+                policy.fallback = None;
+                None
             }
+            None => None,
         }
-        _ => None,
+    } else {
+        None
     };
+    let failover = Some(crate::intelligence::Failover {
+        policy,
+        book: state.latency_book.clone(),
+        fallback,
+    });
 
     // Run the generation asynchronously
+    let _ = app_handle.emit("question_handling_status", serde_json::json!({
+        "request_id": params.request_id,
+        "status": "generating_answer",
+    }));
     let mode_clone = mode.clone();
     let result = IntelligenceEngine::generate_assist(
         &system_prompt,
@@ -1387,6 +1415,28 @@ fn default_window_seconds(mode: &str, action_window: Option<u64>, global_window:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_meeting_documents_are_not_treated_as_successful_empty_retrieval() {
+        let state = AppState::new();
+        assert!(retrieve_profile_context(&state, "p", Some("What is our contribution?".into()), String::new(), 5).is_err());
+    }
+
+    #[test]
+    fn profile_requests_never_inherit_the_global_claude_fallback() {
+        let mut state = AppState::new();
+        let mut router = crate::llm::LLMRouter::new();
+        router.set_provider(routing::fallback_config("claude_cli")).unwrap();
+        state.llm = Some(Arc::new(std::sync::Mutex::new(router)));
+        state.claude_cli_config.write().unwrap().fallback_provider = Some("openai".into());
+        state.claude_health.mark_unavailable(AgentErrorKind::NotLoggedIn);
+        let scope = SessionScope::Live("rehearsal".into());
+        assert!(matches!(request_route(&state, "Assist", &scope), Route::Fallback(_)));
+        *state.active_profile.write().unwrap() = Some(crate::profiles::ActiveProfile::new(
+            crate::profiles::model::MeetingProfile::default(), &[], state.latency_book.clone(),
+        ));
+        assert!(matches!(request_route(&state, "Assist", &scope), Route::Stateless));
+    }
 
     #[test]
     fn meeting_view_actions_default_to_whole_meeting() {

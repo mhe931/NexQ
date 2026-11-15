@@ -1,6 +1,7 @@
 //! The connection status shown in Settings, derived only from what the
 //! official CLI itself reports: `copilot --version`, the ACP handshake and a
-//! `session/new` (with its genuine error text). No credential file is read.
+//! `session/new`. Failures are classified then sanitized; raw RPC text or
+//! stderr may contain private data. No credential file is read.
 
 use super::detect::{copilot_version, find_npm_copilot, INSTALL_HINT, LOGIN_HINT};
 use super::hub::{CopilotError, CopilotErrorKind, CopilotHub, CopilotModel};
@@ -41,7 +42,7 @@ pub struct CopilotStatus {
     pub models: Vec<CopilotModel>,
     /// The CLI's own default model for a new session.
     pub current_model: Option<String>,
-    /// The genuine failure text, when `state` is not `ready`.
+    /// A sanitized, actionable failure, when `state` is not `ready`.
     pub error: Option<String>,
     /// What to do about it (sign-in / install instructions).
     pub login_hint: String,
@@ -82,12 +83,24 @@ fn state_of(kind: CopilotErrorKind) -> CopilotState {
 
 fn fail(mut status: CopilotStatus, error: CopilotError) -> CopilotStatus {
     status.state = state_of(error.kind);
-    status.error = Some(error.message);
+    status.error = Some(match error.kind {
+        CopilotErrorKind::NotInstalled =>
+            "The official standalone GitHub Copilot CLI was not found. Install it, then run `copilot login`.",
+        CopilotErrorKind::NotLoggedIn =>
+            "GitHub Copilot authentication is required. Run `copilot login` in a terminal, then check again.",
+        CopilotErrorKind::NoEntitlement =>
+            "GitHub Copilot is not available for this account. Check the active Copilot plan and organization policy.",
+        CopilotErrorKind::Timeout =>
+            "GitHub Copilot timed out. Check your connection and try again.",
+        _ =>
+            "GitHub Copilot could not complete the ACP connection. Check that the installed CLI supports ACP and try again.",
+    }.to_string());
     status
 }
 
 /// Probe the CLI: version, handshake, a throw-away session (closed again).
-/// Never fails: every problem becomes a state with the CLI's own message.
+/// Never fails: every problem becomes a state with a safe message.
+/// Ready means handshake/session/catalog access, not a successful model call.
 pub async fn check_status(hub: &CopilotHub) -> CopilotStatus {
     let mut status = CopilotStatus::base();
 
@@ -114,7 +127,7 @@ pub async fn check_status(hub: &CopilotHub) -> CopilotStatus {
     status.binary_path = Some(spec.program.to_string_lossy().into_owned());
     status.version = copilot_version(&spec.program)
         .await
-        .map_err(|e| log::warn!("Copilot CLI version probe failed: {e}"))
+        .map_err(|_| log::warn!("Copilot CLI version probe failed"))
         .ok();
 
     let live = match hub.connection().await {
@@ -167,5 +180,21 @@ mod tests {
         assert_eq!(state_of(CopilotErrorKind::NoEntitlement), CopilotState::NoEntitlement);
         assert_eq!(state_of(CopilotErrorKind::Timeout), CopilotState::Timeout);
         assert_eq!(state_of(CopilotErrorKind::Protocol), CopilotState::ProtocolError);
+    }
+
+    #[test]
+    fn status_failures_never_expose_raw_rpc_or_stderr_text() {
+        for kind in [
+            CopilotErrorKind::NotLoggedIn,
+            CopilotErrorKind::NoEntitlement,
+            CopilotErrorKind::Timeout,
+            CopilotErrorKind::Protocol,
+        ] {
+            let status = fail(CopilotStatus::base(), CopilotError::new(kind,
+                "private-user-content-sentinel; Bearer private-key-sentinel"));
+            let message = status.error.unwrap();
+            assert!(!message.contains("sentinel"));
+            assert!(message.contains("Copilot"));
+        }
     }
 }

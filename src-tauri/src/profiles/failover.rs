@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::routing::{
-    choose_for_request, classify_failure, decide_after_failure, Decision, FailureKind, LatencyBook, ModelRef,
+    choose_for_request, classify_kind, decide_after_failure, Decision, FailureKind, LatencyBook, ModelRef,
     RoutingPolicy,
 };
 use crate::llm::provider::{CancelToken, CompletionStats, LLMError, TokenSink};
@@ -24,7 +24,7 @@ pub trait Publisher: Send + Sync {
     fn switched(&self, from: &ModelRef, to: &ModelRef, reason: FailureKind);
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
@@ -85,14 +85,30 @@ where
     F: FnMut(ModelRef, TokenSink) -> Fut,
     Fut: Future<Output = Result<CompletionStats, LLMError>>,
 {
-    let mut target = {
+    let (mut target, initial_reason) = {
         let book = book.lock().map_err(|e| e.to_string())?;
         match choose_for_request(policy, &book, spent_usd, now_ms()) {
-            Decision::UseFallback(fb) => fb,
-            _ => policy.primary.clone(),
+            Decision::UseFallback(fb) => {
+                let reason = if book.credits_exhausted(&policy.primary.provider) {
+                    FailureKind::CreditsExhausted
+                } else {
+                    book.last_failure(&policy.primary).unwrap_or(FailureKind::Other)
+                };
+                (fb, reason)
+            }
+            Decision::Blocked(_) => {
+                let message = crate::llm::provider::LLMFailureKind::CreditsExhausted
+                    .safe_message(&policy.primary.provider);
+                publisher.error(&message);
+                return Err(message);
+            }
+            Decision::UsePrimary => (policy.primary.clone(), FailureKind::Other),
         }
     };
     let mut fell_back = target != policy.primary;
+    if fell_back {
+        publisher.switched(&policy.primary, &target, initial_reason);
+    }
     // Only the attempt whose number equals this may publish.
     let live_attempt = Arc::new(AtomicU64::new(1));
     let mut number = 1u64;
@@ -119,9 +135,11 @@ where
         let result = attempt(target.clone(), sink).await;
         match result {
             Ok(stats) => {
-                if let Ok(mut book) = book.lock() {
-                    book.record_success(&target, first_token_ms.load(Ordering::SeqCst), stats.latency_ms);
-                }
+                book.lock().map_err(|error| {
+                    log::error!("Cannot update provider health: {error}");
+                    publisher.error("Provider health state unavailable. Restart NexQ.");
+                    "Provider health state unavailable. Restart NexQ.".to_string()
+                })?.record_success(&target, first_token_ms.load(Ordering::SeqCst), stats.latency_ms);
                 publisher.end(stats.total_tokens, stats.latency_ms);
                 return Ok(());
             }
@@ -129,17 +147,22 @@ where
             Err(_) if cancel.is_cancelled() => return Ok(()),
             Err(error) => {
                 let message = error.to_string();
-                let kind = classify_failure(&message);
-                if let Ok(mut book) = book.lock() {
+                let kind = classify_kind(error.kind());
+                let decision = {
+                    let mut book = book.lock().map_err(|error| {
+                        log::error!("Cannot update provider health: {error}");
+                        publisher.error("Provider health state unavailable. Restart NexQ.");
+                        "Provider health state unavailable. Restart NexQ.".to_string()
+                    })?;
                     book.record_failure(&target, kind, now_ms());
-                }
-                let decision = decide_after_failure(
-                    policy,
-                    kind,
-                    started.load(Ordering::SeqCst),
-                    fell_back,
-                    spent_usd,
-                );
+                    match decide_after_failure(
+                        policy, kind, started.load(Ordering::SeqCst), fell_back, spent_usd,
+                    ) {
+                        Decision::UseFallback(next) if book.credits_exhausted(&next.provider) =>
+                            Decision::Blocked(super::routing::BlockReason::CreditsExhausted),
+                        decision => decision,
+                    }
+                };
                 match decision {
                     Decision::UseFallback(next) if !cancel.is_cancelled() => {
                         publisher.switched(&target, &next, kind);
@@ -251,6 +274,51 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), ["openai"]);
         assert_eq!(rec.log().len(), 1);
         assert!(rec.log()[0].starts_with("error:"));
+    }
+
+    #[tokio::test]
+    async fn exhausted_credit_is_blocked_on_subsequent_requests_without_contacting_a_provider() {
+        let rec = Arc::new(Recorder::default());
+        let book = Mutex::new(LatencyBook::default());
+        let cancel = CancelToken::new();
+        let p = policy(None);
+        book.lock().unwrap().record_failure(&p.primary, FailureKind::CreditsExhausted, 0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        let result = run(&p, &book, 0.0, rec.clone(), &cancel, move |who, _| {
+            calls2.lock().unwrap().push(who.provider);
+            async { Ok(stats(1)) }
+        }).await;
+        assert!(result.is_err());
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(rec.log().len(), 1);
+        assert!(rec.log()[0].contains("credits"));
+    }
+
+    #[tokio::test]
+    async fn preflight_fallback_is_announced_and_exhausted_fallback_is_never_contacted() {
+        let p = policy(Some("gemini"));
+        let book = Mutex::new(LatencyBook::default());
+        let cancel = CancelToken::new();
+        book.lock().unwrap().record_failure(&p.primary, FailureKind::CreditsExhausted, 0);
+        let rec = Arc::new(Recorder::default());
+        run(&p, &book, 0.0, rec.clone(), &cancel, |who, sink| async move {
+            assert_eq!(who.provider, "gemini");
+            sink("answer");
+            Ok(stats(1))
+        }).await.unwrap();
+        assert_eq!(rec.log(), ["switch:openai->gemini", "token:answer", "end:1"]);
+
+        book.lock().unwrap().clear_credit_failure("openai");
+        book.lock().unwrap().record_failure(p.fallback.as_ref().unwrap(), FailureKind::CreditsExhausted, 0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        let result = run(&p, &book, 0.0, Arc::new(Recorder::default()), &cancel, move |who, _| {
+            calls2.lock().unwrap().push(who.provider);
+            async { Err(LLMError::classified(crate::llm::provider::LLMFailureKind::Timeout, "openai")) }
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), ["openai"]);
     }
 
     #[tokio::test]

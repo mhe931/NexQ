@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use tauri::{command, State};
+use tauri::{command, AppHandle, State};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::llm::provider::LLMProvider;
+use crate::llm::provider::{GenerationParams, LLMFailureKind, LLMProvider, TokenSink};
 use crate::llm::{create_provider, LLMRouter, ProviderConfig};
 use crate::llm::openrouter_models;
 use crate::state::AppState;
@@ -128,6 +128,68 @@ pub async fn test_llm_connection(
         .test_connection()
         .await
         .map_err(|e| format!("Connection test failed: {}", e))
+}
+
+#[command]
+pub async fn clear_provider_credit_failure(
+    provider: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.latency_book.lock()
+        .map_err(|e| format!("Failed to lock provider health: {e}"))?
+        .clear_credit_failure(&provider);
+    Ok(())
+}
+
+#[command]
+pub async fn test_llm_response(
+    provider: String,
+    model: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    if model.trim().is_empty() {
+        return Err("Select a model before testing an AI response.".into());
+    }
+    let llm = state.llm.as_ref().ok_or("LLM router not initialized")?;
+    let provider_arc = resolve_provider(llm, &provider)?;
+    let provider_id = serde_json::from_str::<ProviderConfig>(&provider)
+        .map(|c| c.provider_type)
+        .unwrap_or(provider);
+    let response = Arc::new(std::sync::Mutex::new(String::new()));
+    let received = response.clone();
+    let sink: TokenSink = Arc::new(move |text| {
+        match received.lock() {
+            Ok(mut response) => response.push_str(text),
+            Err(error) => log::error!("AI response test buffer unavailable: {error}"),
+        }
+    });
+    let result = provider_arc.lock().await.stream_completion(
+        vec![crate::llm::provider::LLMMessage {
+            role: "user".into(),
+            content: "Reply with the single word READY. This is a public connectivity test.".into(),
+        }],
+        &model,
+        GenerationParams { silent: true, max_tokens: Some(32), ..Default::default() },
+        app,
+        Some(sink),
+    ).await;
+    let who = crate::profiles::routing::ModelRef::new(&provider_id, &model);
+    match result {
+        Ok(_) if !response.lock().map_err(|e| e.to_string())?.trim().is_empty() => {
+            state.latency_book.lock()
+                .map_err(|e| format!("Failed to lock provider health: {e}"))?
+                .clear_credit_failure(&provider_id);
+            Ok(true)
+        }
+        Ok(_) => Err(LLMFailureKind::InvalidResponse.safe_message(&provider_id)),
+        Err(error) => {
+            state.latency_book.lock()
+                .map_err(|e| format!("Failed to lock provider health: {e}"))?
+                .record_failure(&who, crate::profiles::routing::classify_kind(error.kind()), crate::profiles::failover::now_ms());
+            Err(error.safe_message())
+        }
+    }
 }
 
 #[command]

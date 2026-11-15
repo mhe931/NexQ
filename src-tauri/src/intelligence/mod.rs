@@ -218,7 +218,7 @@ impl IntelligenceEngine {
 
         // Call the LLM provider's stream_completion
         let result = match failover {
-            Some(plan) if plan.fallback.is_some() => {
+            Some(plan) => {
                 // Routed request: attempts stream silently into a publisher that
                 // allows at most one consented fallback and never a duplicate answer.
                 let publisher = Arc::new(crate::profiles::failover::TauriPublisher {
@@ -227,7 +227,7 @@ impl IntelligenceEngine {
                 });
                 let silent = GenerationParams { silent: true, ..params.clone() };
                 let primary_ref = plan.policy.primary.clone();
-                let fallback = plan.fallback.clone().expect("checked above");
+                let fallback = plan.fallback.clone();
                 let fallback_model = plan.policy.fallback.as_ref().map(|f| f.model.clone()).unwrap_or_default();
                 let outcome = crate::profiles::failover::run(
                     &plan.policy,
@@ -237,12 +237,15 @@ impl IntelligenceEngine {
                     &cancel_token,
                     |who, sink| {
                         let (provider, model) = if who == primary_ref {
-                            (llm_provider.clone(), model.clone())
+                            (Some(llm_provider.clone()), model.clone())
                         } else {
                             (fallback.clone(), fallback_model.clone())
                         };
                         let (messages, silent, app) = (messages.clone(), silent.clone(), app_handle.clone());
                         async move {
+                            let provider = provider.ok_or_else(|| crate::llm::provider::LLMError::NotConfigured(
+                                "Selected fallback provider is not configured".into(),
+                            ))?;
                             let guard = provider.lock().await;
                             guard.stream_completion(messages, &model, silent, app, Some(sink)).await
                         }

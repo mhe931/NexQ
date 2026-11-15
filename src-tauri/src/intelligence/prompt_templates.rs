@@ -70,6 +70,22 @@ pub fn resolve_system_prompt(
     }
 }
 
+pub fn resolve_meeting_system_prompt(
+    mode: &str,
+    action: Option<&super::action_config::ActionConfig>,
+    scenario: Option<&str>,
+    meeting: Option<&str>,
+) -> String {
+    let meeting = meeting.filter(|p| !p.trim().is_empty());
+    let resolved = resolve_system_prompt(mode, action, meeting.or(scenario));
+    match meeting {
+        Some(prompt) if is_scenario_guided(mode) && !resolved.contains(prompt) => {
+            format!("{prompt}\n\n{resolved}")
+        }
+        _ => resolved,
+    }
+}
+
 #[cfg(test)]
 mod scenario_prompt_tests {
     use super::*;
@@ -102,6 +118,45 @@ mod scenario_prompt_tests {
         assert_eq!(
             resolve_system_prompt("ActionItemsExtraction", Some(action), Some("Speak as Daniel")),
             action.system_prompt,
+        );
+    }
+
+    #[test]
+    fn meeting_instruction_files_lead_even_when_action_instructions_are_disabled() {
+        let mut config = AllActionConfigs::default();
+        let action = config.actions.get_mut("AskQuestion").unwrap();
+        action.system_prompt = "Answer the question directly.".into();
+        action.is_default_prompt = false;
+        action.include_custom_instructions = false;
+        let prompt = resolve_meeting_system_prompt(
+            "AskQuestion",
+            Some(action),
+            Some("generic scenario"),
+            Some("MEETING: Use short English and we. FILE: Do not invent findings."),
+        );
+        assert!(prompt.starts_with("MEETING: Use short English and we. FILE: Do not invent findings."));
+        assert!(prompt.ends_with("Answer the question directly."));
+        assert!(!prompt.contains("generic scenario"));
+    }
+
+    #[test]
+    fn meeting_prompt_is_not_duplicated_and_nonmeeting_actions_are_unchanged() {
+        let config = AllActionConfigs::default();
+        let meeting = "MEETING: Cite our documents.";
+        let prompt = resolve_meeting_system_prompt(
+            "Assist", config.actions.get("Assist"), Some(meeting), Some(meeting),
+        );
+        assert_eq!(prompt.matches(meeting).count(), 1);
+        assert_eq!(
+            resolve_meeting_system_prompt("Assist", None, Some("scenario"), None),
+            resolve_system_prompt("Assist", None, Some("scenario")),
+        );
+        assert_eq!(
+            resolve_meeting_system_prompt(
+                "ActionItemsExtraction", config.actions.get("ActionItemsExtraction"),
+                Some(meeting), Some(meeting),
+            ),
+            config.actions["ActionItemsExtraction"].system_prompt,
         );
     }
 }

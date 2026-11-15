@@ -38,6 +38,7 @@ impl ModelRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
+    CreditsExhausted,
     Unavailable,
     RateLimited,
     Timeout,
@@ -48,6 +49,7 @@ pub enum FailureKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
 pub enum BlockReason {
+    CreditsExhausted,
     NoFallbackConfigured,
     AutomaticFallbackOff,
     ConsentMissing(String),
@@ -130,6 +132,8 @@ struct Stats {
     total_ms: VecDeque<u64>,
     consecutive_failures: u32,
     rate_limited_until_ms: u64,
+    credits_exhausted: bool,
+    last_failure: Option<FailureKind>,
 }
 
 fn push(window: &mut VecDeque<u64>, v: u64) {
@@ -168,18 +172,42 @@ pub struct LatencyBook {
 
 impl LatencyBook {
     pub fn record_success(&mut self, who: &ModelRef, first_token_ms: u64, total_ms: u64) {
+        self.clear_credit_failure(&who.provider);
         let s = self.stats.entry(who.clone()).or_default();
         push(&mut s.first_token_ms, first_token_ms);
         push(&mut s.total_ms, total_ms);
         s.consecutive_failures = 0;
+        s.last_failure = None;
     }
 
     pub fn record_failure(&mut self, who: &ModelRef, kind: FailureKind, now_ms: u64) {
         let s = self.stats.entry(who.clone()).or_default();
         s.consecutive_failures += 1;
+        s.last_failure = Some(kind);
         if kind == FailureKind::RateLimited {
             s.rate_limited_until_ms = now_ms + RATE_LIMIT_COOLDOWN_MS;
         }
+        if kind == FailureKind::CreditsExhausted {
+            s.credits_exhausted = true;
+        }
+    }
+
+    pub fn clear_credit_failure(&mut self, provider: &str) {
+        for (who, stats) in &mut self.stats {
+            if who.provider.eq_ignore_ascii_case(provider) {
+                stats.credits_exhausted = false;
+            }
+        }
+    }
+
+    pub(crate) fn credits_exhausted(&self, provider: &str) -> bool {
+        self.stats.iter().any(|(who, stats)| {
+            who.provider.eq_ignore_ascii_case(provider) && stats.credits_exhausted
+        })
+    }
+
+    pub(crate) fn last_failure(&self, who: &ModelRef) -> Option<FailureKind> {
+        self.stats.get(who).and_then(|stats| stats.last_failure)
     }
 
     pub fn median_first_token_ms(&self, who: &ModelRef) -> Option<u64> {
@@ -228,8 +256,15 @@ pub fn choose_for_request(
     spent_usd: f64,
     now_ms: u64,
 ) -> Decision {
+    if book.credits_exhausted(&policy.primary.provider) {
+        return match policy.fallback_allowed(spent_usd) {
+            Ok(fb) if !book.credits_exhausted(&fb.provider) => Decision::UseFallback(fb.clone()),
+            _ => Decision::Blocked(BlockReason::CreditsExhausted),
+        };
+    }
     let fallback = match policy.fallback_allowed(spent_usd) {
-        Ok(fb) => fb,
+        Ok(fb) if !book.credits_exhausted(&fb.provider) => fb,
+        Ok(_) => return Decision::UsePrimary,
         Err(_) => return Decision::UsePrimary,
     };
     if book.degraded(&policy.primary, now_ms, policy.max_response_ms)
@@ -287,19 +322,18 @@ pub fn decide_after_failure(
 
 /// Maps an LLM error message to a failure class.
 pub fn classify_failure(message: &str) -> FailureKind {
-    let m = message.to_lowercase();
-    if m.contains("429") || m.contains("rate limit") || m.contains("quota") || m.contains("too many requests") {
-        FailureKind::RateLimited
-    } else if m.contains("timed out") || m.contains("timeout") {
-        FailureKind::Timeout
-    } else if m.contains("401") || m.contains("403") || m.contains("api key") || m.contains("unauthor") {
-        FailureKind::Auth
-    } else if m.contains("503") || m.contains("502") || m.contains("500") || m.contains("unavailable")
-        || m.contains("connect") || m.contains("dns") || m.contains("overloaded")
-    {
-        FailureKind::Unavailable
-    } else {
-        FailureKind::Other
+    classify_kind(crate::llm::provider::classify_failure(message))
+}
+
+pub fn classify_kind(kind: crate::llm::provider::LLMFailureKind) -> FailureKind {
+    use crate::llm::provider::LLMFailureKind;
+    match kind {
+        LLMFailureKind::CreditsExhausted => FailureKind::CreditsExhausted,
+        LLMFailureKind::RateLimited => FailureKind::RateLimited,
+        LLMFailureKind::Timeout => FailureKind::Timeout,
+        LLMFailureKind::Authentication | LLMFailureKind::InvalidApiKey => FailureKind::Auth,
+        LLMFailureKind::Unavailable | LLMFailureKind::NotConfigured => FailureKind::Unavailable,
+        _ => FailureKind::Other,
     }
 }
 
@@ -476,6 +510,16 @@ mod tests {
     }
 
     #[test]
+    fn a_degraded_primary_does_not_select_an_exhausted_fallback_account() {
+        let p = policy(Strategy::Balanced);
+        let mut book = LatencyBook::default();
+        book.record_failure(&p.primary, FailureKind::Timeout, 0);
+        book.record_failure(&p.primary, FailureKind::Timeout, 0);
+        book.record_failure(p.fallback.as_ref().unwrap(), FailureKind::CreditsExhausted, 0);
+        assert_eq!(choose_for_request(&p, &book, 0.0, 0), Decision::UsePrimary);
+    }
+
+    #[test]
     fn fast_uses_measured_latency_and_best_answer_does_not_chase_speed() {
         let mut book = LatencyBook::default();
         let fast = policy(Strategy::Fast);
@@ -505,6 +549,37 @@ mod tests {
         assert_eq!(classify_failure("401 invalid API key"), FailureKind::Auth);
         assert_eq!(classify_failure("503 Service Unavailable"), FailureKind::Unavailable);
         assert_eq!(classify_failure("malformed JSON"), FailureKind::Other);
+    }
+
+    #[test]
+    fn exhausted_api_credit_is_not_a_transient_rate_limit() {
+        for message in [
+            "HTTP 429: insufficient_quota",
+            "429 Too Many Requests: credit_balance_exhausted",
+            "You have no credits remaining.",
+        ] {
+            assert_eq!(classify_failure(message), FailureKind::CreditsExhausted);
+        }
+        assert_eq!(classify_failure("429 rate limit exceeded"), FailureKind::RateLimited);
+    }
+
+    #[test]
+    fn exhausted_provider_is_not_retried_while_its_configuration_is_unchanged() {
+        let p = policy(Strategy::Balanced);
+        let mut book = LatencyBook::default();
+        book.record_failure(&p.primary, FailureKind::CreditsExhausted, 0);
+        assert_eq!(
+            choose_for_request(&p, &book, 0.0, RATE_LIMIT_COOLDOWN_MS * 10),
+            Decision::UseFallback(ModelRef::new("gemini", "gemini-fast")),
+        );
+        let mut no_consent = p.clone();
+        no_consent.consent_provider = None;
+        assert_eq!(
+            choose_for_request(&no_consent, &book, 0.0, RATE_LIMIT_COOLDOWN_MS * 10),
+            Decision::Blocked(BlockReason::CreditsExhausted),
+        );
+        book.record_success(&p.primary, 1, 2);
+        assert_eq!(choose_for_request(&p, &book, 0.0, 1), Decision::UsePrimary);
     }
 
     #[test]
