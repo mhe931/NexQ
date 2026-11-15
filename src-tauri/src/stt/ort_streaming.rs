@@ -53,6 +53,8 @@ pub struct OrtStreamingSTT {
     inference_thread: Option<std::thread::JoinHandle<()>>,
     segment_counter: u64,
     app_handle: Option<AppHandle>,
+    party: String,
+    status_provider: String,
 }
 
 impl OrtStreamingSTT {
@@ -67,11 +69,21 @@ impl OrtStreamingSTT {
             inference_thread: None,
             segment_counter: 0,
             app_handle: None,
+            party: "Them".into(),
+            status_provider: "ort_streaming".into(),
         }
     }
 
     pub fn set_app_handle(&mut self, handle: AppHandle) {
         self.app_handle = Some(handle);
+    }
+
+    pub fn set_party(&mut self, party: &str) {
+        self.party = party.to_string();
+    }
+
+    pub fn set_status_provider(&mut self, provider: &str) {
+        self.status_provider = provider.to_string();
     }
 }
 
@@ -109,14 +121,15 @@ impl STTProvider for OrtStreamingSTT {
         self.stop_flag.store(false, AtomicOrdering::SeqCst);
 
         let (audio_tx, audio_rx) = std::sync::mpsc::channel::<AudioMessage>();
-        self.audio_tx = Some(audio_tx);
-        self.result_tx = Some(result_tx.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         let model_dir = self.model_dir.clone();
         let language = self.language.clone();
         let stop_flag = Arc::clone(&self.stop_flag);
         let seg_start = self.segment_counter;
         let app_handle = self.app_handle.clone();
+        let party = self.party.clone();
+        let status_provider = self.status_provider.clone();
         let encoder_path = model_files.encoder.clone();
         let decoder_path = model_files.decoder.clone();
         let joiner_path = model_files.joiner.clone();
@@ -137,9 +150,26 @@ impl STTProvider for OrtStreamingSTT {
                     result_tx,
                     seg_start,
                     app_handle,
+                    ready_tx,
+                    party,
+                    status_provider,
                 );
             })?;
 
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            outcome => {
+                drop(audio_tx);
+                let _ = thread.join();
+                let message = match outcome {
+                    Ok(Err(message)) => message,
+                    Err(_) => "ORT inference worker ended before becoming ready".into(),
+                    Ok(Ok(())) => unreachable!(),
+                };
+                return Err(message.into());
+            }
+        }
+        self.audio_tx = Some(audio_tx);
         self.inference_thread = Some(thread);
         self.is_streaming = true;
 
@@ -162,7 +192,7 @@ impl STTProvider for OrtStreamingSTT {
         if let Some(ref tx) = self.audio_tx {
             if tx.send(AudioMessage::Samples(chunk.pcm_data)).is_err() {
                 log::warn!("OrtStreamingSTT: Audio channel closed");
-                self.is_streaming = false;
+                return Err("ORT inference worker stopped. Restart listening or check the local model.".into());
             }
         }
 
@@ -595,6 +625,9 @@ fn inference_thread_main(
     result_tx: mpsc::Sender<TranscriptResult>,
     segment_counter_start: u64,
     app_handle: Option<AppHandle>,
+    ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    party: String,
+    status_provider: String,
 ) {
     // Helper to emit both to Rust log and frontend dev log
     let debug = |level: &str, msg: &str| {
@@ -605,6 +638,11 @@ fn inference_thread_main(
         }
         if let Some(ref handle) = app_handle {
             crate::stt::emit_stt_debug(handle, level, "ort_streaming", msg);
+            if level == "error" {
+                let _ = tauri::Emitter::emit(handle, "stt_connection_status", serde_json::json!({
+                    "provider": status_provider, "party": party, "status": "error", "message": msg,
+                }));
+            }
         }
     };
 
@@ -618,6 +656,7 @@ fn inference_thread_main(
         }
         Err(e) => {
             debug("error", &format!("Failed to load tokens: {}", e));
+            let _ = ready_tx.send(Err(format!("Failed to load tokens: {}", e)));
             return;
         }
     };
@@ -627,6 +666,7 @@ fn inference_thread_main(
         Ok(s) => s,
         Err(e) => {
             debug("error", &format!("Encoder load failed: {}", e));
+            let _ = ready_tx.send(Err(format!("Encoder load failed: {}", e)));
             return;
         }
     };
@@ -634,6 +674,7 @@ fn inference_thread_main(
         Ok(s) => s,
         Err(e) => {
             debug("error", &format!("Decoder load failed: {}", e));
+            let _ = ready_tx.send(Err(format!("Decoder load failed: {}", e)));
             return;
         }
     };
@@ -641,16 +682,22 @@ fn inference_thread_main(
         Ok(s) => s,
         Err(e) => {
             debug("error", &format!("Joiner load failed: {}", e));
+            let _ = ready_tx.send(Err(format!("Joiner load failed: {}", e)));
             return;
         }
     };
 
     if encoder.inputs().first().map(|input| input.name()) == Some("audio_signal") {
+        let mut ready_tx = Some(ready_tx);
         if let Err(error) = nemo::run(
             &mut encoder, &mut decoder, &mut joiner, &tokens, &language,
             &stop_flag, &audio_rx, &result_tx, segment_counter_start, &debug,
+            &mut ready_tx,
         ) {
             debug("error", &format!("NeMo TDT inference failed: {error}"));
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(Err(format!("NeMo TDT initialization failed: {error}")));
+            }
         }
         return;
     }
@@ -673,6 +720,7 @@ fn inference_thread_main(
                 "error",
                 &format!("Encoder state discovery failed: {}", e),
             );
+            let _ = ready_tx.send(Err(format!("Encoder state discovery failed: {}", e)));
             return;
         }
     };
@@ -685,6 +733,7 @@ fn inference_thread_main(
                 "error",
                 &format!("Decoder state discovery failed: {}", e),
             );
+            let _ = ready_tx.send(Err(format!("Decoder state discovery failed: {}", e)));
             return;
         }
     };
@@ -701,6 +750,9 @@ fn inference_thread_main(
     // Initialize Fbank feature extractor with the model's expected feature dimension
     let feature_dim = state_mgr.feature_dim;
     let mut fbank = crate::stt::fbank::FbankExtractor::with_num_mels(feature_dim);
+    if ready_tx.send(Ok(())).is_err() {
+        return; // caller cancelled startup
+    }
 
     // Buffer for accumulating Fbank frames until we have enough for one encoder call
     let mut feature_buffer: Vec<Vec<f32>> = Vec::new();
@@ -1340,6 +1392,26 @@ fn run_joiner(
 mod live_tests {
     use super::*;
     use crate::audio::AudioSource;
+
+    #[tokio::test]
+    async fn unreadable_tokens_fail_before_stream_is_ready() {
+        let dir = std::env::temp_dir().join(format!("nexq-ort-invalid-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["encoder.onnx", "decoder.onnx", "joiner.onnx"] {
+            std::fs::write(dir.join(name), b"synthetic invalid model").unwrap();
+        }
+        // Discovery finds the tokens path, but a directory cannot be read as tokens.
+        std::fs::create_dir(dir.join("tokens.txt")).unwrap();
+        let mut provider = OrtStreamingSTT::new(dir.clone());
+        let (tx, _rx) = mpsc::channel(8);
+        let result = provider.start_stream(tx).await;
+        let was_streaming = provider.is_streaming;
+        provider.stop_stream().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(result.is_err(), "worker initialization failure must reach the caller");
+        assert!(!was_streaming);
+        assert!(provider.inference_thread.is_none());
+    }
 
     /// Streams a 16 kHz mono WAV through the provider in 100 ms chunks, like a
     /// meeting does, and prints what comes back. Needs a downloaded model:

@@ -1,4 +1,5 @@
 pub mod device_default;
+pub mod capture_status;
 pub mod device_manager;
 pub mod echo_cancel;
 pub mod encoder;
@@ -17,6 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::recorder::SharedRecorder;
 use crate::audio::vad::VoiceActivityDetector;
+use capture_status::{CaptureStatusReporter, StreamCaptureStatusReporter};
 
 // ── Two-Party Model Types ──
 
@@ -67,6 +69,11 @@ pub struct AudioCaptureManager {
     /// What didn't start as chosen (a missing device replaced by the default,
     /// or one side not captured at all). Taken by the caller to warn the user.
     warnings: Vec<String>,
+    /// Physical sources that actually opened; capture is not STT readiness.
+    captured_sources: (bool, bool),
+    /// Completes after the command's STT/audio processing task has shut down.
+    processing_done: Option<tokio::sync::oneshot::Receiver<()>>,
+    status_reporter: Option<CaptureStatusReporter>,
     /// Active recorder (if recording is enabled)
     recorder: Option<SharedRecorder>,
     /// When a device change paused capture with the recorder kept open: the
@@ -107,6 +114,9 @@ impl AudioCaptureManager {
             system_thread: None,
             system_input_stream: None,
             warnings: Vec::new(),
+            captured_sources: (false, false),
+            processing_done: None,
+            status_reporter: None,
             recorder: None,
             recording_paused_at: None,
             meeting_id: None,
@@ -144,6 +154,7 @@ impl AudioCaptureManager {
 
         log::info!("Starting audio capture pipeline");
         self.warnings.clear();
+        self.captured_sources = (false, false);
         // Why "You" isn't captured, if the mic (and the default mic) failed.
         let mut mic_error: Option<String> = None;
         // Why "Them" isn't captured, if their device failed.
@@ -167,13 +178,18 @@ impl AudioCaptureManager {
             );
             // Single capture that produces both Mic and System chunks
             let dual_tx = tx.clone();
-            match mic_capture::start_mic_capture_dual(mic_device_id, dual_tx) {
+            match mic_capture::start_mic_capture_dual_with_status(
+                mic_device_id, dual_tx, self.stream_status(&[PartyRole::You, PartyRole::Them]),
+            ) {
                 Ok(stream) => {
                     self.mic_stream = Some(stream);
                     log::info!("Dual-tagged capture started on shared device");
                 }
                 Err(e) => {
                     log::error!("Failed to start dual capture: {}", e);
+                    self.capture_error(PartyRole::You, &e);
+                    self.capture_error(PartyRole::Them, &e);
+                    if let Some(reporter) = &self.status_reporter { reporter.close(); }
                     return Err(format!("Dual capture failed: {}", e));
                 }
             }
@@ -187,6 +203,7 @@ impl AudioCaptureManager {
                 Err(e) => {
                     // Keep going: the other side may still be captured.
                     log::error!("Failed to start mic capture: {e}");
+                    self.capture_error(PartyRole::You, &e);
                     mic_error = Some(e);
                 }
             }
@@ -198,7 +215,9 @@ impl AudioCaptureManager {
         } else if system_is_input {
             // "Them" is a different input device — capture tagged as System
             let system_tx = tx.clone();
-            match mic_capture::start_mic_capture(system_device_id, system_tx, AudioSource::System) {
+            match mic_capture::start_mic_capture_with_status(
+                system_device_id, system_tx, AudioSource::System, self.stream_status(&[PartyRole::Them]),
+            ) {
                 Ok(stream) => {
                     self.system_input_stream = Some(stream);
                     log::info!("System audio capture started via input device (tagged as System)");
@@ -206,6 +225,7 @@ impl AudioCaptureManager {
                 Err(e) => {
                     // Keep "You" running; the caller warns about the other side.
                     log::error!("System input capture failed: {e}. The other party won't be captured.");
+                    self.capture_error(PartyRole::Them, &e);
                     system_error = Some(e);
                 }
             }
@@ -215,14 +235,19 @@ impl AudioCaptureManager {
             } else {
                 Some(system_device_id.to_string())
             };
-            let mut started = system_capture::start_system_capture_device(tx.clone(), Arc::clone(&self.stop_flag), device_name.clone());
+            let mut started = system_capture::start_system_capture_device_with_status(
+                tx.clone(), Arc::clone(&self.stop_flag), device_name.clone(), self.stream_status(&[PartyRole::Them]),
+            );
             // A chosen output that isn't connected falls back to the default output.
             if let (Err(e), Some(name)) = (&started, &device_name) {
                 log::warn!("Output '{name}' failed ({e}); capturing the default output instead");
-                started = system_capture::start_system_capture_device(tx.clone(), Arc::clone(&self.stop_flag), None);
+                self.capture_error(PartyRole::Them, e);
+                started = system_capture::start_system_capture_device_with_status(
+                    tx.clone(), Arc::clone(&self.stop_flag), None, self.stream_status(&[PartyRole::Them]),
+                );
                 if started.is_ok() {
                     self.warnings.push(format!(
-                        "The other side's device '{name}' isn't available, so NexQ is capturing your default output instead."
+                        "Them: the selected output '{name}' could not be opened; NexQ is capturing the default output instead."
                     ));
                 }
             }
@@ -234,23 +259,26 @@ impl AudioCaptureManager {
                 Err(e) => {
                     // Keep "You" running; the caller warns about the other side.
                     log::error!("System output capture failed: {e}. The other party won't be captured.");
+                    self.capture_error(PartyRole::Them, &e);
                     system_error = Some(e);
                 }
             }
         }
 
+        let captured_sources = (mic_error.is_none(), system_error.is_none());
         match (mic_error, system_error) {
             (Some(mic), Some(system)) => {
                 self.stop_flag.store(true, Ordering::SeqCst);
                 self.mic_stream.take();
                 self.system_input_stream.take();
+                if let Some(reporter) = &self.status_reporter { reporter.close(); }
                 return Err(format!("Couldn't capture any audio. Microphone: {mic}. Other side: {system}"));
             }
             (Some(mic), None) => self.warnings.push(format!(
-                "Couldn't capture your microphone ({mic}). The other side is still transcribed."
+                "You: microphone capture failed ({mic}). Them audio capture is still running."
             )),
             (None, Some(system)) => self.warnings.push(format!(
-                "Couldn't capture the other side ({system}). Your microphone is still transcribed."
+                "Them: audio capture failed ({system}). You microphone capture is still running."
             )),
             (None, None) => {}
         }
@@ -258,6 +286,7 @@ impl AudioCaptureManager {
         self.resume_or_start_recording();
 
         self.is_capturing = true;
+        self.captured_sources = captured_sources;
         log::info!("Audio capture pipeline started");
         Ok(())
     }
@@ -270,13 +299,18 @@ impl AudioCaptureManager {
     /// Open `device_id` as the microphone, or the default microphone when the
     /// chosen one fails (a headset that's switched off).
     fn start_mic_or_default(&mut self, device_id: &str, tx: mpsc::Sender<AudioChunk>) -> Result<cpal::Stream, String> {
-        match mic_capture::start_mic_capture(device_id, tx.clone(), AudioSource::Mic) {
+        match mic_capture::start_mic_capture_with_status(
+            device_id, tx.clone(), AudioSource::Mic, self.stream_status(&[PartyRole::You]),
+        ) {
             Err(e) if !device_id.is_empty() && device_id != "default" => {
                 log::warn!("Microphone '{device_id}' failed ({e}); trying the default microphone");
-                let stream = mic_capture::start_mic_capture("default", tx, AudioSource::Mic)
+                self.capture_error(PartyRole::You, &e);
+                let stream = mic_capture::start_mic_capture_with_status(
+                    "default", tx, AudioSource::Mic, self.stream_status(&[PartyRole::You]),
+                )
                     .map_err(|default_err| format!("{e}; the default microphone failed too: {default_err}"))?;
                 self.warnings.push(format!(
-                    "Your microphone '{device_id}' isn't available, so NexQ is using the default microphone."
+                    "You: the selected microphone '{device_id}' could not be opened; NexQ is capturing the default microphone instead."
                 ));
                 Ok(stream)
             }
@@ -328,12 +362,39 @@ impl AudioCaptureManager {
         self.system_vad.reset();
 
         self.is_capturing = false;
+        self.captured_sources = (false, false);
+        if let Some(reporter) = &self.status_reporter { reporter.pause(); }
         log::info!("Audio capture pipeline stopped");
     }
 
     /// Check if capture is active.
     pub fn is_capturing(&self) -> bool {
         self.is_capturing
+    }
+
+    /// (You/mic, Them/system), independent of whether a provider is ready.
+    pub fn captured_sources(&self) -> (bool, bool) {
+        self.captured_sources
+    }
+
+    pub fn set_status_reporter(&mut self, reporter: CaptureStatusReporter) {
+        if let Some(previous) = self.status_reporter.replace(reporter) { previous.close(); }
+    }
+
+    fn stream_status(&self, parties: &[PartyRole]) -> Option<StreamCaptureStatusReporter> {
+        self.status_reporter.as_ref().map(|reporter| reporter.stream(parties))
+    }
+
+    fn capture_error(&self, party: PartyRole, error: &str) {
+        if let Some(reporter) = &self.status_reporter { reporter.error(party, error); }
+    }
+
+    pub fn set_processing_completion(&mut self, done: tokio::sync::oneshot::Receiver<()>) {
+        self.processing_done = Some(done);
+    }
+
+    pub fn take_processing_completion(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.processing_done.take()
     }
 
     /// Enable or disable recording to file.
@@ -732,6 +793,20 @@ pub async fn process_recording(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn processing_completion_survives_physical_capture_stop() {
+        let mut manager = AudioCaptureManager::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        manager.set_processing_completion(done_rx);
+        manager.stop_capture(true);
+        let mut done = manager.take_processing_completion().expect("must wait for STT separately");
+        assert!(matches!(done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        done_tx.send(()).unwrap();
+        done.await.unwrap();
+        assert!(manager.take_processing_completion().is_none());
+        assert_eq!(manager.captured_sources(), (false, false));
+    }
 
     fn temp_wav(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("nexq-rec-{}-{}", name, std::process::id()));

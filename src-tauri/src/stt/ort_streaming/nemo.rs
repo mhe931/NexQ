@@ -193,6 +193,7 @@ pub(super) fn run(
     audio_rx: &std::sync::mpsc::Receiver<AudioMessage>,
     result_tx: &mpsc::Sender<TranscriptResult>, mut segment: u64,
     debug: &impl Fn(&str, &str),
+    ready_tx: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), String> {
     let metadata = encoder.metadata().map_err(|e| e.to_string())?;
     let blank: usize = metadata.custom("vocab_size").ok_or("NeMo encoder missing vocab_size")?.parse().map_err(|e| format!("NeMo vocab_size: {e}"))?;
@@ -205,6 +206,11 @@ pub(super) fn run(
     drop(metadata);
     debug("info", "NeMo TDT: offline channel-major encoder, per-feature normalized 128-bin Slaney mel, recurrent decoder, five durations");
     let features = Features::new();
+    if let Some(ready_tx) = ready_tx.take() {
+        if ready_tx.send(Ok(())).is_err() {
+            return Ok(()); // caller cancelled startup
+        }
+    }
     let mut samples = Vec::new();
     let mut silence = 0;
     // Whether the buffer holds any speech-energy frame (silent buffers aren't decoded).

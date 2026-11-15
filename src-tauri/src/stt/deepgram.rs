@@ -108,6 +108,25 @@ fn reconnect_backoff(attempt: u32) -> Duration {
     Duration::from_secs((1u64 << attempt.saturating_sub(1).min(4)).min(15))
 }
 
+fn deepgram_connect_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) =
+        error.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+    {
+        match response.status().as_u16() {
+            401 | 403 => return "Invalid Deepgram API key or account. Check Settings → STT.".into(),
+            400 => return "Deepgram rejected the STT configuration. Check the model and language in Settings → STT.".into(),
+            429 => return "Deepgram rate limit exceeded. Please wait and try again.".into(),
+            _ => {}
+        }
+    }
+    format!("Failed to connect to Deepgram: {}", error)
+}
+
+fn permanent_connect_failure(message: &str) -> bool {
+    message.starts_with("Invalid Deepgram API key")
+        || message.starts_with("Deepgram rejected the STT configuration")
+}
+
 /// Maps Deepgram's clock (how much audio it has received on this connection)
 /// to wall-clock time. Extended digital silence isn't sent, so its clock skips
 /// the remainder of long pauses:
@@ -282,14 +301,14 @@ impl DeepgramSTT {
     /// Create with an API key.
     pub fn with_api_key(api_key: &str) -> Self {
         Self {
-            api_key: api_key.to_string(),
+            api_key: api_key.trim().to_string(),
             ..Self::new()
         }
     }
 
     /// Set the API key.
     pub fn set_api_key(&mut self, api_key: &str) {
-        self.api_key = api_key.to_string();
+        self.api_key = api_key.trim().to_string();
     }
 
     /// Set the Deepgram configuration (model + feature flags).
@@ -426,7 +445,10 @@ impl DeepgramSTT {
             )
             .body(())?;
 
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(request).await?;
+        let (ws_stream, _response) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(request),
+        ).await.map_err(|_| "Deepgram connection timed out after 10 s")??;
         Ok(ws_stream)
     }
 
@@ -792,48 +814,13 @@ impl STTProvider for DeepgramSTT {
         self.connection_state.store(1, Ordering::SeqCst);
         Self::emit_status(&self.app_handle, &self.party, "connecting", None);
 
-        // Connect with retry logic
-        let mut retry_count = 0u32;
-        let max_retries = 5;
-        let ws_stream = loop {
-            match Self::connect(&self.api_key, &url).await {
-                Ok(stream) => break stream,
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count > max_retries {
-                        self.connection_state.store(3, Ordering::SeqCst);
-                        Self::emit_status(
-                            &self.app_handle,
-                            &self.party,
-                            "error",
-                            Some(format!("Failed after {} retries: {}", max_retries, e)),
-                        );
-
-                        // Provide specific error messages
-                        let err_str = e.to_string();
-                        if err_str.contains("401") || err_str.contains("Unauthorized") {
-                            return Err("Invalid Deepgram API key. Please check your key at https://console.deepgram.com/".into());
-                        } else if err_str.contains("429") {
-                            return Err("Deepgram rate limit exceeded. Please wait a moment and try again.".into());
-                        }
-                        return Err(format!("Failed to connect to Deepgram after {} retries: {}", max_retries, e).into());
-                    }
-
-                    let backoff = Duration::from_secs(
-                        (1u64 << (retry_count - 1)).min(30)
-                    );
-                    log::warn!(
-                        "DeepgramSTT: Connection attempt {} failed: {}. Retrying in {:?}",
-                        retry_count, e, backoff
-                    );
-                    Self::emit_status(
-                        &self.app_handle,
-                        &self.party,
-                        "reconnecting",
-                        Some(format!("Retry {} of {}", retry_count, max_retries)),
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
+        let ws_stream = match Self::connect(&self.api_key, &url).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let message = deepgram_connect_error(e.as_ref());
+                self.connection_state.store(3, Ordering::SeqCst);
+                Self::emit_status(&self.app_handle, &self.party, "error", Some(message.clone()));
+                return Err(message.into());
             }
         };
 
@@ -1149,6 +1136,15 @@ impl DeepgramSTT {
                     return;
                 }
                 Some(Ok(Err(e))) => {
+                    if permanent_connect_failure(&e) {
+                        self.result_tx = None;
+                        self.pending_audio.clear();
+                        self.pending_samples = 0;
+                        self.next_reconnect_at = None;
+                        self.connection_state.store(3, Ordering::SeqCst);
+                        Self::emit_status(&self.app_handle, &self.party, "error", Some(e));
+                        return;
+                    }
                     log::warn!("DeepgramSTT: reconnect failed: {}", e);
                     true
                 }
@@ -1175,7 +1171,7 @@ impl DeepgramSTT {
         self.reconnect_task = Some(tokio::spawn(async move {
             match tokio::time::timeout(Duration::from_secs(10), Self::connect(&key, &url)).await {
                 Ok(Ok(ws)) => Ok((ws, Instant::now())),
-                Ok(Err(e)) => Err(e.to_string()),
+                Ok(Err(e)) => Err(deepgram_connect_error(e.as_ref())),
                 Err(_) => Err("connect timed out after 10 s".to_string()),
             }
         }));
@@ -1457,6 +1453,45 @@ mod tests {
 
     fn chunk(value: i16, ts: u64) -> AudioChunk {
         AudioChunk { pcm_data: vec![value; 1600], source: crate::audio::AudioSource::System, timestamp_ms: ts, is_speech: true }
+    }
+
+    #[tokio::test]
+    async fn blank_credentials_fail_even_when_flux_starts_muted() {
+        let mut provider = DeepgramSTT::with_api_key(" \r\n\t ");
+        provider.set_config(DeepgramConfig {
+            model: "flux-general-en".into(),
+            ..DeepgramConfig::default()
+        });
+        provider.set_muted(true);
+        let (tx, _rx) = mpsc::channel(8);
+        let result = provider.start_stream(tx).await;
+        assert!(result.is_err(), "blank credentials must not report paused/ready");
+        assert!(!provider.is_streaming);
+        assert!(provider.result_tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_fail_without_startup_retries() {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = tokio_tungstenite::accept_hdr_async(socket, |_: &Request, _: Response| {
+                let mut reject = ErrorResponse::new(Some("synthetic invalid key".into()));
+                *reject.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+                Err(reject)
+            }).await;
+        });
+        let mut provider = DeepgramSTT::with_api_key("synthetic-invalid-key");
+        provider.url_override = Some(format!("ws://{address}/v1/listen"));
+        let (tx, _rx) = mpsc::channel(8);
+        let result = tokio::time::timeout(Duration::from_millis(500), provider.start_stream(tx)).await;
+        server.await.unwrap();
+        let error = result.expect("401 must not wait through retry backoff").unwrap_err();
+        assert!(error.to_string().contains("Invalid Deepgram API key"));
+        assert_eq!(provider.connection_state.load(Ordering::SeqCst), 3);
+        assert!(provider.result_tx.is_none());
     }
 
     /// The server dropped the session. The provider must

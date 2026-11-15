@@ -5,8 +5,8 @@
 //
 // Two modes:
 //   DirectMic   — SpeechRecognizer reads from the default mic device. feed_audio is a no-op.
-//   CustomStream — We push PCM chunks into a ring buffer for processing.
-//                  Used for loopback (system audio) transcription.
+//   CustomStream — Unsupported: the Windows WinRT API cannot accept PCM.
+//                  Use an existing local PCM engine for loopback audio.
 //
 // The Windows.Media.SpeechRecognition API provides built-in speech recognition
 // that ships with Windows 10/11. No downloads needed if the language pack is installed.
@@ -25,9 +25,23 @@ use crate::stt::provider::{STTProvider, STTProviderType, TranscriptResult};
 pub enum SapiInputMode {
     /// SpeechRecognizer reads from the system default microphone directly.
     DirectMic,
-    /// We feed PCM chunks via a channel; processed via energy-based VAD
-    /// with real SAPI recognition when available.
+    /// PCM input is not supported by the WinRT recognizer.
     CustomStream,
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn custom_pcm_is_not_a_transcription_engine() {
+        let mut provider = WindowsNativeSTT::for_custom_stream();
+        let (tx, _rx) = mpsc::channel(8);
+        let result = provider.start_stream(tx).await;
+        provider.stop_stream().await.unwrap();
+        assert!(result.is_err(), "energy detection must not be advertised as transcription");
+        assert!(!provider.is_streaming);
+    }
 }
 
 /// Windows Native STT provider using Windows.Media.SpeechRecognition.
@@ -137,6 +151,11 @@ impl STTProvider for WindowsNativeSTT {
         if self.is_streaming {
             return Err("Stream already active".into());
         }
+        if self.input_mode == SapiInputMode::CustomStream {
+            return Err("Windows Speech cannot transcribe system/PCM audio. Select an installed local STT model for this party in Settings → Meeting Audio.".into());
+        }
+        #[cfg(not(target_os = "windows"))]
+        return Err("Windows Speech is only available on Windows. Select an installed local STT engine.".into());
 
         log::info!(
             "WindowsNativeSTT: Starting stream (mode: {:?}, language: {})",
@@ -149,7 +168,7 @@ impl STTProvider for WindowsNativeSTT {
 
         // Create the audio feed channel for CustomStream mode
         let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
-        self.audio_tx = Some(audio_tx);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         // Clone values for the recognition thread
         let stop_flag = Arc::clone(&self.stop_flag);
@@ -171,9 +190,24 @@ impl STTProvider for WindowsNativeSTT {
                     result_tx_clone,
                     app_handle,
                     party,
+                    ready_tx,
                 );
             })?;
 
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            outcome => {
+                drop(audio_tx);
+                let _ = recognizer_thread.join();
+                let message = match outcome {
+                    Ok(Err(message)) => message,
+                    Err(_) => "Windows Speech worker ended before becoming ready".into(),
+                    Ok(Ok(())) => unreachable!(),
+                };
+                return Err(message.into());
+            }
+        }
+        self.audio_tx = Some(audio_tx);
         self.recognizer_thread = Some(recognizer_thread);
         self.result_tx = Some(result_tx);
         self.is_streaming = true;
@@ -324,7 +358,7 @@ fn emit_thread_status(app_handle: &Option<tauri::AppHandle>, party: &str, status
 /// Main function running on the dedicated recognition thread.
 ///
 /// On Windows, attempts to use Windows.Media.SpeechRecognition API.
-/// Falls back to energy-based speech detection if the API is unavailable.
+/// Never replaces failed recognition with energy-only placeholder transcripts.
 fn recognition_thread_main(
     stop_flag: Arc<AtomicBool>,
     language: String,
@@ -333,27 +367,38 @@ fn recognition_thread_main(
     result_tx: mpsc::Sender<TranscriptResult>,
     app_handle: Option<tauri::AppHandle>,
     party: String,
+    ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) {
     log::info!("Recognition thread started (mode: {:?})", input_mode);
+    let mut ready_tx = Some(ready_tx);
 
     #[cfg(target_os = "windows")]
     {
         // Try Windows.Media.SpeechRecognition for DirectMic mode
         if input_mode == SapiInputMode::DirectMic {
-            if run_windows_speech_recognizer(&stop_flag, &language, &result_tx, &app_handle, &party) {
+            if run_windows_speech_recognizer(&stop_flag, &language, &result_tx, &app_handle, &party, &mut ready_tx) {
                 log::info!("WindowsNativeSTT: Windows Speech Recognizer completed");
                 emit_thread_status(&app_handle, &party, "disconnected", None);
                 return;
             }
             // Don't emit another generic error here — run_windows_speech_recognizer
             // already emits specific errors at each failure point.
-            log::warn!("WindowsNativeSTT: Windows Speech Recognizer unavailable, falling back to energy detection");
+            log::warn!("WindowsNativeSTT: Windows Speech Recognizer unavailable");
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(Err("Windows Speech could not start. Check microphone permission, speech privacy consent and the installed speech language in Windows Settings.".into()));
+            }
+            return;
         }
     }
 
-    // CustomStream mode or fallback: use energy-based detection
-    emit_thread_status(&app_handle, &party, "connected", Some("Energy-based detection active".to_string()));
-    energy_detection_with_accumulation(stop_flag, input_mode, audio_rx, result_tx);
+    // No other path here performs speech recognition.
+    let _ = (stop_flag, language, input_mode, audio_rx, result_tx);
+    emit_thread_status(&app_handle, &party, "error", Some(
+        "Windows Speech cannot recognize this audio source. Select an installed local STT engine.".into(),
+    ));
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = ready_tx.send(Err("Windows Speech cannot recognize this audio source.".into()));
+    }
 }
 
 /// Run the Windows.Media.SpeechRecognition continuous recognizer (DirectMic mode only).
@@ -365,6 +410,7 @@ fn run_windows_speech_recognizer(
     result_tx: &mpsc::Sender<TranscriptResult>,
     app_handle: &Option<tauri::AppHandle>,
     party: &str,
+    ready_tx: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> bool {
     use windows::core::HSTRING;
     use windows::Foundation::TypedEventHandler;
@@ -692,6 +738,11 @@ fn run_windows_speech_recognizer(
     }
 
     log::info!("WindowsNativeSTT: Continuous recognition started — listening for speech...");
+    if let Some(ready_tx) = ready_tx.take() {
+        if ready_tx.send(Ok(())).is_err() {
+            stop_flag.store(true, Ordering::SeqCst);
+        }
+    }
     emit_thread_status(app_handle, party, "connected",
         Some("Listening for speech (speak into your microphone)".to_string()));
 

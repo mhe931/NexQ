@@ -214,6 +214,15 @@ pub trait STTProvider: Send + Sync {
     /// Test whether the provider is available/configured correctly.
     async fn test_connection(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
 
+    /// Optional local-only file diagnostic. Does not open capture devices,
+    /// emit live-meeting transcripts, or contact a cloud provider.
+    async fn transcribe_pcm(
+        &mut self,
+        _samples: Vec<i16>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Err("This engine does not support bounded file diagnostics. Select an installed Whisper.cpp model; no fallback was used.".into())
+    }
+
     /// Set the recognition language (e.g., "en-US", "es-ES").
     fn set_language(&mut self, language: &str);
 

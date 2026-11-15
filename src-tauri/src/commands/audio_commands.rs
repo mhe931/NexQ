@@ -134,6 +134,7 @@ pub async fn start_capture(
             .lock()
             .map_err(|_| "Audio state lock poisoned".to_string())?;
         let mgr = guard.get_or_insert_with(AudioCaptureManager::new);
+        mgr.set_status_reporter(crate::audio::capture_status::CaptureStatusReporter::new(app.clone()));
         mgr.start_capture(&mic_device_id, &system_device_id, false, tx)?;
         for warning in mgr.take_warnings() {
             let _ = app.emit("capture_warning", warning);
@@ -142,9 +143,9 @@ pub async fn start_capture(
 
     // ---- System Audio STT (for remote party in calls) ----
     // Mic transcription is handled by Web Speech API in the frontend.
-    // System audio (WASAPI loopback = other party in Zoom/Meet) needs a
-    // cloud STT provider (Deepgram/Whisper/Azure/Groq) configured in Settings.
-    // If no cloud provider is configured, system audio won't be transcribed.
+    // This legacy command only creates cloud providers for system PCM.
+    // Existing local PCM engines are supported by start_capture_per_party,
+    // not by this legacy single-router path.
     let system_stt: Option<Box<dyn STTProvider>> = {
         let stt_config = state.stt.as_ref().and_then(|stt_arc| {
             let router = stt_arc.lock().ok()?;
@@ -407,10 +408,7 @@ pub async fn start_capture(
 pub async fn stop_capture(app: AppHandle, keep_recording: Option<bool>) -> Result<(), String> {
     let state = app.state::<AppState>();
 
-    // Restore original default capture device if IPolicyConfig override was active
-    restore_default_device_if_overridden(&state, &app);
-
-    let recording_info = {
+    let processing_done = {
         let mut guard = state
             .audio
             .lock()
@@ -418,13 +416,24 @@ pub async fn stop_capture(app: AppHandle, keep_recording: Option<bool>) -> Resul
 
         match guard.as_mut() {
             Some(mgr) => {
-                let info = mgr.stop_capture(keep_recording.unwrap_or(false));
-                log::info!("Audio capture stopped via command");
-                info
+                // Keep the recorder open until the last buffered chunks are mixed.
+                mgr.stop_capture(true);
+                mgr.take_processing_completion()
             }
             None => return Err("No audio manager initialized".to_string()),
         }
     };
+    let shutdown_result = if let Some(done) = processing_done {
+        done.await.map_err(|_| "Audio/STT processing task ended unexpectedly during shutdown".to_string())
+    } else {
+        Ok(())
+    };
+    restore_default_device_if_overridden(&state, &app);
+    let recording_info = {
+        let mut guard = state.audio.lock().map_err(|_| "Audio state lock poisoned".to_string())?;
+        guard.as_mut().and_then(|mgr| mgr.stop_capture(keep_recording.unwrap_or(false)))
+    };
+    log::info!("Audio capture and STT stopped via command");
 
     // Store recording info for end_meeting to pick up.
     // The frontend calls stopCapture() then endMeeting() in sequence, so
@@ -441,7 +450,7 @@ pub async fn stop_capture(app: AppHandle, keep_recording: Option<bool>) -> Resul
         log::info!("Recording info stored for post-meeting pipeline");
     }
 
-    Ok(())
+    shutdown_result
 }
 
 /// Get current audio levels for UI meters.
@@ -536,6 +545,78 @@ pub async fn stop_audio_test(app: AppHandle) -> Result<bool, String> {
 #[command]
 pub async fn test_audio_device(device_id: String) -> Result<bool, String> {
     device_manager::test_device(&device_id)
+}
+
+/// Transcribe an explicitly selected <=30-second PCM WAV with the selected
+/// party's installed local engine. Never captures devices, records audio,
+/// downloads models, writes settings, or uses a cloud/model fallback.
+#[command]
+pub async fn test_stt_transcription(
+    file_path: String,
+    party: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let (party_key, party_role) = match party.as_str() {
+        "You" | "you" => ("you", "You"),
+        "Them" | "them" => ("them", "Them"),
+        _ => return Err("Party must be You or Them".into()),
+    };
+    let state = app.state::<AppState>();
+    {
+        let audio = state.audio.lock().map_err(|_| "Audio state lock poisoned".to_string())?;
+        if audio.as_ref().is_some_and(|manager| manager.is_capturing()) {
+            return Err("Pause listening before testing file transcription".into());
+        }
+    }
+    let saved = crate::commands::settings_commands::get_config("meetingAudioConfig".into(), app.clone()).await?
+        .ok_or("Select a local STT engine and installed model in Meeting Audio before testing")?;
+    let saved: serde_json::Value = serde_json::from_str(&saved)
+        .map_err(|_| "Saved meeting audio configuration is invalid".to_string())?;
+    let config: crate::audio::PartyAudioConfig = serde_json::from_value(
+        saved.get(party_key).cloned().ok_or("Selected party audio configuration is missing")?,
+    ).map_err(|_| "Selected party audio configuration is invalid".to_string())?;
+    // Windows Speech reads a microphone; Web Speech and cloud engines must not
+    // receive file audio. Other local engines lack a finite-file API for now.
+    if config.stt_provider != "whisper_cpp" {
+        return Err("File diagnostics currently require the selected party to use an installed Whisper.cpp model. No cloud or engine fallback was used.".into());
+    }
+    // Live capture may use another downloaded model of the same engine.
+    // A diagnostic must test exactly the selected model, never that fallback.
+    let model_id = config.local_model_id.as_deref().unwrap_or("base");
+    get_local_model_path(&state, &config.stt_provider, model_id)?;
+    let samples = tokio::task::spawn_blocking(move || read_diagnostic_wav(&file_path))
+        .await.map_err(|_| "WAV reading task failed".to_string())??;
+    let mut provider = create_stt_provider_for_party(&config, &state, &app, party_role, false).await?
+        .ok_or("Selected engine cannot transcribe file PCM")?;
+    let text = provider.transcribe_pcm(samples).await.map_err(|error| error.to_string())?;
+    if text.trim().is_empty() {
+        return Err("The local engine produced no transcript".into());
+    }
+    Ok(text)
+}
+
+fn read_diagnostic_wav(file_path: &str) -> Result<Vec<i16>, String> {
+    // Bound header scanning and allocation as well as the decoded duration.
+    let file = std::fs::File::open(file_path).map_err(|_| "Cannot open the selected WAV file".to_string())?;
+    let metadata = file.metadata().map_err(|_| "Cannot inspect the selected WAV file".to_string())?;
+    if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+        return Err("Select a regular PCM WAV file no larger than 16 MiB".into());
+    }
+    let mut reader = hound::WavReader::new(std::io::BufReader::new(file))
+        .map_err(|error| format!("Selected file is not a valid WAV: {}", error))?;
+    let spec = reader.spec();
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16
+        || !(1..=2).contains(&spec.channels) || !(8_000..=96_000).contains(&spec.sample_rate) {
+        return Err("Select a 16-bit PCM WAV with one or two channels and an 8–96 kHz sample rate".into());
+    }
+    let count = reader.len() as usize;
+    let max_samples = 30 * spec.sample_rate as usize * spec.channels as usize;
+    if count == 0 || count > max_samples || count % spec.channels as usize != 0 {
+        return Err("Select a non-empty WAV no longer than 30 seconds with complete PCM frames".into());
+    }
+    let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<_, _>>()
+        .map_err(|_| "The selected WAV contains invalid PCM samples".to_string())?;
+    Ok(crate::audio::resampler::resample(&samples, spec.sample_rate, 16_000, spec.channels))
 }
 
 /// Enable or disable audio recording to file.
@@ -887,6 +968,56 @@ fn sync_mute(provider: &mut Option<Box<dyn STTProvider>>, applied: &mut bool, fl
     }
 }
 
+fn emit_party_status(app: &AppHandle, party: &str, provider: &str, status: &str, message: Option<String>) {
+    let _ = app.emit("stt_connection_status", serde_json::json!({
+        "provider": provider,
+        "party": party,
+        "status": status,
+        "message": message,
+    }));
+}
+
+/// Preparing a party is independent: neither a factory nor a stream failure
+/// may abort the healthy party. Only Web Speech legitimately has no Rust provider.
+async fn start_party_stt(
+    created: Result<Option<Box<dyn STTProvider>>, String>,
+    muted: bool,
+    result_tx: mpsc::Sender<crate::stt::provider::TranscriptResult>,
+) -> Result<Option<Box<dyn STTProvider>>, String> {
+    use crate::stt::provider::STTProviderType;
+    let Some(mut provider) = created? else { return Ok(None) };
+    // REST providers only allocate buffers in start_stream. Validate credentials
+    // via their existing non-audio endpoint before calling that "ready".
+    if matches!(provider.provider_type(),
+        STTProviderType::WhisperApi | STTProviderType::AzureSpeech | STTProviderType::GroqWhisper
+    ) {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), provider.test_connection()).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Err("STT provider rejected the credentials or account. Check Settings → STT.".into()),
+            Ok(Err(error)) => return Err(format!("STT readiness check failed: {}", error)),
+            Err(_) => return Err("STT readiness check timed out after 10 s. Check your connection and try again.".into()),
+        }
+    }
+    provider.set_muted(muted);
+    provider.start_stream(result_tx).await.map_err(|error| error.to_string())?;
+    Ok(Some(provider))
+}
+
+async fn finish_transcript_task(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(mut task) = task {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::error!("STT result task failed during shutdown: {error}"),
+            Err(_) => {
+                // REST batches may retain senders; stale transcripts must not revive a resumed session.
+                task.abort();
+                let _ = task.await;
+                log::warn!("STT result draining timed out during shutdown");
+            }
+        }
+    }
+}
+
 /// Start per-party audio capture with independent STT pipelines.
 ///
 /// Each party (You / Them) independently selects:
@@ -914,23 +1045,13 @@ pub async fn start_capture_per_party(
 
     let state = app.state::<AppState>();
 
-    // If already capturing, stop first (allows mid-meeting hot-swap)
-    {
-        // Restore any previous IPolicyConfig override before hot-swap
-        restore_default_device_if_overridden(&state, &app);
-
-        let mut guard = state
-            .audio
-            .lock()
-            .map_err(|_| "Audio state lock poisoned".to_string())?;
-        if let Some(ref mut mgr) = *guard {
-            if mgr.is_capturing() {
-                log::info!("start_capture_per_party: stopping existing capture for hot-swap");
-                crate::stt::emit_stt_debug(&app, "info", "stt",
-                    "Hot-swap: stopping existing audio capture + STT providers");
-                mgr.stop_capture(true);
-            }
-        }
+    // A hot-swap waits for old providers and their status events to finish.
+    // Otherwise an old task can undo the new session's default-mic override.
+    let has_audio_manager = {
+        state.audio.lock().map_err(|_| "Audio state lock poisoned".to_string())?.is_some()
+    };
+    if has_audio_manager {
+        stop_capture(app.clone(), Some(true)).await?;
     }
 
     log::info!(
@@ -1049,32 +1170,54 @@ pub async fn start_capture_per_party(
         }));
     }
 
-    {
+    let capture_result = {
         let mut guard = state
             .audio
             .lock()
             .map_err(|_| "Audio state lock poisoned".to_string())?;
         let mgr = guard.get_or_insert_with(AudioCaptureManager::new);
+        mgr.set_status_reporter(crate::audio::capture_status::CaptureStatusReporter::new(app.clone()));
         log::info!(
             "AudioCaptureManager::start_capture mic='{}', system='{}'",
             mic_device, system_device
         );
-        mgr.start_capture(&mic_device, &system_device, system_is_input, tx)?;
+        let result = mgr.start_capture(&mic_device, &system_device, system_is_input, tx);
         for warning in mgr.take_warnings() {
             let _ = app.emit("capture_warning", warning);
         }
-    }
+        result.map(|()| mgr.captured_sources())
+    };
+    let (you_captured, them_captured) = match capture_result {
+        Ok(sources) => sources,
+        Err(error) => {
+            for (party, config) in [("You", &you), ("Them", &them)] {
+                if party != "You" || !skip_you_stt {
+                    emit_party_status(&app, party, &config.stt_provider, "error", Some(error.clone()));
+                }
+            }
+            restore_default_device_if_overridden(&state, &app);
+            return Err(error);
+        }
+    };
 
     // ── Create STT provider for "You" party (if not web_speech or skipped) ──
     let you_stt = if skip_you_stt {
         crate::stt::emit_stt_debug(&app, "info", "stt", "'You' STT skipped (in-person meeting)");
-        None
+        Ok(None)
     } else {
-        create_stt_provider_for_party(&you, &state, &app, "You").await?
+        if !you_captured || !you.is_input_device {
+            Err("The selected You audio source could not be captured as an input. Check Settings → Meeting Audio.".into())
+        } else {
+            create_stt_provider_for_party(&you, &state, &app, "You", true).await
+        }
     };
 
     // ── Create STT provider for "Them" party (if not web_speech) ──
-    let them_stt = create_stt_provider_for_party(&them, &state, &app, "Them").await?;
+    let them_stt = if them_captured {
+        create_stt_provider_for_party(&them, &state, &app, "Them", true).await
+    } else {
+        Err("The selected Them audio source could not be captured. Check Settings → Meeting Audio.".into())
+    };
 
     // Start STT streams
     let (you_stt_tx, mut you_stt_rx) =
@@ -1082,62 +1225,56 @@ pub async fn start_capture_per_party(
     let (them_stt_tx, mut them_stt_rx) =
         mpsc::channel::<crate::stt::provider::TranscriptResult>(256);
 
-    let mut you_stt_provider = you_stt;
-    let mut them_stt_provider = them_stt;
-
     // A party that's already muted (hot-swap, in-person) starts muted, so a
     // provider that bills for an open stream doesn't connect until unmute.
     let you_muted_at_start = state.you_muted.load(Ordering::Relaxed);
     let them_muted_at_start = state.them_muted.load(Ordering::Relaxed);
 
-    if let Some(ref mut provider) = you_stt_provider {
-        crate::stt::emit_stt_debug(&app, "info", "stt",
-            &format!("Starting 'You' STT ({})", you.stt_provider));
-        provider.set_muted(you_muted_at_start);
-        match provider.start_stream(you_stt_tx).await {
-            Ok(()) => {
-                log::info!("'You' party STT started ({})", you.stt_provider);
-                crate::stt::emit_stt_debug(&app, "info", "stt",
-                    &format!("'You' STT started: {}", you.stt_provider));
+    // Emit new startup states on every resume/hot-swap, before acknowledging
+    // capture. "connecting" is not a promise that transcription is working.
+    if skip_you_stt {
+        emit_party_status(&app, "You", &you.stt_provider, "paused", Some("You STT skipped for this meeting mode".into()));
+    } else {
+        emit_party_status(&app, "You", &you.stt_provider, "connecting", None);
+    }
+    emit_party_status(&app, "Them", &them.stt_provider, "connecting", None);
+    let (you_started, them_started) = tokio::join!(
+        start_party_stt(you_stt, you_muted_at_start, you_stt_tx),
+        start_party_stt(them_stt, them_muted_at_start, them_stt_tx),
+    );
+    let you_available = !skip_you_stt && you_started.is_ok();
+    let them_available = them_started.is_ok();
+    let mut providers = Vec::new();
+    for (party, config, started) in [("You", &you, you_started), ("Them", &them, them_started)] {
+        match started {
+            Ok(provider) => {
+                if provider.is_some() && matches!(config.stt_provider.as_str(), "whisper_cpp" | "ort_streaming" | "parakeet_tdt" | "sherpa_onnx") {
+                    // Offline sidecars load the model at the first batch, not here.
+                    if provider.as_ref().is_some_and(|p| p.provider_type() == crate::stt::provider::STTProviderType::OrtStreaming)
+                        || config.stt_provider == "whisper_cpp"
+                    {
+                        emit_party_status(&app, party, &config.stt_provider, "connected", None);
+                    }
+                }
+                providers.push(provider);
             }
-            Err(e) => {
-                log::warn!("Failed to start 'You' STT: {}", e);
-                crate::stt::emit_stt_debug(&app, "error", "stt",
-                    &format!("'You' STT failed to start: {}", e));
-                let _ = app.emit("stt_connection_status", serde_json::json!({
-                    "provider": you.stt_provider,
-                    "party": "You",
-                    "status": "error",
-                    "message": format!("Failed to start STT: {}", e)
-                }));
-                you_stt_provider = None;
+            Err(error) => {
+                crate::stt::emit_stt_debug(&app, "error", "stt", &format!("'{}' STT unavailable: {}", party, error));
+                emit_party_status(&app, party, &config.stt_provider, "error", Some(error));
+                providers.push(None);
             }
         }
     }
-
-    if let Some(ref mut provider) = them_stt_provider {
-        crate::stt::emit_stt_debug(&app, "info", "stt",
-            &format!("Starting 'Them' STT ({})", them.stt_provider));
-        provider.set_muted(them_muted_at_start);
-        match provider.start_stream(them_stt_tx).await {
-            Ok(()) => {
-                log::info!("'Them' party STT started ({})", them.stt_provider);
-                crate::stt::emit_stt_debug(&app, "info", "stt",
-                    &format!("'Them' STT started: {}", them.stt_provider));
-            }
-            Err(e) => {
-                log::warn!("Failed to start 'Them' STT: {}", e);
-                crate::stt::emit_stt_debug(&app, "error", "stt",
-                    &format!("'Them' STT failed to start: {}", e));
-                let _ = app.emit("stt_connection_status", serde_json::json!({
-                    "provider": them.stt_provider,
-                    "party": "Them",
-                    "status": "error",
-                    "message": format!("Failed to start STT: {}", e)
-                }));
-                them_stt_provider = None;
+    let mut them_stt_provider = providers.pop().unwrap();
+    let mut you_stt_provider = providers.pop().unwrap();
+    if !you_available && !them_available {
+        if let Ok(mut guard) = state.audio.lock() {
+            if let Some(mgr) = guard.as_mut() {
+                mgr.stop_capture(true);
             }
         }
+        restore_default_device_if_overridden(&state, &app);
+        return Err("Neither party has an available transcription pipeline. Check Meeting Audio/STT settings; typed Q&A is still available.".into());
     }
 
     // Unique session prefix to avoid segment ID collisions across mid-meeting restarts.
@@ -1152,7 +1289,7 @@ pub async fn start_capture_per_party(
     // Uses SegmentAccumulator for cloud providers (Deepgram, Groq, etc.)
     // Skips accumulator for web_speech (browser handles segmentation)
     // and whisper_cpp (dual-pass engine manages its own line breaking).
-    if you_stt_provider.is_some() {
+    let you_results_task = if you_stt_provider.is_some() {
         let stt_app = app.clone();
         let prefix = session_prefix.clone();
         let use_accumulator = you.stt_provider != "web_speech"
@@ -1163,7 +1300,7 @@ pub async fn start_capture_per_party(
         } else {
             None
         };
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             if let Some(pause_threshold) = pause_threshold {
                 // Accumulator path: merge same-speaker segments
                 use std::sync::atomic::Ordering;
@@ -1227,19 +1364,19 @@ pub async fn start_capture_per_party(
                     let _ = stt_app.emit(event_name, &payload);
                 }
             }
-        });
-    }
+        }))
+    } else { None };
 
     // Emit transcript events from "Them" STT (speaker = "Them")
     // Uses SegmentAccumulator to merge consecutive same-speaker segments
     // within the configurable pause threshold, producing longer lines.
-    if them_stt_provider.is_some() {
+    let them_results_task = if them_stt_provider.is_some() {
         let stt_app = app.clone();
         let prefix = session_prefix.clone();
         let intel_arc = app.state::<AppState>().intelligence.clone();
         let pause_threshold = app.state::<AppState>().pause_threshold_ms.clone();
         let mut tally = TranscriptTally::new("Them", &them.stt_provider);
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             use std::sync::atomic::Ordering;
             let threshold = pause_threshold.load(Ordering::Relaxed);
             let mut accumulator =
@@ -1298,8 +1435,8 @@ pub async fn start_capture_per_party(
                     }
                 }
             }
-        });
-    }
+        }))
+    } else { None };
 
     // Grab the recorder handle for WAV recording (with mic/system mixing)
     let recorder = {
@@ -1324,6 +1461,11 @@ pub async fn start_capture_per_party(
     }
 
     // Audio processing task: levels + recording + STT feed per party
+    let (processing_done_tx, processing_done_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut guard = state.audio.lock().map_err(|_| "Audio state lock poisoned".to_string())?;
+        guard.as_mut().ok_or("Audio manager not initialized")?.set_processing_completion(processing_done_rx);
+    }
     let app_handle = app.clone();
     tokio::spawn(async move {
         // Separate VAD instances per audio source — sharing one VAD across
@@ -1490,6 +1632,7 @@ pub async fn start_capture_per_party(
                                     crate::stt::emit_stt_debug(&app_handle, "error", "stt",
                                         &format!("'You' feed_audio error: {}", e));
                                     you_feed_error_emitted = true;
+                                    emit_party_status(&app_handle, "You", &you.stt_provider, "error", Some(format!("STT audio processing failed: {}", e)));
                                 }
                             }
                         }
@@ -1503,6 +1646,7 @@ pub async fn start_capture_per_party(
                                     crate::stt::emit_stt_debug(&app_handle, "error", "stt",
                                         &format!("'Them' feed_audio error: {}", e));
                                     them_feed_error_emitted = true;
+                                    emit_party_status(&app_handle, "Them", &them.stt_provider, "error", Some(format!("STT audio processing failed: {}", e)));
                                 }
                             }
                         }
@@ -1518,6 +1662,7 @@ pub async fn start_capture_per_party(
                                     crate::stt::emit_stt_debug(&app_handle, "error", "stt",
                                         &format!("'Room' feed_audio error: {}", e));
                                     them_feed_error_emitted = true;
+                                    emit_party_status(&app_handle, "Them", &them.stt_provider, "error", Some(format!("STT audio processing failed: {}", e)));
                                 }
                             }
                         }
@@ -1556,6 +1701,12 @@ pub async fn start_capture_per_party(
                 }
             },
         );
+        drop(you_stt_provider);
+        drop(them_stt_provider);
+        tokio::join!(
+            finish_transcript_task(you_results_task),
+            finish_transcript_task(them_results_task),
+        );
 
         // Restore IPolicyConfig override if active (crash recovery for async task exit)
         {
@@ -1569,6 +1720,13 @@ pub async fn start_capture_per_party(
         }
 
         log::info!("Per-party audio processing task exiting");
+        if you_available && !you_feed_error_emitted {
+            emit_party_status(&app_handle, "You", &you.stt_provider, "disconnected", None);
+        }
+        if them_available && !them_feed_error_emitted {
+            emit_party_status(&app_handle, "Them", &them.stt_provider, "disconnected", None);
+        }
+        let _ = processing_done_tx.send(());
     });
 
     log::info!("Per-party audio capture started");
@@ -1586,6 +1744,7 @@ async fn create_stt_provider_for_party(
     state: &AppState,
     app: &AppHandle,
     party_role: &str,
+    allow_model_fallback: bool,
 ) -> Result<Option<Box<dyn STTProvider>>, String> {
     use crate::stt::provider::STTProviderType;
 
@@ -1600,11 +1759,18 @@ async fn create_stt_provider_for_party(
             config.local_model_id.as_deref().unwrap_or("n/a")));
 
     match stt_type {
-        STTProviderType::WebSpeech => Ok(None), // Frontend handles this
+        STTProviderType::WebSpeech => {
+            if !config.is_input_device {
+                return Err("Web Speech only hears the default microphone, not system audio. Select an installed local STT model for this party.".into());
+            }
+            Ok(None) // Frontend must report actual browser recognition readiness.
+        }
         STTProviderType::WhisperCpp => {
             let model_id = config.local_model_id.as_deref().unwrap_or("base");
             let model_result = get_local_model_path(state, "whisper_cpp", model_id)
-                .or_else(|_| find_any_downloaded_model(state, "whisper_cpp"));
+                .or_else(|error| if allow_model_fallback {
+                    find_any_downloaded_model(state, "whisper_cpp")
+                } else { Err(error) });
             match model_result {
                 Ok(model_path) => {
                     let lang = get_stt_language(state);
@@ -1619,21 +1785,20 @@ async fn create_stt_provider_for_party(
                          Download the model in Settings.",
                         e
                     );
-                    Ok(None)
+                    Err(format!("Whisper model unavailable: {}. Select or download a local model in Settings.", e))
                 }
             }
         }
         STTProviderType::WindowsNative => {
             use crate::stt::windows_native::WindowsNativeSTT;
+            if !config.is_input_device {
+                // WinRT cannot accept system PCM. Do not instantiate the old
+                // energy-only placeholder path as a transcription engine.
+                return Err("Windows Speech cannot transcribe system/PCM audio. Select an installed local PCM STT model for this party.".into());
+            }
             let lang = get_stt_language(state);
-            let mut provider = if config.is_input_device {
-                // IPolicyConfig already overrides system default to the selected device,
-                // so DirectMic mode correctly captures from non-default devices too
-                WindowsNativeSTT::for_mic()
-            } else {
-                // System audio: feed PCM from pipeline
-                WindowsNativeSTT::for_custom_stream()
-            };
+            // IPolicyConfig selects the OS default mic before this provider starts.
+            let mut provider = WindowsNativeSTT::for_mic();
             provider.set_language(&lang);
             provider.set_app_handle(app.clone());
             provider.set_party(party_role);
@@ -1641,7 +1806,7 @@ async fn create_stt_provider_for_party(
         }
         STTProviderType::Deepgram => {
             let lang = get_stt_language(state);
-            let key = get_credential_key(state, "deepgram");
+            let key = get_credential_key(state, "deepgram")?;
             log::info!("Deepgram key for '{}': {}", party_role, if key.is_some() { "present" } else { "MISSING" });
             let dg_config = get_deepgram_config(state);
             let mut p = match key.as_deref() {
@@ -1656,7 +1821,7 @@ async fn create_stt_provider_for_party(
         }
         STTProviderType::WhisperApi => {
             let lang = get_stt_language(state);
-            let key = get_credential_key(state, "whisper_api");
+            let key = get_credential_key(state, "whisper_api")?;
             log::info!("WhisperApi key for '{}': {}", party_role, if key.is_some() { "present" } else { "MISSING" });
             let mut p = match key.as_deref() {
                 Some(k) => crate::stt::whisper_api::WhisperApiSTT::with_api_key(k),
@@ -1667,8 +1832,8 @@ async fn create_stt_provider_for_party(
         }
         STTProviderType::AzureSpeech => {
             let lang = get_stt_language(state);
-            let key = get_credential_key(state, "azure_speech");
-            let region = get_credential_key(state, "azure_speech_region");
+            let key = get_credential_key(state, "azure_speech")?;
+            let region = get_credential_key(state, "azure_speech_region")?;
             log::info!("Azure key for '{}': {}, region: {}", party_role,
                 if key.is_some() { "present" } else { "MISSING" },
                 if region.is_some() { "present" } else { "MISSING" });
@@ -1681,7 +1846,7 @@ async fn create_stt_provider_for_party(
         }
         STTProviderType::GroqWhisper => {
             let lang = get_stt_language(state);
-            let key = get_credential_key(state, "groq_whisper");
+            let key = get_credential_key(state, "groq_whisper")?;
             log::info!("Groq key for '{}': {}", party_role, if key.is_some() { "present" } else { "MISSING" });
             let mut p = match key.as_deref() {
                 Some(k) => crate::stt::groq_whisper::GroqWhisperSTT::with_api_key(k),
@@ -1697,7 +1862,7 @@ async fn create_stt_provider_for_party(
         }
         STTProviderType::Cartesia => {
             let lang = get_stt_language(state);
-            let key = get_credential_key(state, "cartesia");
+            let key = get_credential_key(state, "cartesia")?;
             log::info!("Cartesia key for '{}': {}", party_role, if key.is_some() { "present" } else { "MISSING" });
             let mut p = match key.as_deref() {
                 Some(k) => crate::stt::cartesia::CartesiaSTT::with_api_key(k),
@@ -1749,12 +1914,13 @@ async fn create_stt_provider_for_party(
                                 );
                                 p.set_language(&lang);
                                 p.set_app_handle(app.clone());
+                                p.set_party(party_role);
                                 Ok(Some(Box::new(p)))
                             }
                             None => {
                                 crate::stt::emit_stt_debug(app, "error", "stt",
                                     &format!("[{}] {}", party_role, missing_offline_binary(state)));
-                                Ok(None)
+                                Err(missing_offline_binary(state))
                             }
                         }
                     } else {
@@ -1765,6 +1931,8 @@ async fn create_stt_provider_for_party(
                         let mut p = crate::stt::ort_streaming::OrtStreamingSTT::new(model_dir);
                         p.set_language(&lang);
                         p.set_app_handle(app.clone());
+                        p.set_party(party_role);
+                        p.set_status_provider(&config.stt_provider);
                         Ok(Some(Box::new(p)))
                     }
                 }
@@ -1772,7 +1940,7 @@ async fn create_stt_provider_for_party(
                     crate::stt::emit_stt_debug(app, "error", "stt",
                         &format!("[{}] SherpaOnnx model '{}' not found: {}. Download in Settings.",
                             party_role, model_id, e));
-                    Ok(None)
+                    Err(format!("Sherpa model '{}' unavailable: {}. Select or download a local model in Settings.", model_id, e))
                 }
             }
         }
@@ -1788,13 +1956,15 @@ async fn create_stt_provider_for_party(
                     let mut p = crate::stt::ort_streaming::OrtStreamingSTT::new(model_dir);
                     p.set_language(&lang);
                     p.set_app_handle(app.clone());
+                    p.set_party(party_role);
+                    p.set_status_provider(&config.stt_provider);
                     Ok(Some(Box::new(p)))
                 }
                 Err(e) => {
                     crate::stt::emit_stt_debug(app, "error", "stt",
                         &format!("[{}] ORT model '{}' not found: {}. Download in Settings.",
                             party_role, model_id, e));
-                    Ok(None)
+                    Err(format!("ORT model '{}' unavailable: {}. Select or download a local model in Settings.", model_id, e))
                 }
             }
         }
@@ -1813,7 +1983,9 @@ async fn create_stt_provider_for_party(
                 &format!("[{}] Parakeet TDT: looking for model '{}' (local_model_id={:?})",
                     party_role, model_id, config.local_model_id));
             let model_result = get_local_model_path(state, "parakeet_tdt", model_id)
-                .or_else(|_| find_any_downloaded_model(state, "parakeet_tdt"));
+                .or_else(|error| if allow_model_fallback {
+                    find_any_downloaded_model(state, "parakeet_tdt")
+                } else { Err(error) });
             match model_result {
                 Ok(model_dir) => {
                     let lang = get_stt_language(state);
@@ -1827,6 +1999,8 @@ async fn create_stt_provider_for_party(
                         let mut p = crate::stt::ort_streaming::OrtStreamingSTT::new(model_dir);
                         p.set_language(&lang);
                         p.set_app_handle(app.clone());
+                        p.set_party(party_role);
+                        p.set_status_provider(&config.stt_provider);
                         Ok(Some(Box::new(p)))
                     } else {
                         // CTC model (e.g., 110M) → use offline sidecar
@@ -1846,19 +2020,20 @@ async fn create_stt_provider_for_party(
                                         );
                                         p.set_language(&lang);
                                         p.set_app_handle(app.clone());
+                                        p.set_party(party_role);
                                         Ok(Some(Box::new(p)))
                                     }
                                     None => {
                                         crate::stt::emit_stt_debug(app, "error", "stt",
                                             &format!("[{}] {}", party_role, missing_offline_binary(state)));
-                                        Ok(None)
+                                        Err(missing_offline_binary(state))
                                     }
                                 }
                             }
                             Err(e) => {
                                 crate::stt::emit_stt_debug(app, "error", "stt",
                                     &format!("[{}] Parakeet model discovery failed: {}", party_role, e));
-                                Ok(None)
+                                Err(format!("Parakeet model discovery failed: {}", e))
                             }
                         }
                     }
@@ -1867,7 +2042,7 @@ async fn create_stt_provider_for_party(
                     crate::stt::emit_stt_debug(app, "error", "stt",
                         &format!("[{}] Parakeet model '{}' not found: {}. Download in Settings.",
                             party_role, model_id, e));
-                    Ok(None)
+                    Err(format!("Parakeet model '{}' unavailable: {}. Select or download a local model in Settings.", model_id, e))
                 }
             }
         }
@@ -1951,10 +2126,13 @@ fn get_stt_language(state: &AppState) -> String {
 /// Read an API key directly from the credential store (Windows Credential Manager).
 /// This bypasses the STTRouter, which only has keys when set_stt_provider() was called.
 /// Per-party mode never calls set_stt_provider(), so we read credentials directly.
-fn get_credential_key(state: &AppState, provider: &str) -> Option<String> {
-    state.credentials.as_ref()
-        .and_then(|cred_arc| cred_arc.lock().ok())
-        .and_then(|cred| cred.get_key(provider).ok().flatten())
+fn get_credential_key(state: &AppState, provider: &str) -> Result<Option<String>, String> {
+    let credentials = state.credentials.as_ref()
+        .ok_or("STT credential store is not initialized. Restart the application.")?
+        .lock().map_err(|_| "STT credential store lock failed".to_string())?;
+    let key = credentials.get_key(provider)
+        .map_err(|_| format!("Cannot read {} credentials. Check Settings → STT.", provider))?;
+    Ok(key.map(|key| key.trim().to_string()).filter(|key| !key.is_empty()))
 }
 
 /// Get the current Deepgram config from the STT router.
@@ -2150,6 +2328,107 @@ mod tests {
     use super::*;
     use crate::audio::{PartyAudioConfig, PartyRole};
     use crate::stt::provider::{TranscriptResult, TurnSignal};
+
+    #[tokio::test]
+    #[ignore = "requires NEXQ_TEST_WHISPER_MODEL and NEXQ_TEST_SPEECH_WAV containing approved public speech"]
+    async fn approved_speech_file_and_pcm_streams_produce_real_whisper_transcripts() {
+        let model = std::path::PathBuf::from(std::env::var("NEXQ_TEST_WHISPER_MODEL").expect("Select a downloaded Whisper model"));
+        let wav = std::env::var("NEXQ_TEST_SPEECH_WAV").expect("Select approved speech WAV");
+        let samples = read_diagnostic_wav(&wav).unwrap();
+        let mut file_provider = crate::stt::whisper_cpp::WhisperCppSTT::new(model.clone(), Arc::new(std::sync::RwLock::new(Default::default())));
+        file_provider.set_language("en-US");
+        let text = file_provider.transcribe_pcm(samples.clone()).await.unwrap();
+        assert!(text.to_lowercase().contains("contribution") && text.to_lowercase().contains("research"), "Test speech was not recognized");
+        assert!(file_provider.transcribe_pcm(vec![0; 32_000]).await.is_err(), "Silence must not invent a transcript");
+
+        // Both source contracts, without opening microphones/loopback or recording participants.
+        for source in [crate::audio::AudioSource::Mic, crate::audio::AudioSource::System] {
+            let mut provider = crate::stt::whisper_cpp::WhisperCppSTT::new(model.clone(), Arc::new(std::sync::RwLock::new(Default::default())));
+            provider.set_language("en-US");
+            let (tx, mut rx) = mpsc::channel(128);
+            provider.start_stream(tx).await.unwrap();
+            let mut pcm = samples.clone();
+            pcm.extend(vec![0; 80_000]);
+            for (index, chunk) in pcm.chunks(3_200).enumerate() {
+                provider.feed_audio(crate::audio::AudioChunk {
+                    pcm_data: chunk.to_vec(), source: source.clone(),
+                    timestamp_ms: index as u64 * 200, is_speech: true,
+                }).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let recognized = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                while let Some(result) = rx.recv().await {
+                    let text = result.text.to_lowercase();
+                    if text.contains("contribution") && text.contains("research") { return true; }
+                }
+                false
+            }).await.unwrap_or(false);
+            provider.stop_stream().await.unwrap();
+            assert!(recognized, "Selected Whisper stream did not recognize the approved question");
+        }
+    }
+
+    struct ReadinessProvider {
+        provider_type: crate::stt::provider::STTProviderType,
+        valid_credentials: bool,
+        fail_start: bool,
+        started: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl STTProvider for ReadinessProvider {
+        fn provider_name(&self) -> &str { "Synthetic readiness provider" }
+        fn provider_type(&self) -> crate::stt::provider::STTProviderType { self.provider_type.clone() }
+        async fn start_stream(&mut self, _tx: mpsc::Sender<TranscriptResult>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail_start { return Err("Synthetic startup failure".into()) }
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn feed_audio(&mut self, _chunk: crate::audio::AudioChunk) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn stop_stream(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn test_connection(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> { Ok(self.valid_credentials) }
+        fn set_language(&mut self, _language: &str) {}
+    }
+
+    fn readiness_provider(provider_type: crate::stt::provider::STTProviderType, valid_credentials: bool, fail_start: bool) -> (Box<dyn STTProvider>, Arc<AtomicBool>) {
+        let started = Arc::new(AtomicBool::new(false));
+        (Box::new(ReadinessProvider { provider_type, valid_credentials, fail_start, started: started.clone() }), started)
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_does_not_abort_the_other_party() {
+        use crate::stt::provider::STTProviderType;
+        let (you, you_started) = readiness_provider(STTProviderType::WhisperCpp, true, false);
+        let (you_tx, _you_rx) = mpsc::channel(8);
+        let (them_tx, _them_rx) = mpsc::channel(8);
+        let (you, them) = tokio::join!(
+            start_party_stt(Ok(Some(you)), false, you_tx),
+            start_party_stt(Err("Them model unavailable".into()), false, them_tx),
+        );
+        assert!(you.unwrap().is_some());
+        assert!(you_started.load(Ordering::SeqCst));
+        assert_eq!(them.err().as_deref(), Some("Them model unavailable"));
+    }
+
+    #[tokio::test]
+    async fn readiness_rejected_batch_credentials_never_start_a_stream() {
+        use crate::stt::provider::STTProviderType;
+        for provider_type in [STTProviderType::WhisperApi, STTProviderType::AzureSpeech, STTProviderType::GroqWhisper] {
+            let (provider, started) = readiness_provider(provider_type, false, false);
+            let (tx, _rx) = mpsc::channel(8);
+            assert!(start_party_stt(Ok(Some(provider)), false, tx).await.is_err());
+            assert!(!started.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_stream_error_is_not_a_frontend_only_party() {
+        let (provider, _started) = readiness_provider(crate::stt::provider::STTProviderType::WhisperCpp, true, true);
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(start_party_stt(Ok(Some(provider)), false, tx).await.is_err());
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(start_party_stt(Ok(None), false, tx).await.unwrap().is_none());
+    }
 
     fn output(turn: Option<TurnSignal>) -> AccumulatorOutput {
         AccumulatorOutput {

@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use super::resampler::resample;
 use super::{AudioChunk, AudioSource};
+use super::capture_status::StreamCaptureStatusReporter;
 
 /// Target sample rate for all audio output
 const TARGET_SAMPLE_RATE: u32 = 16000;
@@ -22,6 +23,15 @@ pub fn start_mic_capture(
     device_id: &str,
     tx: mpsc::Sender<AudioChunk>,
     source: AudioSource,
+) -> Result<Stream, String> {
+    start_mic_capture_with_status(device_id, tx, source, None)
+}
+
+pub fn start_mic_capture_with_status(
+    device_id: &str,
+    tx: mpsc::Sender<AudioChunk>,
+    source: AudioSource,
+    status: Option<StreamCaptureStatusReporter>,
 ) -> Result<Stream, String> {
     let device = super::device_manager::find_input_device(device_id)?;
 
@@ -43,8 +53,10 @@ pub fn start_mic_capture(
         sample_format
     );
 
-    let err_fn = |err: cpal::StreamError| {
+    let error_status = status.clone();
+    let err_fn = move |err: cpal::StreamError| {
         log::error!("Mic capture stream error: {}", err);
+        if let Some(status) = &error_status { status.stream_error(err); }
     };
 
     let stream = match sample_format {
@@ -97,9 +109,14 @@ pub fn start_mic_capture(
 
     stream
         .play()
-        .map_err(|e| format!("Failed to start mic stream: {}", e))?;
+        .map_err(|e| {
+            let message = format!("Failed to start mic stream: {}", e);
+            if let Some(status) = &status { status.error(&message); }
+            message
+        })?;
 
     log::info!("Mic capture started successfully");
+    if let Some(status) = status { status.active(format!("Capturing input '{}'", device_name)); }
     Ok(stream)
 }
 
@@ -109,6 +126,14 @@ pub fn start_mic_capture(
 pub fn start_mic_capture_dual(
     device_id: &str,
     tx: mpsc::Sender<AudioChunk>,
+) -> Result<Stream, String> {
+    start_mic_capture_dual_with_status(device_id, tx, None)
+}
+
+pub fn start_mic_capture_dual_with_status(
+    device_id: &str,
+    tx: mpsc::Sender<AudioChunk>,
+    status: Option<StreamCaptureStatusReporter>,
 ) -> Result<Stream, String> {
     let device = super::device_manager::find_input_device(device_id)?;
     let device_name = device.name().unwrap_or_else(|_| "unknown".into());
@@ -122,8 +147,10 @@ pub fn start_mic_capture_dual(
     let channels = config.channels();
     let sample_format = config.sample_format();
 
-    let err_fn = |err: cpal::StreamError| {
+    let error_status = status.clone();
+    let err_fn = move |err: cpal::StreamError| {
         log::error!("Dual capture stream error: {}", err);
+        if let Some(status) = &error_status { status.stream_error(err); }
     };
 
     let stream = match sample_format {
@@ -160,9 +187,14 @@ pub fn start_mic_capture_dual(
 
     stream
         .play()
-        .map_err(|e| format!("Failed to start dual stream: {}", e))?;
+        .map_err(|e| {
+            let message = format!("Failed to start dual stream: {}", e);
+            if let Some(status) = &status { status.error(&message); }
+            message
+        })?;
 
     log::info!("Dual-tagged capture started successfully");
+    if let Some(status) = status { status.active(format!("Capturing shared input '{}'", device_name)); }
     Ok(stream)
 }
 

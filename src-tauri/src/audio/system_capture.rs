@@ -10,6 +10,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use super::resampler::resample;
 use super::{AudioChunk, AudioSource};
+use super::capture_status::StreamCaptureStatusReporter;
 
 const TARGET_SAMPLE_RATE: u32 = 16000;
 
@@ -24,20 +25,30 @@ pub fn start_system_capture(
     start_system_capture_device(tx, stop_flag, None)
 }
 
-#[cfg(target_os = "macos")]
 pub fn start_system_capture_device(
     tx: mpsc::Sender<AudioChunk>,
     stop_flag: Arc<AtomicBool>,
     device_name: Option<String>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
-    macos::start(tx, stop_flag, device_name)
+    start_system_capture_device_with_status(tx, stop_flag, device_name, None)
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn start_system_capture_device(
+#[cfg(target_os = "macos")]
+pub fn start_system_capture_device_with_status(
     tx: mpsc::Sender<AudioChunk>,
     stop_flag: Arc<AtomicBool>,
     device_name: Option<String>,
+    status: Option<StreamCaptureStatusReporter>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    macos::start(tx, stop_flag, device_name, status)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn start_system_capture_device_with_status(
+    tx: mpsc::Sender<AudioChunk>,
+    stop_flag: Arc<AtomicBool>,
+    device_name: Option<String>,
+    status: Option<StreamCaptureStatusReporter>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     let label = device_name.as_deref().unwrap_or("default").to_string();
     log::info!("Starting system audio capture on: {}", label);
@@ -49,8 +60,10 @@ pub fn start_system_capture_device(
     let handle = std::thread::Builder::new()
         .name("system-audio-capture".into())
         .spawn(move || {
-            if let Err(e) = run_cpal_loopback(tx, stop_flag, device_name, &ready_tx) {
+            let runtime_status = status.clone();
+            if let Err(e) = run_cpal_loopback(tx, stop_flag, device_name, &ready_tx, status) {
                 log::error!("System audio capture failed: {}", e);
+                if let Some(status) = &runtime_status { status.error(&e); }
                 let _ = ready_tx.send(Err(e));
             }
         })
@@ -80,6 +93,7 @@ fn run_cpal_loopback(
     stop_flag: Arc<AtomicBool>,
     device_name: Option<String>,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
+    status: Option<StreamCaptureStatusReporter>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
 
@@ -99,9 +113,9 @@ fn run_cpal_loopback(
         match found {
             Some(d) => d,
             None => {
-                log::warn!("Output device '{}' not found, using default", name);
-                host.default_output_device()
-                    .ok_or_else(|| "No default output device".to_string())?
+                // The manager owns fallback and reports the chosen device's
+                // failure separately from the default output becoming active.
+                return Err(format!("Output device '{}' not found", name));
             }
         }
     } else {
@@ -121,8 +135,10 @@ fn run_cpal_loopback(
     let sample_format = config.sample_format();
     log::info!("System capture: {}Hz, {}ch, {:?}", sample_rate, channels, sample_format);
 
-    let err_fn = |err: cpal::StreamError| {
+    let error_status = status.clone();
+    let err_fn = move |err: cpal::StreamError| {
         log::error!("System capture error: {}", err);
+        if let Some(status) = &error_status { status.stream_error(err); }
     };
 
     let stop = stop_flag.clone();
@@ -169,6 +185,7 @@ fn run_cpal_loopback(
 
     stream.play().map_err(|e| format!("Failed to play loopback stream: {}", e))?;
     log::info!("System audio loopback ACTIVE on '{}'", actual_name);
+    if let Some(status) = status { status.active(format!("Capturing output '{}'", actual_name)); }
     let _ = ready.send(Ok(()));
 
     // Keep stream alive until stop flag

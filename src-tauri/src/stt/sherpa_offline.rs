@@ -65,6 +65,8 @@ pub struct SherpaOfflineSTT {
     segment_counter: Arc<AtomicU64>,
     /// Tauri app handle for debug events.
     app_handle: Option<AppHandle>,
+    party: String,
+    worker_failed: Arc<AtomicBool>,
 }
 
 impl SherpaOfflineSTT {
@@ -88,6 +90,8 @@ impl SherpaOfflineSTT {
             batch_thread: None,
             segment_counter: Arc::new(AtomicU64::new(0)),
             app_handle: None,
+            party: "Them".into(),
+            worker_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -97,6 +101,10 @@ impl SherpaOfflineSTT {
 
     pub fn set_app_handle(&mut self, handle: AppHandle) {
         self.app_handle = Some(handle);
+    }
+
+    pub fn set_party(&mut self, party: &str) {
+        self.party = party.to_string();
     }
 }
 
@@ -121,15 +129,16 @@ impl STTProvider for SherpaOfflineSTT {
             return Err("Stream already active".into());
         }
 
-        if !self.binary_path.exists() {
-            return Err(format!(
-                "sherpa-onnx-offline binary not found at: {}",
-                self.binary_path.display()
-            )
-            .into());
+        for (label, path) in [("offline recognizer binary", &self.binary_path), ("model", &self.model_path), ("tokens", &self.tokens_path)] {
+            let metadata = std::fs::metadata(path)
+                .map_err(|_| format!("Local STT {} is missing or unreadable: {}", label, path.display()))?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return Err(format!("Local STT {} is not a non-empty file: {}", label, path.display()).into());
+            }
         }
 
         self.stop_flag.store(false, AtomicOrdering::SeqCst);
+        self.worker_failed.store(false, AtomicOrdering::SeqCst);
 
         let (audio_tx, audio_rx) = std::sync::mpsc::channel::<AudioMessage>();
         self.audio_tx = Some(audio_tx);
@@ -142,6 +151,9 @@ impl STTProvider for SherpaOfflineSTT {
         let stop_flag = Arc::clone(&self.stop_flag);
         let segment_counter = Arc::clone(&self.segment_counter);
         let app_handle = self.app_handle.clone();
+        let party = self.party.clone();
+        let provider = self.provider_type.as_str().to_string();
+        let worker_failed = self.worker_failed.clone();
 
         // Working directory for DLL resolution
         let working_dir = binary_path
@@ -150,6 +162,18 @@ impl STTProvider for SherpaOfflineSTT {
             .to_path_buf();
 
         let batch_thread = std::thread::spawn(move || {
+            let status = |status: &str, message: Option<String>| {
+                if let Some(ref handle) = app_handle {
+                    let _ = tauri::Emitter::emit(handle, "stt_connection_status", serde_json::json!({
+                        "provider": provider, "party": party, "status": status, "message": message,
+                    }));
+                }
+            };
+            let fail = |message: String| {
+                worker_failed.store(true, AtomicOrdering::SeqCst);
+                status("error", Some(message));
+            };
+            let mut announced_ready = false;
             let batch_samples = (BATCH_SECONDS * SAMPLE_RATE as f32) as usize;
             let mut buffer: Vec<i16> = Vec::with_capacity(batch_samples);
             let mut segment_id = segment_counter.load(AtomicOrdering::Relaxed);
@@ -185,7 +209,9 @@ impl STTProvider for SherpaOfflineSTT {
 
                     if let Err(e) = write_wav(&wav_path, &chunk, SAMPLE_RATE) {
                         log::error!("SherpaOfflineSTT: Failed to write temp WAV: {}", e);
-                        continue;
+                        fail("Local STT could not prepare an audio batch.".into());
+                        let _ = std::fs::remove_file(&wav_path);
+                        break;
                     }
 
                     // Verify model file exists before calling sidecar
@@ -196,7 +222,8 @@ impl STTProvider for SherpaOfflineSTT {
                                 &format!("Model file missing: {}", model_path.display()));
                         }
                         let _ = std::fs::remove_file(&wav_path);
-                        continue;
+                        fail("The local STT model is no longer available.".into());
+                        break;
                     }
 
                     // Build CLI arguments — use separate --flag value pairs
@@ -264,7 +291,11 @@ impl STTProvider for SherpaOfflineSTT {
                                 }
                             }
 
-                            if !text.is_empty() {
+                            if !text.is_empty() && output.status.success() {
+                                if !announced_ready {
+                                    announced_ready = true;
+                                    status("connected", None);
+                                }
                                 let timestamp_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -322,6 +353,7 @@ impl STTProvider for SherpaOfflineSTT {
                             }
 
                             if !output.status.success() {
+                                fail(format!("Local STT recognizer failed ({}). Check the model and runtime files in Settings → STT.", output.status));
                                 let err = String::from_utf8_lossy(&output.stderr);
                                 log::warn!(
                                     "SherpaOfflineSTT: Process exited with {}: {}",
@@ -341,6 +373,7 @@ impl STTProvider for SherpaOfflineSTT {
                             }
                         }
                         Err(e) => {
+                            fail("Local STT recognizer could not run. Check the installed recognizer and runtime files in Settings → STT.".into());
                             log::error!(
                                 "SherpaOfflineSTT: Failed to run binary: {}",
                                 e
@@ -358,11 +391,14 @@ impl STTProvider for SherpaOfflineSTT {
 
                     // Clean up temp WAV
                     let _ = std::fs::remove_file(&wav_path);
+                    if worker_failed.load(AtomicOrdering::SeqCst) {
+                        break;
+                    }
                 }
             }
 
             // Process any remaining audio in the buffer
-            if !buffer.is_empty() && !stop_flag.load(AtomicOrdering::SeqCst) {
+            if !buffer.is_empty() && !stop_flag.load(AtomicOrdering::SeqCst) && !worker_failed.load(AtomicOrdering::SeqCst) {
                 let wav_path = std::env::temp_dir().join("nexq_offline_stt_final.wav");
                 if write_wav(&wav_path, &buffer, SAMPLE_RATE).is_ok() && model_path.exists() {
                     let model_flag = match model_type {
@@ -453,14 +489,20 @@ impl STTProvider for SherpaOfflineSTT {
         &mut self,
         chunk: AudioChunk,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.worker_failed.load(AtomicOrdering::SeqCst) {
+            return Err("Local STT batch worker failed. Check the model and runtime in Settings → STT.".into());
+        }
         if let Some(ref tx) = self.audio_tx {
-            let _ = tx.send(AudioMessage::Samples(chunk.pcm_data));
+            tx.send(AudioMessage::Samples(chunk.pcm_data))
+                .map_err(|_| "Local STT batch worker stopped")?;
         }
         Ok(())
     }
 
     async fn test_connection(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.binary_path.exists())
+        Ok([&self.binary_path, &self.model_path, &self.tokens_path].iter().all(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        }))
     }
 
     async fn stop_stream(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -556,6 +598,25 @@ pub fn find_offline_binary(models_base_dir: &std::path::Path) -> Option<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn readiness_missing_model_fails_before_batch_worker_starts() {
+        let dir = std::env::temp_dir().join(format!("nexq-sherpa-readiness-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join(OFFLINE_BINARY);
+        std::fs::write(&binary, b"synthetic binary, never executed").unwrap();
+        let mut provider = SherpaOfflineSTT::new(
+            binary, dir.join("missing.onnx"), dir.join("missing-tokens.txt"),
+            OfflineModelType::NemoCtc, STTProviderType::ParakeetTdt,
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        let result = provider.start_stream(tx).await;
+        let was_streaming = provider.is_streaming;
+        provider.stop_stream().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(result.is_err(), "the binary alone is not model readiness");
+        assert!(!was_streaming);
+    }
 
     #[test]
     fn finds_the_offline_program_under_its_platform_name() {
