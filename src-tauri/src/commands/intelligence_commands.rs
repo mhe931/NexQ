@@ -935,6 +935,7 @@ pub async fn generate_assist(
                 request_id: Some(request_id.clone()),
                 silent: false,
                 cancel: Some(cancel_token.clone()),
+                metadata_sink: None,
             },
             cancel: cancel_token.clone(),
         };
@@ -1064,6 +1065,7 @@ pub async fn generate_assist(
         request_id: Some(request_id),
         silent: false,
         cancel: Some(cancel_token.clone()),
+        metadata_sink: None,
     };
 
     // When Gemini cache is active, skip RAG entirely — no Ollama embed needed.

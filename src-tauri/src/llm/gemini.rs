@@ -16,6 +16,48 @@ pub struct GeminiClient {
     client: reqwest::Client,
 }
 
+/// Accumulate metadata for every SSE frame, including the final buffered
+/// frame. Text and metadata must not take different flush paths.
+#[derive(Default)]
+struct GeminiMetadata {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    grounding_sources: Vec<(String, String)>,
+}
+
+impl GeminiMetadata {
+    fn observe(&mut self, data: &serde_json::Value, enable_web_search: bool) {
+        if enable_web_search {
+            self.grounding_sources.extend(SSEParser::extract_gemini_grounding(data));
+        }
+        if let Some(usage) = data.get("usageMetadata") {
+            if let Some(tokens) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+                self.prompt_tokens = tokens;
+            }
+            if let Some(tokens) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+                self.completion_tokens = tokens;
+            }
+        }
+    }
+
+    fn finish(self, token_count: u64, latency_ms: u64) -> (CompletionStats, Vec<StreamSource>) {
+        // Preserve the existing chunk-count fallback when usage is absent.
+        let completion_tokens = if self.completion_tokens == 0 { token_count } else { self.completion_tokens };
+        let stats = CompletionStats {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens,
+            total_tokens: self.prompt_tokens + completion_tokens,
+            latency_ms,
+        };
+        let mut seen = std::collections::HashSet::new();
+        let sources = self.grounding_sources.into_iter()
+            .filter(|(_, url)| seen.insert(url.clone()))
+            .map(|(title, url)| StreamSource { title, url })
+            .collect();
+        (stats, sources)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -23,6 +65,45 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_KEY: &str = "nexq-unit-test-key-not-a-credential";
+
+    #[test]
+    fn grounding_and_usage_survive_an_unterminated_final_sse_frame() {
+        let mut buffer = LineBuffer::new();
+        let mut metadata = GeminiMetadata::default();
+        let frames = [
+            "data: {\"candidates\":[{\"groundingMetadata\":{\"groundingChunks\":[{\"web\":{\"title\":\"Public source\",\"uri\":\"https://example.com\"}}]}}]}\n\n",
+            "data: {\"usageMetadata\":{\"promptTokenCount\":17,\"candidatesTokenCount\":4},\"candidates\":[{\"groundingMetadata\":{\"groundingChunks\":[{\"web\":{\"title\":\"Duplicate\",\"uri\":\"https://example.com\"}},{\"web\":{\"title\":\"Final source\",\"uri\":\"https://example.org\"}}]}}]}",
+        ];
+        for frame in frames {
+            for line in buffer.push(frame) {
+                for data in SSEParser::parse_chunk(&line).into_iter().flatten() {
+                    metadata.observe(&data, true);
+                }
+            }
+        }
+        if let Some(remaining) = buffer.flush() {
+            for data in SSEParser::parse_chunk(&remaining).into_iter().flatten() {
+                metadata.observe(&data, true);
+            }
+        }
+        let (stats, sources) = metadata.finish(1, 23);
+        assert_eq!((stats.prompt_tokens, stats.completion_tokens, stats.total_tokens, stats.latency_ms), (17, 4, 21, 23));
+        assert_eq!(sources.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["Public source", "Final source"]);
+        let usage = crate::llm::provider::StreamUsage::from_stats(&stats).unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (17, 4));
+    }
+
+    #[test]
+    fn disabled_grounding_and_absent_usage_keep_existing_behavior() {
+        let mut metadata = GeminiMetadata::default();
+        metadata.observe(&json!({"candidates":[{"groundingMetadata":{"groundingChunks":[
+            {"web":{"title":"Public source","uri":"https://example.com"}}
+        ]}}]}), false);
+        let (stats, sources) = metadata.finish(3, 5);
+        assert!(sources.is_empty());
+        assert_eq!((stats.prompt_tokens, stats.completion_tokens, stats.total_tokens), (0, 3, 3));
+        assert!(crate::llm::provider::StreamUsage::from_stats(&stats).is_none());
+    }
 
     async fn server(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -333,9 +414,7 @@ impl LLMProvider for GeminiClient {
         let mut stream = response.bytes_stream();
         let mut line_buffer = LineBuffer::new();
         let mut token_count: u64 = 0;
-        let mut prompt_tokens: u64 = 0;
-        let mut completion_tokens: u64 = 0;
-        let mut grounding_sources: Vec<(String, String)> = Vec::new();
+        let mut metadata = GeminiMetadata::default();
 
         while let Some(chunk_result) = cancellable(&params, stream.next()).await? {
             check_cancelled(&params)?;
@@ -364,23 +443,7 @@ impl LLMProvider for GeminiClient {
                                 }
                             }
 
-                            if params.enable_web_search {
-                                grounding_sources.extend(SSEParser::extract_gemini_grounding(&data));
-                            }
-
-                            // Extract usage metadata if available
-                            if let Some(usage) = data.get("usageMetadata") {
-                                if let Some(pt) =
-                                    usage.get("promptTokenCount").and_then(|v| v.as_u64())
-                                {
-                                    prompt_tokens = pt;
-                                }
-                                if let Some(ct) =
-                                    usage.get("candidatesTokenCount").and_then(|v| v.as_u64())
-                                {
-                                    completion_tokens = ct;
-                                }
-                            }
+                            metadata.observe(&data, params.enable_web_search);
                         }
                         None => {
                             // [DONE] signal
@@ -395,6 +458,7 @@ impl LLMProvider for GeminiClient {
             let events = SSEParser::parse_chunk(&remaining);
             for event in events {
                 if let Some(data) = event {
+                    metadata.observe(&data, params.enable_web_search);
                     if let Some(token) = SSEParser::extract_gemini_token(&data) {
                         if !token.is_empty() {
                             token_count += 1;
@@ -408,25 +472,9 @@ impl LLMProvider for GeminiClient {
 
         let latency_ms = start.elapsed().as_millis() as u64;
 
-        if completion_tokens == 0 {
-            completion_tokens = token_count;
-        }
-        let total = prompt_tokens + completion_tokens;
+        let (stats, sources) = metadata.finish(token_count, latency_ms);
 
-        let stats = CompletionStats {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: total,
-            latency_ms,
-        };
-
-        if !grounding_sources.is_empty() {
-            let mut seen = std::collections::HashSet::new();
-            let sources: Vec<StreamSource> = grounding_sources
-                .into_iter()
-                .filter(|(_, url)| seen.insert(url.clone()))
-                .map(|(title, url)| StreamSource { title, url })
-                .collect();
+        if !sources.is_empty() {
             check_cancelled(&params)?;
             emit_sources(&app_handle, &params, sources);
         }

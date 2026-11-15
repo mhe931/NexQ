@@ -31,6 +31,11 @@ pub struct GenerationParams {
     /// `LLMError::Cancelled` once it fires. Never serialized.
     #[serde(skip)]
     pub cancel: Option<Arc<CancelToken>>,
+    /// In-process metadata for routed attempts. `silent` still suppresses
+    /// global events; this callback lets the publisher retain their metadata.
+    /// Ordinary silent probes/translations leave this unset.
+    #[serde(skip)]
+    pub metadata_sink: Option<MetadataSink>,
 }
 
 impl Default for GenerationParams {
@@ -43,6 +48,7 @@ impl Default for GenerationParams {
             request_id: None,
             silent: false,
             cancel: None,
+            metadata_sink: None,
         }
     }
 }
@@ -122,6 +128,35 @@ pub fn check_cancelled(params: &GenerationParams) -> Result<(), LLMError> {
 /// Callback that receives each streamed token for an in-process caller.
 pub type TokenSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Provider metadata, using the existing event payloads. Attempt errors/end
+/// events are staged by routing, never published before its decision.
+#[derive(Debug, Clone)]
+pub enum StreamMetadata {
+    Thinking,
+    Sources(Vec<StreamSource>),
+    End(StreamEndPayload),
+    Error(StreamErrorPayload),
+}
+
+#[derive(Clone)]
+pub struct MetadataSink(Arc<dyn Fn(StreamMetadata) + Send + Sync>);
+
+impl MetadataSink {
+    pub fn new(callback: impl Fn(StreamMetadata) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn emit(&self, event: StreamMetadata) {
+        (self.0)(event);
+    }
+}
+
+impl std::fmt::Debug for MetadataSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MetadataSink")
+    }
+}
+
 /// Where a streamed token is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -142,6 +177,18 @@ fn route_token(params: &GenerationParams, token: &str, sink: Option<&TokenSink>)
     } else {
         Route::Global
     }
+}
+
+/// The same routing rule as tokens, without AppHandle so silent/cancelled
+/// metadata delivery can be tested directly.
+pub(crate) fn route_metadata(params: &GenerationParams, event: &StreamMetadata) -> Route {
+    if is_cancelled(params) {
+        return Route::Sink;
+    }
+    if let Some(sink) = &params.metadata_sink {
+        sink.emit(event.clone());
+    }
+    if params.silent { Route::Sink } else { Route::Global }
 }
 
 /// Delivers one streamed token: to the sink, and as `llm_stream_token` unless the stream is silent.
@@ -170,19 +217,16 @@ pub fn emit_end_with_usage(
     latency_ms: u64,
     usage: Option<StreamUsage>,
 ) {
-    if params.silent {
-        return;
+    let payload = StreamEndPayload {
+        total_tokens,
+        latency_ms,
+        request_id: params.request_id.clone(),
+        cancelled: false,
+        usage,
+    };
+    if route_metadata(params, &StreamMetadata::End(payload.clone())) == Route::Global {
+        let _ = app.emit("llm_stream_end", payload);
     }
-    let _ = app.emit(
-        "llm_stream_end",
-        StreamEndPayload {
-            total_tokens,
-            latency_ms,
-            request_id: params.request_id.clone(),
-            cancelled: false,
-            usage,
-        },
-    );
 }
 
 /// [`emit_end`] for a provider that reports real prompt/completion counts in
@@ -200,7 +244,7 @@ pub fn emit_end_with_stats(app: &AppHandle, params: &GenerationParams, stats: &C
 /// Emits `llm_stream_thinking` for this request (nothing for silent
 /// streams): the model is thinking before its first words. Once per request.
 pub fn emit_thinking(app: &AppHandle, params: &GenerationParams) {
-    if params.silent {
+    if route_metadata(params, &StreamMetadata::Thinking) != Route::Global {
         return;
     }
     let _ = app.emit(
@@ -223,18 +267,18 @@ pub fn emit_error(app: &AppHandle, params: &GenerationParams, message: &str) {
 /// Emits a typed, sanitized failure, preserving its classification.
 pub fn emit_llm_error(app: &AppHandle, params: &GenerationParams, error: &LLMError) {
     // A stopped stream already got its cancelled end event; no error on top of it.
-    if params.silent || is_cancelled(params) || error.kind() == LLMFailureKind::Cancelled {
+    if is_cancelled(params) || error.kind() == LLMFailureKind::Cancelled {
         return;
     }
-    let _ = app.emit(
-        "llm_stream_error",
-        StreamErrorPayload::from_error(params, error),
-    );
+    let payload = StreamErrorPayload::from_error(params, error);
+    if route_metadata(params, &StreamMetadata::Error(payload.clone())) == Route::Global {
+        let _ = app.emit("llm_stream_error", payload);
+    }
 }
 
 /// Emits `llm_stream_sources` for this request (nothing for silent streams).
 pub fn emit_sources(app: &AppHandle, params: &GenerationParams, sources: Vec<StreamSource>) {
-    if params.silent {
+    if route_metadata(params, &StreamMetadata::Sources(sources.clone())) != Route::Global {
         return;
     }
     let _ = app.emit(
@@ -685,6 +729,57 @@ pub trait LLMProvider: Send + Sync {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn silent_metadata_reaches_its_sink_without_global_events() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let target = received.clone();
+        let params = GenerationParams {
+            silent: true,
+            request_id: Some("public-request".into()),
+            metadata_sink: Some(MetadataSink::new(move |event| target.lock().unwrap().push(event))),
+            ..Default::default()
+        };
+        let end = StreamMetadata::End(StreamEndPayload {
+            total_tokens: 12, latency_ms: 23, request_id: params.request_id.clone(),
+            cancelled: false, usage: Some(StreamUsage { input_tokens: 10, output_tokens: 2, ..Default::default() }),
+        });
+        for event in [
+            StreamMetadata::Thinking,
+            StreamMetadata::Sources(vec![StreamSource { title: "Public source".into(), url: "https://example.com".into() }]),
+            end,
+            StreamMetadata::Error(StreamErrorPayload::from_error(&params,
+                &LLMError::classified(LLMFailureKind::CreditsExhausted, "openai"))),
+        ] {
+            assert_eq!(route_metadata(&params, &event), Route::Sink);
+        }
+        let events = received.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[2], StreamMetadata::End(payload)
+            if payload.request_id.as_deref() == Some("public-request") && payload.usage.as_ref().unwrap().input_tokens == 10));
+        assert!(matches!(&events[3], StreamMetadata::Error(payload)
+            if payload.code == LLMFailureKind::CreditsExhausted && !payload.retryable));
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("metadata_sink").is_none());
+    }
+
+    #[test]
+    fn ordinary_silent_calls_and_cancelled_metadata_stay_silent() {
+        let silent = GenerationParams { silent: true, ..Default::default() };
+        assert_eq!(route_metadata(&silent, &StreamMetadata::Thinking), Route::Sink);
+        assert_eq!(route_metadata(&GenerationParams::default(), &StreamMetadata::Thinking), Route::Global);
+        let token = Arc::new(CancelToken::new());
+        let received = Arc::new(Mutex::new(0));
+        let target = received.clone();
+        let params = GenerationParams {
+            cancel: Some(token.clone()),
+            metadata_sink: Some(MetadataSink::new(move |_| *target.lock().unwrap() += 1)),
+            ..Default::default()
+        };
+        token.cancel();
+        assert_eq!(route_metadata(&params, &StreamMetadata::Thinking), Route::Sink);
+        assert_eq!(*received.lock().unwrap(), 0);
+    }
 
     #[test]
     fn credit_exhaustion_wins_over_http_429_and_is_never_retryable() {
