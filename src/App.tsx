@@ -238,6 +238,7 @@ function App() {
       "nexq:meeting_started",
       async (e) => {
         const { meeting, audioMode, aiScenario, profileId = null, listening = true, sttOverride = null } = e.payload;
+        useMeetingStore.setState({ sttOverride, listening });
         logToFile("info", "overlay", `Meeting started in overlay window (profile: ${profileId ?? "none"})`);
         const startedAt = Date.now();
         // A profile meeting shows the presenter view with its own slides/notes.
@@ -265,7 +266,7 @@ function App() {
           audioMode,
           aiScenario,
           profileId,
-          listening,
+          listening: useMeetingStore.getState().listening,
           sttOverride,
           isRecording: true,
           meetingStartTime: startedAt,

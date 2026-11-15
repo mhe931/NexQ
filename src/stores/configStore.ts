@@ -1040,7 +1040,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
             role: "You",
             device_id: micDeviceId ?? "default",
             is_input_device: true,
-            stt_provider: sttProvider ?? "web_speech",
+            stt_provider: "web_speech",
           },
           them: {
             role: "Them",
@@ -1073,7 +1073,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
             role: "You",
             device_id: "default",
             is_input_device: true,
-            stt_provider: sttProvider ?? "web_speech",
+            stt_provider: "web_speech",
           },
           them: {
             role: "Them",

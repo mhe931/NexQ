@@ -112,6 +112,8 @@ export interface StartMeetingOptions {
 async function startAudioCapture(resolvedMode: AudioMode, sttOverride: STTProviderType | null = null): Promise<boolean> {
   const config = useConfigStore.getState();
   try {
+    const { setRecordingEnabled } = await import("../lib/ipc");
+    await setRecordingEnabled(useMeetingStore.getState().profileId ? false : config.recordingEnabled);
     if (config.meetingAudioConfig) {
       const you = sttOverride ? { ...config.meetingAudioConfig.you, stt_provider: sttOverride } : config.meetingAudioConfig.you;
       const them = sttOverride ? { ...config.meetingAudioConfig.them, stt_provider: sttOverride } : config.meetingAudioConfig.them;
@@ -269,17 +271,21 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         }
       } catch { /* non-critical */ }
 
-      // 2. Sync recording toggle to backend before capture starts. A profile
-      // meeting never records audio automatically.
-      const config = useConfigStore.getState();
-      try {
-        const { setRecordingEnabled } = await import("../lib/ipc");
-        await setRecordingEnabled(options.profileId ? false : config.recordingEnabled);
-      } catch { /* non-critical */ }
+      const sttOverride = options.sttProvider ?? null;
+      set({ sttOverride, listening: false, profileId: options.profileId ?? null });
+      const { emit } = await import("@tauri-apps/api/event");
+      await emit("nexq:meeting_started", {
+        meeting,
+        audioMode: resolvedMode,
+        aiScenario: resolvedScenario,
+        profileId: options.profileId ?? null,
+        listening: false,
+        sttOverride,
+      });
 
       // 3. Start audio capture — use per-party config if available, else legacy.
       // A profile meeting may defer it until the user explicitly starts listening.
-      const listening = options.deferCapture ? false : await startAudioCapture(resolvedMode, options.sttProvider ?? null);
+      const listening = options.deferCapture ? false : await startAudioCapture(resolvedMode, sttOverride);
 
       // 4. Set meeting state
       const now = Date.now();
@@ -305,16 +311,11 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       // 6. Switch to overlay view
       set({ currentView: "overlay" });
 
-      // 7. Notify overlay Tauri window to initialize meeting UI
-      import("@tauri-apps/api/event").then(({ emit }) => {
-        emit("nexq:meeting_started", {
-          meeting,
-          audioMode: resolvedMode,
-          aiScenario: resolvedScenario,
-          profileId: options.profileId ?? null,
-          listening,
-          sttOverride: options.sttProvider ?? null,
-        }).catch(() => {});
+      await emit("nexq:listening_changed", { listening }).catch((error) => {
+        console.warn("[meetingStore] Listening status synchronization failed:", error);
+        import("./toastStore").then(({ showToast }) => {
+          showToast("Listening status could not sync between windows. Pause listening and retry.", "error");
+        });
       });
     } catch (err) {
       console.error("[meetingStore] Failed to start meeting:", err);

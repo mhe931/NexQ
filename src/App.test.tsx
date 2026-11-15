@@ -19,6 +19,7 @@ import { useMeetingStore } from "./stores/meetingStore";
 import { useScenarioStore } from "./stores/scenarioStore";
 import type { AIScenario } from "./lib/types";
 import { usePresenterStore } from "./stores/presenterStore";
+import { useLiveQAHealthStore } from "./stores/liveQAHealthStore";
 import { makeProfile } from "./test/profileFixtures";
 
 /** config.json, which both windows read and the launcher writes. */
@@ -90,6 +91,26 @@ describe("scenarios saved by another window", () => {
 });
 
 describe("a meeting started from a saved profile", () => {
+  it("retains startup STT errors and later capture updates while the overlay initializes", async () => {
+    await launchOverlayOn("team_meeting");
+    act(() => useLiveQAHealthStore.getState().reset());
+    await act(async () => {
+      const initialized = listeners.get("nexq:meeting_started")?.({
+        payload: {
+          meeting: { id: "meeting-2", title: "Rehearsal" }, audioMode: "online",
+          aiScenario: "team_meeting", profileId: "p1", listening: false, sttOverride: "whisper_cpp",
+        },
+      });
+      listeners.get("stt_connection_status")?.({
+        payload: { party: "Them", provider: "whisper_cpp", status: "error", message: "Selected model is missing" },
+      });
+      listeners.get("nexq:listening_changed")?.({ payload: { listening: true } });
+      await initialized;
+    });
+    expect(useLiveQAHealthStore.getState().stt.them).toMatchObject({ provider: "whisper_cpp", status: "error" });
+    expect(useMeetingStore.getState().listening).toBe(true);
+  });
+
   it("shows the presenter view instead of the classic overlay", async () => {
     await launchOverlayOn("team_meeting");
     await act(async () => {

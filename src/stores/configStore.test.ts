@@ -38,6 +38,18 @@ describe("configStore: Claude CLI config", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([false, true])("keeps legacy cloud selection on Them, without authorizing microphone transfer (devices: %s)", async (hasDevices) => {
+    saved.set("sttProvider", "deepgram");
+    if (hasDevices) {
+      saved.set("micDeviceId", "mic");
+      saved.set("systemDeviceId", "system");
+    }
+    const store = await freshStore();
+    await store.getState().loadConfig();
+    expect(store.getState().meetingAudioConfig?.you.stt_provider).toBe("web_speech");
+    expect(store.getState().meetingAudioConfig?.them.stt_provider).toBe("deepgram");
+  });
+
   it("preserves explicitly saved local STT providers and model choices without a cloud migration", async () => {
     const audio = {
       you: { role: "You", device_id: "mic", is_input_device: true, stt_provider: "whisper_cpp", local_model_id: "local-model" },
