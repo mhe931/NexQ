@@ -1,3 +1,4 @@
+pub mod app_commands;
 pub mod audio_commands;
 pub mod claude_cli_commands;
 pub mod context_commands;

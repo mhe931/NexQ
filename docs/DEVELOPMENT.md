@@ -178,6 +178,84 @@ Its default Conda location is
 `$HOME\Miniforge3\Scripts\conda.exe`; pass `-CondaExe` for another existing
 installation. The launcher does not override PowerShell execution policy.
 
+### Install NexQ for your user account
+
+`start-nexq.ps1` runs whatever sits in `src-tauri\target`, and any later
+`cargo build` / `cargo test` can silently replace `nexq.exe` there with a binary
+that lacks Tauri's `custom-protocol` feature. Such a binary has no bundled
+interface and loads `http://localhost:5173`, so double-clicking it shows
+*localhost refused to connect / ERR_CONNECTION_REFUSED*. Only `npx tauri build`
+produces a good executable. Never point a shortcut into `src-tauri\target`.
+
+`scripts\install-user.ps1` installs a verified build into a stable per-user folder
+and keeps the Desktop shortcut pointing at it. It needs no administrator rights,
+no network and no downloads (Windows PowerShell 5.1 and PowerShell 7):
+
+```powershell
+.\scripts\install-user.ps1 -Build      # build via scripts\native-env.ps1, then install
+.\scripts\install-user.ps1             # install the existing release build
+.\scripts\install-user.ps1 -WhatIf     # validate and show the plan, change nothing
+```
+
+After pulling updates, run `.\scripts\install-user.ps1 -Build` again: it
+rebuilds, replaces the installed files and repairs the shortcut, so it can never
+stay on an obsolete exe. Re-running is idempotent (identical files are left
+alone and a running NexQ is not interrupted).
+
+| Option | Meaning |
+|---|---|
+| `-Source <dir\|nexq.exe>` | Release folder or exe to install (default `src-tauri\target\x86_64-pc-windows-gnu\release`) |
+| `-Build` | Run `npx tauri build --no-bundle --target x86_64-pc-windows-gnu --config src-tauri\tauri.conda.conf.json '--' --locked` after `. .\scripts\native-env.ps1`, then install (`-CondaExe` selects another conda) |
+| `-InstallDir <dir>` | Default `%LOCALAPPDATA%\Programs\NexQ`. Drive roots, system/user folders, `src-tauri\target`, temp/session folders and `com.nexq.app` data folders are refused |
+| `-NoShortcut` | Install files only |
+| `-StartMenu` | Also create/update `NexQ.lnk` in the current user's Start Menu\Programs |
+| `-Force` | Reinstall identical files; adopt a non-empty folder this script did not create |
+| `-WhatIf` | Dry run (the `--self-test` validation still runs; nothing is written or stopped) |
+
+What it does, in order:
+
+1. **Validates before touching anything.** `nexq.exe` must exist, be larger than
+   1 MB and pass `nexq.exe --self-test` (run hidden; exit `0` = interface bundled,
+   `3` = developer build without UI, which is refused with the root-cause
+   explanation above).
+2. **Stages** `nexq.exe` and every DLL beside it (`libgcc_s_seh-1.dll`,
+   `libstdc++-6.dll`, `libwinpthread-1.dll`, `onnxruntime.dll`,
+   `WebView2Loader.dll`, the VC runtime DLLs) into `<InstallDir>\.staging`,
+   verifies hashes and re-runs `--self-test` on the staged copy.
+3. **Stops NexQ only if it runs from exactly the installed `nexq.exe`**
+   (`Get-CimInstance Win32_Process` matched on `ExecutablePath`, `Stop-Process -Id`,
+   then waits for exit). It never stops processes by name, and never touches other
+   apps or another NexQ copy (for example one run from `src-tauri\target`).
+4. **Swaps** the files in, moving the previous version to `<InstallDir>\previous`;
+   any failure restores it. It writes `nexq-install.json` (version, build time,
+   source path, SHA-256 of `nexq.exe` and of each file).
+5. **Creates or updates** `NexQ.lnk` on the real Desktop of the current user,
+   resolved with `[Environment]::GetFolderPath('Desktop')` (a OneDrive-redirected
+   Desktop works; nothing is created at `C:\Users\<you>\Desktop`). The shortcut
+   targets the installed `nexq.exe` directly (no PowerShell/cmd wrapper, no console
+   window), starts in `<InstallDir>`, and uses the exe's embedded icon (`nexq.exe,0`);
+   if the exe does not expose an icon, `icon.ico` is copied into `<InstallDir>`
+   and used instead.
+
+It never reads or writes `%APPDATA%\com.nexq.app` (database, models, settings).
+`scripts\uninstall-user.ps1` stops the installed copy by exact path, removes the
+shortcut(s) that point at it and the installed files, and keeps user data unless
+you pass `-RemoveUserData` (`-Force` also removes a `NexQ.lnk` that points
+elsewhere).
+
+Tauri's NSIS per-user installer (`installMode: currentUser`) is not used here:
+bundling it needs Tauri to download the NSIS toolchain, and no cached copy exists
+on this locked-down machine (`%LOCALAPPDATA%\tauri\NSIS` is absent and `makensis` is not
+installed); it was not attempted, so the script approach above is the offline path.
+
+Run the script's tests (no Pester required; they use only temp folders and a fake
+desktop):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-user.tests.ps1
+pwsh -NoProfile -File .\scripts\install-user.tests.ps1
+```
+
 Configure cloud providers in **Settings > LLM Providers**. Enter keys only in
 the app's masked fields, then use **Test Connection**, **Load Models**, and
 **Set as Active Provider**. Windows stores keys in the current user's Credential

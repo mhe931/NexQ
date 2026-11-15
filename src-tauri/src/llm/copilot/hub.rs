@@ -314,6 +314,9 @@ impl Default for Timeouts {
     }
 }
 
+/// How long [`CopilotHub::shutdown`] waits for the process slot.
+const SHUTDOWN_LOCK_WAIT: Duration = Duration::from_millis(800);
+
 /// Resolves the launch of the CLI; fails with `NotInstalled` when there is none.
 pub type Launcher = Arc<dyn Fn() -> Result<SpawnSpec, CopilotError> + Send + Sync>;
 
@@ -423,6 +426,24 @@ impl CopilotHub {
                 conn.kill();
                 Err(e.into())
             }
+        }
+    }
+
+    /// Stop the CLI process this hub started, if there is one (NexQ is quitting).
+    /// Only that child is ended — never another process, whatever its name — and
+    /// the hub would start a new one on the next request. Waits at most
+    /// [`SHUTDOWN_LOCK_WAIT`] for a handshake that is just starting.
+    pub async fn shutdown(&self) {
+        let live = match tokio::time::timeout(SHUTDOWN_LOCK_WAIT, self.live.lock()).await {
+            Ok(mut slot) => slot.take(),
+            Err(_) => {
+                log::warn!("copilot: a CLI process is still starting; leaving it to exit with its pipes");
+                None
+            }
+        };
+        if let Some(live) = live {
+            live.conn.kill();
+            log::info!("copilot: stopped the CLI process on exit");
         }
     }
 
@@ -672,6 +693,19 @@ mod tests {
 
     fn session_new(models: Value) -> Value {
         json!({"sessionId": "s-1", "models": {"availableModels": models, "currentModelId": "claude-sonnet-5.5"}})
+    }
+
+    #[test]
+    fn shutdown_without_a_process_starts_nothing_and_can_repeat() {
+        let hub = CopilotHub::new(Arc::new(|| {
+            Err(CopilotError::new(CopilotErrorKind::NotInstalled, "not installed"))
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            hub.shutdown().await;
+            hub.shutdown().await;
+        });
+        assert_eq!(hub.spawn_count(), 0);
     }
 
     #[test]

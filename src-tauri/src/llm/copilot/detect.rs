@@ -272,11 +272,15 @@ mod tests {
 
     #[test]
     fn login_launch_keeps_the_path_out_of_cmd() {
-        let bin = Path::new(r"C:\Users\Tom&Jerry 100%\AppData\copilot.exe");
-        let (dir, line) = login_launch(Some(bin));
-        assert_eq!(dir.as_deref(), Some(Path::new(r"C:\Users\Tom&Jerry 100%\AppData")));
-        assert_eq!(line, r#"/d /c start "Copilot login" cmd.exe /k .\copilot.exe login"#);
-        assert!(!line.contains('&') && !line.contains('%'));
+        // Backslash paths only split into a parent on Windows.
+        #[cfg(windows)]
+        {
+            let bin = Path::new(r"C:\Users\Tom&Jerry 100%\AppData\copilot.exe");
+            let (dir, line) = login_launch(Some(bin));
+            assert_eq!(dir.as_deref(), Some(Path::new(r"C:\Users\Tom&Jerry 100%\AppData")));
+            assert_eq!(line, r#"/d /c start "Copilot login" cmd.exe /k .\copilot.exe login"#);
+            assert!(!line.contains('&') && !line.contains('%'));
+        }
         let (dir, line) = login_launch(None);
         assert_eq!(dir, None);
         assert_eq!(line, r#"/d /c start "Copilot login" cmd.exe /k copilot login"#);

@@ -31,7 +31,28 @@ The installer uses NSIS and installs per-user (no admin rights required). The de
 After installation, NexQ starts automatically. You will see:
 
 - **Launcher window** (900x650) -- the main dashboard for managing meetings, settings, and history
-- **System tray icon** -- NexQ lives in your taskbar tray; closing the window hides it to tray rather than quitting. Click the icon to bring NexQ back
+- **System tray icon** -- gives quick access to meeting controls while NexQ runs. Closing the main window (the X, or `Alt+F4`) quits NexQ completely; the tray menu's **Quit** does the same
+
+### Closing NexQ
+
+Closing the main window ends the whole application, including the microphone and any helper programs NexQ started (the Claude and GitHub Copilot command-line tools). It takes a moment to release them, and never longer than about four seconds.
+
+- With nothing to lose, NexQ closes immediately.
+- If a meeting is running, or the meeting setup page has unsaved changes, NexQ asks first: **Save and quit** (ends the meeting and saves it, or saves the setup, then quits), **Quit without saving**, or **Cancel** (`Esc`) to keep working.
+- Closing the floating overlay with `Alt+F4` does not quit NexQ: the overlay hides and the main window comes back.
+- Starting NexQ again afterwards begins a clean session.
+
+### Install NexQ for your user account
+
+If you build NexQ from source (or cannot run the installer on a managed PC), you can install your own build without administrator rights, network access or downloads. From the NexQ folder in PowerShell run:
+
+```powershell
+.\scripts\install-user.ps1 -Build
+```
+
+This builds NexQ, checks that the program really contains its interface, copies it to `%LOCALAPPDATA%\Programs\NexQ` and puts a **NexQ** shortcut on your Desktop (your real Desktop, including a OneDrive-redirected one). Add `-StartMenu` for a Start Menu entry too. After you pull updates, run the same command again: it closes the running installed copy, replaces it, and fixes the shortcut if it pointed anywhere else. Your meetings, models and settings in `%APPDATA%\com.nexq.app` are never touched. To remove NexQ, run `.\scripts\uninstall-user.ps1` (your data is kept unless you add `-RemoveUserData`).
+
+If you ever see **"localhost refused to connect"** when starting NexQ, you launched a developer build that has no built-in interface. Re-run the command above and use the Desktop shortcut it creates. See [DEVELOPMENT.md](../DEVELOPMENT.md) for options and details.
 
 ## Quick Setup
 
