@@ -21,7 +21,7 @@ interface MeetingState {
   currentView: AppView;
   previousView: AppView | null;
   settingsOpen: boolean;
-  /** Tab the settings panel opens on next (cleared when it opens). */
+  /** Requested settings tab, cleared when the panel applies it. */
   settingsTab: string | null;
 
   // Active meeting

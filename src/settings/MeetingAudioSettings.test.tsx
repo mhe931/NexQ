@@ -29,8 +29,10 @@ vi.mock("../lib/ipc", async (importOriginal) => ({
 
 import { MeetingAudioSettings } from "./MeetingAudioSettings";
 import { STTSettings } from "./STTSettings";
+import { SettingsOverlay } from "./SettingsOverlay";
 import { AudioSetupStep } from "../components/wizard/AudioSetupStep";
 import { useConfigStore } from "../stores/configStore";
+import { useMeetingStore } from "../stores/meetingStore";
 
 const initialConfig: MeetingAudioConfig = {
   you: { role: "You", device_id: 'Studio: USB "Audio"', is_input_device: true, stt_provider: "deepgram" },
@@ -96,6 +98,15 @@ it("does not advertise provider catalog entries as operational STT readiness", a
   await act(async () => {});
   expect(screen.getByRole("button", { name: /Windows Speech/ })).not.toHaveTextContent("Ready");
   expect(screen.getByRole("button", { name: /Whisper.cpp/ })).not.toHaveTextContent("Batch mode only");
+});
+
+it("opens Audio & Devices from the transcription diagnostic while settings is already open", async () => {
+  useMeetingStore.setState({ currentView: "settings", previousView: "launcher", settingsTab: "stt", profileId: null, activeMeeting: null });
+  render(<SettingsOverlay />);
+  expect(screen.getByRole("tab", { name: "STT Providers" })).toHaveAttribute("aria-selected", "true");
+  await userEvent.setup().click(screen.getByRole("button", { name: "Audio & Devices" }));
+  await waitFor(() => expect(screen.getByRole("tab", { name: "Audio & Devices" })).toHaveAttribute("aria-selected", "true"));
+  expect(useMeetingStore.getState().previousView).toBe("launcher");
 });
 
 describe.each([
