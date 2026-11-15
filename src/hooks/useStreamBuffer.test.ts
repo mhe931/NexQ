@@ -28,6 +28,7 @@ import { useStreamBuffer } from "./useStreamBuffer";
 import { useStreamStore } from "../stores/streamStore";
 import { useConfigStore } from "../stores/configStore";
 import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
+import { useQuestionStore } from "../stores/questionStore";
 
 const start = (mode: string, request_id: string) =>
   handlers.start({ mode, model: "m", provider: "p", request_id });
@@ -52,6 +53,29 @@ describe("useStreamBuffer", () => {
     const state = useStreamStore.getState();
     expect(state.isStreaming).toBe(false);
     expect(state.responseHistory[0]?.content).toBe("Hello");
+  });
+
+  it("settles only the matching pending question when retrieval is cancelled before stream start", () => {
+    renderHook(() => useStreamBuffer());
+    const questions = useQuestionStore.getState();
+    questions.clear();
+    questions.addQuestion({ text: "Why?", source: "Them", confidence: 1, timestamp_ms: 1 }, "line");
+    questions.trackAnswer("line", "Why?", "pending");
+    act(() => {
+      useStreamStore.getState().setPending("AskQuestion", "pending");
+      handlers.handling({ request_id: "pending", status: "retrieving_context" });
+      handlers.end({ request_id: "other", cancelled: true, latency_ms: 0 });
+    });
+    expect(useStreamStore.getState().pendingRequestId).toBe("pending");
+    act(() => handlers.end({ request_id: "pending", cancelled: true, latency_ms: 0 }));
+    expect(useStreamStore.getState()).toMatchObject({
+      pendingRequestId: null, handlingStatus: null, phase: "idle", answerOutcome: "cancelled", error: null,
+    });
+    expect(useQuestionStore.getState().questions[0]).toMatchObject({
+      assisted: false, heldBack: true, answerRequestId: undefined, answerStatus: undefined,
+    });
+    act(() => useStreamStore.getState().setPending("AskQuestion", "retry"));
+    expect(useStreamStore.getState().pendingRequestId).toBe("retry");
   });
 
   it("shows thinking until the first words of its own stream", async () => {

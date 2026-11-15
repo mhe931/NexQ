@@ -17,4 +17,21 @@ describe("question answer outcomes", () => {
     store.settleAnswer("retry", "ready");
     expect(useQuestionStore.getState().questions[0]).toMatchObject({ answerStatus: "ready", assisted: true });
   });
+
+  it("clears the old answer outcome and request when a detected question is revised", () => {
+    const store = useQuestionStore.getState();
+    store.addQuestion({ text: "Why?", source: "Them", confidence: 1, timestamp_ms: 1 }, "line");
+    store.trackAnswer("line", "Why?", "old");
+    store.settleAnswer("old", "ready");
+    store.reviseLine("line", "Why is this useful?");
+    expect(useQuestionStore.getState().questions[0]).toMatchObject({
+      text: "Why is this useful?", assisted: false, answerStatus: undefined, answerRequestId: undefined,
+    });
+    store.trackAnswer("line", "Why is this useful?", "pending");
+    store.reviseLine("line", "Why is this better?");
+    store.settleAnswer("pending", "cancelled");
+    expect(useQuestionStore.getState().questions[0]).toMatchObject({
+      heldBack: false, assisted: false, answerStatus: undefined, answerRequestId: undefined,
+    });
+  });
 });

@@ -148,7 +148,7 @@ export const useQuestionStore = create<QuestionState>((set) => ({
   reviseLine: (segmentId, text) =>
     set((state) => ({
       questions: state.questions.map((q) =>
-        q.segmentId === segmentId ? { ...q, text, assisted: false, heldBack: false } : q),
+        q.segmentId === segmentId ? { ...q, text, assisted: false, heldBack: false, answerRequestId: undefined, answerStatus: undefined } : q),
     })),
 
   markTurnLine: (segmentId) => {

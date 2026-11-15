@@ -133,7 +133,7 @@ export function useStreamBuffer() {
     // Subscribe to stream end
     unlisteners.push(
       onStreamEnd((event) => {
-        if (!isActive(event.request_id)) return;
+        if (!isActive(event.request_id) && !(event.cancelled && event.request_id && useStreamStore.getState().pendingRequestId === event.request_id)) return;
         activeRequestId.current = null;
         // Flush any remaining buffered tokens immediately
         if (tokenBuffer.current.length > 0) {
