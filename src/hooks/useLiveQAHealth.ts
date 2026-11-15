@@ -41,8 +41,18 @@ export function useLiveQAHealth() {
   const servingDiffers = sameProvider && !!stream.currentProvider
     && (providerKey(stream.currentProvider) !== providerKey(stream.requestProvider ?? llmProvider)
       || (stream.requestModel !== null && stream.currentModel !== stream.requestModel));
-  const ai = servingDiffers && (baseAI.label === "Ready" || baseAI.label === "Answering")
-    ? { ...baseAI, label: `${baseAI.label} via ${stream.currentProvider}` } : baseAI;
+  const failure = observed.aiFailures[llmProvider];
+  const failedModel = failure?.model === llmModel;
+  const recovered = failedModel && sameProvider && !servingDiffers
+    && stream.answerOutcome === "ready" && stream.currentId !== failure.answerId
+    && providerKey(stream.currentProvider) === providerKey(llmProvider) && stream.currentModel === llmModel;
+  useEffect(() => {
+    if (recovered && failure) observed.clearAIFailure(llmProvider, failure);
+  }, [recovered, failure, llmProvider, observed.clearAIFailure]);
+  const ai = failedModel && !recovered && !servingDiffers && !stream.isStreaming && stream.phase === "idle"
+    ? aiHealth({ phase: "idle", isStreaming: false, error: failure.error, currentContent: "" })
+    : servingDiffers && (baseAI.label === "Ready" || baseAI.label === "Answering")
+      ? { ...baseAI, label: `${baseAI.label} via ${stream.currentProvider}` } : baseAI;
   return {
     audioMode,
     showYouAudio: audioMode === "online" || !!observed.audio.you?.status,

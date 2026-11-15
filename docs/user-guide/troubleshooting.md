@@ -160,8 +160,14 @@ Check API billing, or explicitly choose another configured provider in
 uses the existing official Copilot CLI and its separately authenticated
 account. Its model catalog and connection check do not prove chat entitlement:
 use **Test AI response** for a real, small public request without meeting
-documents. Once billing is corrected, an explicit retry or a successful
-response test clears the exhausted-credit block.
+documents. Draft credentials and inactive providers are diagnostic only:
+their successful test does not change the meeting's active AI health. Saved
+active settings are reapplied before testing the actual router. Once billing
+is corrected, an explicit retry or a successful active-router response test
+clears the exhausted-credit block. A stale test cannot clear a newer failure.
+If an active response test fails, AI health shows that failure independently
+of previously valid answers. Answer history stays available; a new successful
+response restores readiness.
 
 Automatic fallback still requires the meeting's existing consent and cost
 permissions. NexQ never treats a provider error as permission to send your

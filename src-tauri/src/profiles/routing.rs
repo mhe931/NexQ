@@ -134,6 +134,7 @@ struct Stats {
     rate_limited_until_ms: u64,
     credits_exhausted: bool,
     last_failure: Option<FailureKind>,
+    failure_revision: u64,
 }
 
 fn push(window: &mut VecDeque<u64>, v: u64) {
@@ -168,6 +169,7 @@ pub struct LatencySnapshot {
 #[derive(Debug, Default, Clone)]
 pub struct LatencyBook {
     stats: HashMap<ModelRef, Stats>,
+    failure_revision: u64,
 }
 
 impl LatencyBook {
@@ -181,7 +183,9 @@ impl LatencyBook {
     }
 
     pub fn record_failure(&mut self, who: &ModelRef, kind: FailureKind, now_ms: u64) {
+        self.failure_revision = self.failure_revision.saturating_add(1);
         let s = self.stats.entry(who.clone()).or_default();
+        s.failure_revision = self.failure_revision;
         s.consecutive_failures += 1;
         s.last_failure = Some(kind);
         if kind == FailureKind::RateLimited {
@@ -198,6 +202,13 @@ impl LatencyBook {
                 stats.credits_exhausted = false;
             }
         }
+    }
+
+    pub(crate) fn failure_revision(&self, provider: &str) -> u64 {
+        self.stats.iter()
+            .filter(|(who, _)| who.provider.eq_ignore_ascii_case(provider))
+            .map(|(_, stats)| stats.failure_revision)
+            .max().unwrap_or(0)
     }
 
     pub(crate) fn credits_exhausted(&self, provider: &str) -> bool {

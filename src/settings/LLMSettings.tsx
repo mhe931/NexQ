@@ -8,7 +8,7 @@ import {
   setLLMProvider,
   testLLMConnection,
   testLLMResponse,
-  clearProviderCreditFailure,
+  setClaudeCliConfig,
   storeApiKey,
   getApiKey,
   hasApiKey,
@@ -132,6 +132,7 @@ const DOT_STYLES: Record<BadgeVariant, string> = {
 export function LLMSettings() {
   const llmProvider = useConfigStore((s) => s.llmProvider);
   const llmModel = useConfigStore((s) => s.llmModel);
+  const lastModelByProvider = useConfigStore((s) => s.lastModelByProvider);
   const setConfigModel = useConfigStore((s) => s.setLLMModel);
   const activateLLMProvider = useConfigStore((s) => s.activateLLMProvider);
   const verifiedCloudProviders = useConfigStore((s) => s.verifiedCloudProviders);
@@ -193,11 +194,12 @@ export function LLMSettings() {
 
   // Load API key when provider changes
   useEffect(() => {
+    let cancelled = false;
     const info = PROVIDER_DISPLAY[selectedProvider];
     if (info?.requiresKey) {
       getApiKey(selectedProvider)
-        .then((key) => setApiKeyValue(key || ""))
-        .catch(() => setApiKeyValue(""));
+        .then((key) => { if (!cancelled) setApiKeyValue(key || ""); })
+        .catch(() => { if (!cancelled) setApiKeyValue(""); });
     } else {
       setApiKeyValue("");
     }
@@ -206,17 +208,20 @@ export function LLMSettings() {
     setModels([]);
     setOpenRouterModels([]);
     setModelsError("");
+    return () => { cancelled = true; };
   }, [selectedProvider]);
 
   // Custom provider: load persisted base URL / auth type + stored token when the
   // provider is selected, so the user's endpoint is restored after a restart.
   useEffect(() => {
     if (selectedProvider !== "custom") return;
+    let cancelled = false;
     setCustomBaseUrl(useConfigStore.getState().customLlmBaseUrl);
     setCustomAuthType(useConfigStore.getState().customLlmAuthType);
     getApiKey("custom")
-      .then((v) => setCustomAuthValue(v || ""))
-      .catch(() => setCustomAuthValue(""));
+      .then((v) => { if (!cancelled) setCustomAuthValue(v || ""); })
+      .catch(() => { if (!cancelled) setCustomAuthValue(""); });
+    return () => { cancelled = true; };
   }, [selectedProvider]);
 
   // Persist base URL / auth type as the user edits them (token is saved on blur).
@@ -242,35 +247,116 @@ export function LLMSettings() {
   }, [selectedProvider, apiKey, customBaseUrl, customAuthType, customAuthValue]);
 
   const responseTestModel = selectedProvider === "claude_cli" ? claudeCliConfig.fast_model
-    : selectedModel || useConfigStore.getState().lastModelByProvider[selectedProvider] || (selectedProvider === "github_copilot" ? "auto" : "");
+    : selectedProvider === "github_copilot"
+      ? (selectedProvider === llmProvider ? llmModel : lastModelByProvider.github_copilot) || "auto"
+      : selectedModel || lastModelByProvider[selectedProvider] || "";
+  const responseConfig = buildProviderConfig();
+  const responseClaudeConfig = selectedProvider === "claude_cli" ? JSON.stringify(claudeCliConfig) : null;
+  const responseCustomSaved = selectedProvider === "custom" ? JSON.stringify([storedCustomBaseUrl, storedCustomAuthType]) : null;
+  const responseEditor = useRef({ provider: selectedProvider, model: responseTestModel, config: responseConfig });
+  responseEditor.current = { provider: selectedProvider, model: responseTestModel, config: responseConfig };
   useEffect(() => {
     responseAttempt.current++;
     setResponseStatus("idle");
     setResponseMessage("");
-    useLiveQAHealthStore.getState().forgetAIReady(selectedProvider);
-  }, [selectedProvider, responseTestModel, apiKey, customBaseUrl, customAuthType, customAuthValue]);
+    return () => { responseAttempt.current++; };
+  }, [selectedProvider, responseTestModel, responseConfig, llmProvider, llmModel, responseCustomSaved, responseClaudeConfig]);
 
   const handleTestResponse = async () => {
     const attempt = ++responseAttempt.current;
     const provider = selectedProvider;
+    const model = responseTestModel;
+    const configJson = responseConfig;
+    const before = useConfigStore.getState();
+    const streamBefore = useStreamStore.getState();
+    // Activation alone is not generation proof. Compare saved settings, then
+    // await their application before asking the backend to test the live router.
+    const selectionSnapshot = () => {
+      const state = useConfigStore.getState();
+      return JSON.stringify([
+        state.llmProvider, state.llmModel,
+        provider === "custom" ? [state.customLlmBaseUrl, state.customLlmAuthType] : null,
+        provider === "claude_cli" ? state.claudeCliConfig : null,
+      ]);
+    };
+    const savedSelection = selectionSnapshot();
+    const isCurrent = () => responseAttempt.current === attempt
+      && responseEditor.current.provider === provider && responseEditor.current.model === model
+      && responseEditor.current.config === configJson && selectionSnapshot() === savedSelection;
+    const needsSavedKey = PROVIDER_DISPLAY[provider].requiresKey || (provider === "custom" && customAuthType !== "none");
+    const editorKey = provider === "custom" ? customAuthValue.trim() : apiKey;
+    let activeTest = provider === before.llmProvider && model === before.llmModel
+      && (provider !== "custom" || (customBaseUrl === before.customLlmBaseUrl && customAuthType === before.customLlmAuthType));
+    let testedActive = false;
+    const canUpdateHealth = () => {
+      const stream = useStreamStore.getState();
+      return !stream.isStreaming && stream.phase === "idle"
+        && !(stream !== streamBefore && stream.error && stream.handlingStatus !== "retrieving_context");
+    };
     setResponseStatus("testing");
     setResponseMessage("");
     try {
-      // The backend command sends ONLY its built-in public synthetic prompt.
-      // Testing doesn't activate a provider or include meeting context.
-      const success = await testLLMResponse(buildProviderConfig(), responseTestModel);
-      if (success) await clearProviderCreditFailure(provider);
-      if (responseAttempt.current !== attempt) return;
-      if (success) {
-        useLiveQAHealthStore.getState().markAIReady(provider, responseTestModel);
+      if (activeTest && needsSavedKey) {
+        const savedKey = await getApiKey(provider);
+        if (!isCurrent()) return;
+        activeTest = editorKey === (savedKey || "");
+      }
+      if (activeTest) {
+        try {
+          if (provider === "claude_cli") {
+            await setClaudeCliConfig(before.claudeCliConfig);
+            if (!isCurrent()) return;
+          }
+          await activateLLMProvider(provider, { model, providerConfig: configJson });
+        } catch {
+          if (!isCurrent()) return;
+          setResponseStatus("error");
+          setResponseMessage("Could not apply saved settings. Active AI configuration not verified.");
+          return;
+        }
+        if (!isCurrent()) return;
+      }
+      // JSON is an isolated configuration diagnostic; a bare id tests the
+      // actual active router. Both send ONLY the built-in public test prompt.
+      const credentialsUnchanged = async () => !needsSavedKey || editorKey === ((await getApiKey(provider)) || "");
+      if (activeTest && !(await credentialsUnchanged())) {
+        if (!isCurrent()) return;
+        setResponseStatus("error");
+        setResponseMessage("Saved credentials changed. Test again.");
+        return;
+      }
+      if (!isCurrent()) return;
+      testedActive = activeTest;
+      const success = await testLLMResponse(activeTest ? provider : configJson, model);
+      if (!isCurrent()) return;
+      if (activeTest && !(await credentialsUnchanged())) {
+        if (!isCurrent()) return;
+        setResponseStatus("error");
+        setResponseMessage("Saved credentials changed. Test again.");
+        return;
+      }
+      if (!isCurrent()) return;
+      const recoverActive = activeTest && canUpdateHealth();
+      if (recoverActive && success) {
+        useLiveQAHealthStore.getState().markAIReady(provider, model);
         const stream = useStreamStore.getState();
-        if (provider === useConfigStore.getState().llmProvider && !stream.isStreaming && stream.phase === "idle") stream.setError(null);
+        const failedProvider = stream.currentProvider || stream.requestProvider;
+        if (stream.error && stream.handlingStatus !== "retrieving_context"
+          && failedProvider?.toLowerCase().replace(/[^a-z0-9]/g, "") === provider.replace(/[^a-z0-9]/g, "")) stream.setError(null);
+      } else if (recoverActive) {
+        useLiveQAHealthStore.getState().markAIFailed(provider, model, "AI returned no answer.", useStreamStore.getState().currentId);
       }
       setResponseStatus(success ? "success" : "error");
-      setResponseMessage(success ? "AI response verified" : "AI returned no answer. Check the provider and model.");
+      setResponseMessage(success
+        ? recoverActive ? "Active AI response verified"
+          : activeTest ? "Test response received. Current AI state not changed."
+            : "Test response received. Active AI configuration not verified."
+        : "AI returned no answer. Check the provider and model.");
     } catch (error) {
-      if (responseAttempt.current !== attempt) return;
-      useLiveQAHealthStore.getState().forgetAIReady(provider);
+      if (!isCurrent()) return;
+      if (testedActive && canUpdateHealth()) {
+        useLiveQAHealthStore.getState().markAIFailed(provider, model, safeServiceError(error, "AI").message, useStreamStore.getState().currentId);
+      }
       setResponseStatus("error");
       setResponseMessage(safeServiceError(error, "AI").message);
     }
@@ -514,7 +600,6 @@ export function LLMSettings() {
           </p>
         </div>
       )}
-
       {/* Custom Provider Config */}
       {isCustom && (
         <div className="space-y-4 rounded-xl border border-border/30 bg-card/50 p-5">
@@ -644,21 +729,26 @@ export function LLMSettings() {
             </div>
           )}
 
-          <div className="space-y-2 rounded-xl border border-border/30 bg-card/50 p-4">
-            <button type="button" onClick={() => void handleTestResponse()}
-              disabled={responseStatus === "testing" || !responseTestModel || (requiresApiKey && !apiKey) || (isCustom && !customBaseUrl)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
-              {responseStatus === "testing" && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />}
-              Test AI response
-            </button>
-            <p className="text-xs text-muted-foreground">
-              Sends a short public test to {info.label}{responseTestModel ? ` / ${responseTestModel}` : " after you select a model"}. No meeting content. Provider usage may apply.
-            </p>
-            {responseMessage && <p role={responseStatus === "error" ? "alert" : "status"} aria-label="AI response test"
-              className={`text-xs ${responseStatus === "error" ? "text-destructive" : "text-success"}`}>{responseMessage}</p>}
-          </div>
         </div>
       )}
+
+      {/* Public response test is available for API, local and CLI providers. */}
+      <div className="space-y-2 rounded-xl border border-border/30 bg-card/50 p-4">
+        <button type="button" onClick={() => void handleTestResponse()}
+          disabled={responseStatus === "testing" || !responseTestModel || (requiresApiKey && !apiKey) || (isCustom && !customBaseUrl)}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+          {responseStatus === "testing" && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />}
+          Test AI response
+        </button>
+        <p className="text-xs text-muted-foreground">
+          Sends a short public test to {info.label}{responseTestModel ? ` / ${responseTestModel}` : " after you select a model"}. No meeting content. Provider usage may apply.
+        </p>
+        <p className="text-xs text-muted-foreground">
+          Saved active settings are reapplied before verification. Drafts and other providers are diagnostic only.
+        </p>
+        {responseMessage && <p role={responseStatus === "error" ? "alert" : "status"} aria-label="AI response test"
+          className={`text-xs ${responseStatus === "error" ? "text-destructive" : "text-success"}`}>{responseMessage}</p>}
+      </div>
 
       {/* Make Active button — only when different from active AND provider is ready (Copilot has its own in its card) */}
       {selectedProvider !== llmProvider && !isCopilot && (

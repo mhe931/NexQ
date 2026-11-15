@@ -4,9 +4,9 @@
 // provider until Claude was picked again in the footer.
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeCliStatus } from "../lib/types";
+import type { ClaudeCliStatus, CopilotStatus } from "../lib/types";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => null }));
@@ -26,6 +26,8 @@ const ipc = vi.hoisted(() => ({
   testLLMConnection: vi.fn(),
   testLLMResponse: vi.fn(),
   clearProviderCreditFailure: vi.fn(),
+  copilotStatus: vi.fn(),
+  getApiKey: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => ({
@@ -40,7 +42,8 @@ vi.mock("../lib/ipc", async (importOriginal) => ({
   testLLMConnection: (...a: unknown[]) => ipc.testLLMConnection(...a),
   testLLMResponse: (...a: unknown[]) => ipc.testLLMResponse(...a),
   clearProviderCreditFailure: (...a: unknown[]) => ipc.clearProviderCreditFailure(...a),
-  getApiKey: async () => null,
+  copilotStatus: () => ipc.copilotStatus(),
+  getApiKey: (...a: unknown[]) => ipc.getApiKey(...a),
   hasApiKey: async () => false,
   listModels: async () => [],
   listLocalSTTEngines: async () => [],
@@ -51,7 +54,9 @@ import { LLMSettings } from "./LLMSettings";
 import { ServiceStatusBar } from "../components/ServiceStatusBar";
 import { resetAgentStoreForTests } from "../stores/agentStore";
 import { useStreamStore } from "../stores/streamStore";
+import { useLiveQAHealthStore } from "../stores/liveQAHealthStore";
 import { DEFAULT_CLAUDE_CLI_CONFIG, useConfigStore } from "../stores/configStore";
+import { useLiveQAHealth } from "../hooks/useLiveQAHealth";
 
 const LOGGED_IN: ClaudeCliStatus = {
   installed: true,
@@ -59,6 +64,11 @@ const LOGGED_IN: ClaudeCliStatus = {
   version: "2.1.288",
   auth: { logged_in: true, auth_method: "claude.ai", subscription_type: "max", email: "me@example.com", login: "subscription" },
   npm_only: false,
+};
+const COPILOT_CONNECTED: CopilotStatus = {
+  state: "ready", installed: true, binary_path: "C:\\test\\copilot.exe",
+  version: "1.0.105", npm_only: false, handshake_ok: true, session_ok: true,
+  models: [], current_model: "auto", error: null, login_hint: "",
 };
 
 /** The footer's LLM chip: Claude's status chip, or the generic provider chip. */
@@ -73,6 +83,8 @@ function claudeCard(): HTMLElement {
 describe("Settings ↔ footer sync of the active LLM", () => {
   beforeEach(() => {
     resetAgentStoreForTests();
+    useStreamStore.getState().resetForMeeting();
+    useLiveQAHealthStore.getState().reset();
     useConfigStore.setState({
       llmProvider: "ollama",
       llmModel: "llama3.2",
@@ -80,6 +92,8 @@ describe("Settings ↔ footer sync of the active LLM", () => {
       claudeCliConfig: DEFAULT_CLAUDE_CLI_CONFIG,
       claudeCliFallbackPinned: false,
       verifiedCloudProviders: [],
+      customLlmBaseUrl: "",
+      customLlmAuthType: "none",
     });
     ipc.claudeCliStatus.mockReset().mockResolvedValue(LOGGED_IN);
     ipc.claudeCliModels.mockReset().mockResolvedValue([]);
@@ -91,6 +105,8 @@ describe("Settings ↔ footer sync of the active LLM", () => {
     ipc.testLLMConnection.mockReset().mockResolvedValue(true);
     ipc.testLLMResponse.mockReset().mockResolvedValue(true);
     ipc.clearProviderCreditFailure.mockReset().mockResolvedValue(undefined);
+    ipc.copilotStatus.mockReset().mockResolvedValue(COPILOT_CONNECTED);
+    ipc.getApiKey.mockReset().mockResolvedValue(null);
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
 
@@ -133,13 +149,52 @@ describe("Settings ↔ footer sync of the active LLM", () => {
     expect(screen.queryByText("AI response verified")).toBeNull();
   });
 
-  it("tests a synthetic chat with the selected provider/model and clears credits only on success", async () => {
+  it("tests the selected config/model without treating a diagnostic response as active-router recovery", async () => {
+    useConfigStore.setState({
+      llmProvider: "openai", llmModel: "gpt-4o", lastModelByProvider: { ollama: "llama3.2" },
+    });
+    useStreamStore.getState().setPending("AskQuestion", "failed", "openai", "Why?", "gpt-4o");
+    useStreamStore.getState().setError("credits exhausted", { code: "credits_exhausted" });
+    const activeError = useStreamStore.getState().error;
     render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: /^Ollama\b/ }));
     fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
     await waitFor(() => expect(ipc.testLLMResponse).toHaveBeenCalledWith('{"provider_type":"ollama"}', "llama3.2"));
-    await waitFor(() => expect(ipc.clearProviderCreditFailure).toHaveBeenCalledWith("ollama"));
-    expect(screen.getByRole("status", { name: "AI response test" })).toHaveTextContent("AI response verified");
+    expect(await screen.findByRole("status", { name: "AI response test" }))
+      .toHaveTextContent("Test response received. Active AI configuration not verified.");
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useLiveQAHealthStore.getState().aiReadyModels).toEqual({});
     expect(ipc.setLLMProvider).not.toHaveBeenCalled();
+    expect(screen.getByText(/No meeting content\. Provider usage may apply/)).toBeInTheDocument();
+  });
+
+  it("reconfigures the active saved selection before testing the actual router by bare provider id", async () => {
+    useStreamStore.getState().setPending("AskQuestion", "failed", "ollama", "Why?", "llama3.2");
+    useStreamStore.getState().setError("credits exhausted", { code: "credits_exhausted" });
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    expect(await screen.findByRole("status", { name: "AI response test" })).toHaveTextContent("Active AI response verified");
+    expect(ipc.testLLMResponse).toHaveBeenCalledWith("ollama", "llama3.2");
+    expect(ipc.setLLMProvider).toHaveBeenCalledWith('{"provider_type":"ollama"}');
+    expect(ipc.setActiveModel).toHaveBeenCalledWith("ollama", "llama3.2");
+    expect(ipc.setActiveModel.mock.invocationCallOrder[0]).toBeLessThan(ipc.testLLMResponse.mock.invocationCallOrder[0]);
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(useStreamStore.getState().error).toBeNull();
+    expect(useLiveQAHealthStore.getState().aiReadyModels.ollama).toBe("llama3.2");
+  });
+
+  it("does not test or clear an active failure when reconfiguration fails", async () => {
+    ipc.setActiveModel.mockRejectedValueOnce(new Error("Model was not applied"));
+    useStreamStore.getState().setError("credits exhausted", { code: "credits_exhausted" });
+    const activeError = useStreamStore.getState().error;
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    expect(await screen.findByRole("alert", { name: "AI response test" })).toHaveTextContent("Could not apply saved settings");
+    expect(ipc.testLLMResponse).not.toHaveBeenCalled();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useLiveQAHealthStore.getState().aiReadyModels.ollama).toBeUndefined();
   });
 
   it("does not clear a credit failure or show success after an empty/failed chat test", async () => {
@@ -149,6 +204,230 @@ describe("Settings ↔ footer sync of the active LLM", () => {
     await waitFor(() => expect(screen.getByRole("alert", { name: "AI response test" })).toHaveTextContent("AI returned no answer"));
     expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
     expect(screen.queryByText("AI response verified")).toBeNull();
+  });
+
+  it("does not replace a document-retrieval failure with diagnostic AI success", async () => {
+    const message = "Meeting documents are unavailable. Restart NexQ before asking again.";
+    useStreamStore.getState().setPending("AskQuestion", "docs", "ollama");
+    useStreamStore.getState().setHandlingStatus("retrieving_context");
+    useStreamStore.getState().setError(message);
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await screen.findByRole("status", { name: "AI response test" });
+    expect(useStreamStore.getState()).toMatchObject({ error: message, handlingStatus: "retrieving_context", answerOutcome: "unable" });
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+  });
+
+  it("does not mark unsaved credentials ready or clear the active provider's failure", async () => {
+    useConfigStore.setState({ llmProvider: "openai", llmModel: "gpt-4o", lastModelByProvider: { openai: "gpt-4o" } });
+    useStreamStore.getState().setError("401 invalid API key");
+    const activeError = useStreamStore.getState().error;
+    render(<LLMSettings />);
+    fireEvent.change(await screen.findByPlaceholderText("Enter OpenAI API key"), { target: { value: "test-unsaved-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await screen.findByRole("status", { name: "AI response test" });
+    expect(ipc.testLLMResponse).toHaveBeenCalledWith('{"provider_type":"openai","api_key":"test-unsaved-key"}', "gpt-4o");
+    expect(ipc.storeApiKey).not.toHaveBeenCalled();
+    expect(ipc.setLLMProvider).not.toHaveBeenCalled();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useLiveQAHealthStore.getState().aiReadyModels.openai).toBeUndefined();
+  });
+
+  it("reapplies saved API credentials before an active-router response test", async () => {
+    useConfigStore.setState({ llmProvider: "openai", llmModel: "gpt-4o", lastModelByProvider: { openai: "gpt-4o" } });
+    ipc.getApiKey.mockResolvedValue("test-saved-key");
+    render(<LLMSettings />);
+    await waitFor(() => expect(screen.getByPlaceholderText("Enter OpenAI API key")).toHaveValue("test-saved-key"));
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    expect(await screen.findByRole("status", { name: "AI response test" })).toHaveTextContent("Active AI response verified");
+    expect(ipc.setLLMProvider).toHaveBeenCalledWith('{"provider_type":"openai","api_key":"test-saved-key"}');
+    expect(ipc.testLLMResponse).toHaveBeenCalledWith("openai", "gpt-4o");
+    expect(ipc.setActiveModel.mock.invocationCallOrder[0]).toBeLessThan(ipc.testLLMResponse.mock.invocationCallOrder[0]);
+    expect(ipc.storeApiKey).not.toHaveBeenCalled();
+    expect(useLiveQAHealthStore.getState().aiReadyModels.openai).toBe("gpt-4o");
+  });
+
+  it("does not recover active health when saved credentials change during a response test", async () => {
+    let complete: (success: boolean) => void = () => {};
+    ipc.testLLMResponse.mockReturnValueOnce(new Promise<boolean>((resolve) => { complete = resolve; }));
+    ipc.getApiKey.mockResolvedValue("test-saved-key");
+    useConfigStore.setState({ llmProvider: "openai", llmModel: "gpt-4o", lastModelByProvider: { openai: "gpt-4o" } });
+    useStreamStore.getState().setPending("AskQuestion", "failed", "openai", "Why?", "gpt-4o");
+    useStreamStore.getState().setError("401 invalid API key");
+    const activeError = useStreamStore.getState().error;
+    render(<LLMSettings />);
+    await waitFor(() => expect(screen.getByPlaceholderText("Enter OpenAI API key")).toHaveValue("test-saved-key"));
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await waitFor(() => expect(ipc.testLLMResponse).toHaveBeenCalledWith("openai", "gpt-4o"));
+    ipc.getApiKey.mockResolvedValue("test-new-saved-key");
+    await act(async () => { complete(true); });
+    expect(await screen.findByRole("alert", { name: "AI response test" })).toHaveTextContent("Saved credentials changed");
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useLiveQAHealthStore.getState().aiReadyModels.openai).toBeUndefined();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+  });
+
+  it("does not test or recover a model changed while active reconfiguration awaits", async () => {
+    let applied: () => void = () => {};
+    ipc.setActiveModel.mockReturnValueOnce(new Promise<void>((resolve) => { applied = resolve; }));
+    useStreamStore.getState().setError("credits exhausted", { code: "credits_exhausted" });
+    const activeError = useStreamStore.getState().error;
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await waitFor(() => expect(ipc.setActiveModel).toHaveBeenCalled());
+    act(() => useConfigStore.getState().setLLMModel("different-model", "ollama"));
+    await act(async () => { applied(); });
+    expect(ipc.testLLMResponse).not.toHaveBeenCalled();
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useLiveQAHealthStore.getState().aiReadyModels).toEqual({});
+  });
+
+  it("does not clear a serving fallback provider's error when the requested primary passes", async () => {
+    useStreamStore.getState().setPending("AskQuestion", "fallback", "ollama", "Why?", "llama3.2");
+    useStreamStore.getState().applyProfileFallback({
+      request_id: "fallback", from_provider: "ollama", from_model: "llama3.2",
+      to_provider: "openai", to_model: "gpt-4o", reason: "unavailable",
+    });
+    useStreamStore.getState().setError("401 invalid API key");
+    const activeError = useStreamStore.getState().error;
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await screen.findByRole("status", { name: "AI response test" });
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useStreamStore.getState().currentProvider).toBe("openai");
+    expect(useLiveQAHealthStore.getState().aiReadyModels.ollama).toBe("llama3.2");
+  });
+
+  it("invalidates generation proof only when the actual active response test fails", async () => {
+    useLiveQAHealthStore.getState().markAIReady("ollama", "llama3.2");
+    ipc.testLLMResponse.mockRejectedValueOnce(new Error("401 invalid API key"));
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await screen.findByRole("alert", { name: "AI response test" });
+    expect(ipc.testLLMResponse).toHaveBeenCalledWith("ollama", "llama3.2");
+    expect(useLiveQAHealthStore.getState().aiReadyModels.ollama).toBeUndefined();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "Failed", error: null },
+    { label: "Credits exhausted", error: "429 credit_balance_exhausted" },
+  ])("shows $label after a failed active test instead of reusing an older answer's Ready state", async ({ label, error }) => {
+    const stream = useStreamStore.getState();
+    stream.setPending("AskQuestion", "older-answer", "ollama", "Earlier question", "llama3.2");
+    stream.startStream("AskQuestion", "llama3.2", "ollama", { requestId: "older-answer" });
+    stream.appendToken("An earlier valid answer.");
+    stream.endStream(20);
+    const { result } = renderHook(() => useLiveQAHealth());
+    expect(result.current.ai.label).toBe("Ready");
+    if (error) ipc.testLLMResponse.mockRejectedValueOnce(new Error(error));
+    else ipc.testLLMResponse.mockResolvedValueOnce(false);
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await screen.findByRole("alert", { name: "AI response test" });
+    expect(result.current.ai.label).toBe(label);
+    expect(result.current.question.label).toBe("Answer ready");
+    expect(useStreamStore.getState().responseHistory[0].content).toBe("An earlier valid answer.");
+
+    act(() => {
+      stream.setPending("AskQuestion", "recovered-answer", "ollama", "New question", "llama3.2");
+      stream.startStream("AskQuestion", "llama3.2", "ollama", { requestId: "recovered-answer" });
+      stream.appendToken("A new real response.");
+      stream.endStream(20);
+    });
+    await waitFor(() => expect(result.current.ai.label).toBe("Ready"));
+  });
+
+  it("discards stale diagnostic completion before any active-health recovery", async () => {
+    let complete: (success: boolean) => void = () => {};
+    ipc.testLLMResponse.mockReturnValueOnce(new Promise<boolean>((resolve) => { complete = resolve; }));
+    useStreamStore.getState().setError("credits exhausted", { code: "credits_exhausted" });
+    const activeError = useStreamStore.getState().error;
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await waitFor(() => expect(ipc.testLLMResponse).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: /^Groq\b/ }));
+    await act(async () => { complete(true); });
+    expect(screen.queryByLabelText("AI response test")).toBeNull();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useLiveQAHealthStore.getState().aiReadyModels).toEqual({});
+  });
+
+  it("does not invalidate operational proof when viewing settings or an isolated diagnostic fails", async () => {
+    useConfigStore.setState({ llmProvider: "openai", llmModel: "gpt-4o", lastModelByProvider: { openai: "gpt-4o" } });
+    useLiveQAHealthStore.getState().markAIReady("openai", "gpt-4o");
+    ipc.testLLMResponse.mockRejectedValueOnce(new Error("401 diagnostic credentials"));
+    render(<LLMSettings />);
+    expect(useLiveQAHealthStore.getState().aiReadyModels.openai).toBe("gpt-4o");
+    fireEvent.change(await screen.findByPlaceholderText("Enter OpenAI API key"), { target: { value: "test-unsaved-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await screen.findByRole("alert", { name: "AI response test" });
+    expect(useLiveQAHealthStore.getState().aiReadyModels.openai).toBe("gpt-4o");
+    expect(ipc.setLLMProvider).not.toHaveBeenCalled();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+  });
+
+  it("offers Claude's public response test using its Fast model, without activation", async () => {
+    render(<LLMSettings />);
+    fireEvent.click(claudeCard());
+    await screen.findByText("me@example.com · Max");
+    const button = screen.getByRole("button", { name: "Test AI response" });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    await screen.findByRole("status", { name: "AI response test" });
+    expect(ipc.testLLMResponse).toHaveBeenCalledWith('{"provider_type":"claude_cli"}', DEFAULT_CLAUDE_CLI_CONFIG.fast_model);
+    expect(ipc.setLLMProvider).not.toHaveBeenCalled();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(useLiveQAHealthStore.getState().aiReadyModels.claude_cli).toBeUndefined();
+  });
+
+  it.each([
+    { active: false, model: "auto" },
+    { active: true, model: "claude-sonnet-5.5" },
+  ])("offers Copilot's public response test for the saved/active model (active: $active)", async ({ active, model }) => {
+    if (active) useConfigStore.setState({
+      llmProvider: "github_copilot", llmModel: model, lastModelByProvider: { github_copilot: model },
+    });
+    render(<LLMSettings />);
+    if (!active) fireEvent.click(await screen.findByRole("button", { name: /^GitHub Copilot,/ }));
+    const button = screen.getByRole("button", { name: "Test AI response" });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    await screen.findByRole("status", { name: "AI response test" });
+    expect(ipc.testLLMResponse).toHaveBeenCalledWith(active ? "github_copilot" : '{"provider_type":"github_copilot"}', model);
+    if (!active) expect(ipc.setLLMProvider).not.toHaveBeenCalled();
+    expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+    expect(useLiveQAHealthStore.getState().aiReadyModels.github_copilot).toBe(active ? model : undefined);
+  });
+
+  it("tests active Claude only after applying its saved CLI configuration", async () => {
+    useConfigStore.setState({ llmProvider: "claude_cli", llmModel: DEFAULT_CLAUDE_CLI_CONFIG.fast_model });
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await screen.findByRole("status", { name: "AI response test" });
+    expect(ipc.setClaudeCliConfig).toHaveBeenCalledWith(DEFAULT_CLAUDE_CLI_CONFIG);
+    expect(ipc.setClaudeCliConfig.mock.invocationCallOrder[0]).toBeLessThan(ipc.setLLMProvider.mock.invocationCallOrder[0]);
+    expect(ipc.testLLMResponse).toHaveBeenCalledWith("claude_cli", DEFAULT_CLAUDE_CLI_CONFIG.fast_model);
+    expect(useLiveQAHealthStore.getState().aiReadyModels.claude_cli).toBe(DEFAULT_CLAUDE_CLI_CONFIG.fast_model);
+    expect(useConfigStore.getState().claudeCliConfig).toEqual(DEFAULT_CLAUDE_CLI_CONFIG);
+  });
+
+  it("does not clear or verify a newer provider failure that arrives during an active test", async () => {
+    let complete: (success: boolean) => void = () => {};
+    ipc.testLLMResponse.mockReturnValueOnce(new Promise<boolean>((resolve) => { complete = resolve; }));
+    render(<LLMSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+    await waitFor(() => expect(ipc.testLLMResponse).toHaveBeenCalled());
+    act(() => {
+      useStreamStore.getState().setPending("AskQuestion", "new-failure", "ollama", "Why?", "llama3.2");
+      useStreamStore.getState().setError("credits exhausted", { code: "credits_exhausted" });
+    });
+    const activeError = useStreamStore.getState().error;
+    await act(async () => { complete(true); });
+    expect(useStreamStore.getState().error).toBe(activeError);
+    expect(useLiveQAHealthStore.getState().aiReadyModels.ollama).toBeUndefined();
   });
 
   describe("Custom endpoint", () => {
@@ -196,6 +475,25 @@ describe("Settings ↔ footer sync of the active LLM", () => {
       fireEvent.blur(token);
       await waitFor(() => expect(ipc.storeApiKey).toHaveBeenCalledWith("custom", "the-key"));
       expect(ipc.setLLMProvider).not.toHaveBeenCalled();
+    });
+
+    it("does not treat successful draft credentials as router recovery after custom activation failed", async () => {
+      useStreamStore.getState().setError("401 invalid API key");
+      const activeError = useStreamStore.getState().error;
+      ipc.setLLMProvider.mockRejectedValueOnce(new Error("Custom config was not applied"));
+      render(<LLMSettings />);
+      const token = await screen.findByPlaceholderText("Bearer token...");
+      fireEvent.change(token, { target: { value: "test-new-token" } });
+      fireEvent.blur(token);
+      await waitFor(() => expect(ipc.setLLMProvider).toHaveBeenCalled());
+      fireEvent.click(screen.getByRole("button", { name: "Test AI response" }));
+      await screen.findByRole("status", { name: "AI response test" });
+      expect(ipc.testLLMResponse).toHaveBeenCalledWith(
+        JSON.stringify({ ...OLLAMA_CLOUD, auth_type: "bearer", auth_value: "test-new-token" }), "gemma4:31b-cloud",
+      );
+      expect(ipc.clearProviderCreditFailure).not.toHaveBeenCalled();
+      expect(useStreamStore.getState().error).toBe(activeError);
+      expect(useLiveQAHealthStore.getState().aiReadyModels.custom).toBeUndefined();
     });
   });
 

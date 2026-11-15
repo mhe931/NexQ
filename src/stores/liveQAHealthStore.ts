@@ -1,12 +1,20 @@
 import { create } from "zustand";
-import type { AudioObservation, STTObservation } from "../lib/serviceHealth";
+import { safeServiceError, type AudioObservation, type STTObservation } from "../lib/serviceHealth";
 
 type Party = "you" | "them";
+interface AIFailureObservation {
+  model: string;
+  error: string;
+  answerId: string | null;
+}
 interface LiveQAHealthState {
   audio: Record<Party, AudioObservation | null>;
   stt: Record<Party, STTObservation | null>;
   aiReadyModels: Record<string, string>;
+  aiFailures: Record<string, AIFailureObservation>;
   markAIReady: (provider: string, model: string) => void;
+  markAIFailed: (provider: string, model: string, error: string, answerId: string | null) => void;
+  clearAIFailure: (provider: string, observation: AIFailureObservation) => void;
   forgetAIReady: (provider: string) => void;
   observeSTT: (party: Party, observation: STTObservation) => void;
   observeAudioStatus: (party: Party, observation: AudioObservation) => void;
@@ -18,7 +26,25 @@ export const useLiveQAHealthStore = create<LiveQAHealthState>((set) => ({
   audio: { you: null, them: null },
   stt: { you: null, them: null },
   aiReadyModels: {},
-  markAIReady: (provider, model) => set((s) => ({ aiReadyModels: { ...s.aiReadyModels, [provider]: model } })),
+  aiFailures: {},
+  markAIReady: (provider, model) => set((s) => {
+    const aiFailures = { ...s.aiFailures };
+    delete aiFailures[provider];
+    return { aiReadyModels: { ...s.aiReadyModels, [provider]: model }, aiFailures };
+  }),
+  markAIFailed: (provider, model, error, answerId) => set((s) => {
+    const aiReadyModels = { ...s.aiReadyModels };
+    delete aiReadyModels[provider];
+    return { aiReadyModels, aiFailures: { ...s.aiFailures, [provider]: {
+      model, error: safeServiceError(error, "AI").message, answerId,
+    } } };
+  }),
+  clearAIFailure: (provider, observation) => set((s) => {
+    if (s.aiFailures[provider] !== observation) return s;
+    const aiFailures = { ...s.aiFailures };
+    delete aiFailures[provider];
+    return { aiFailures };
+  }),
   forgetAIReady: (provider) => set((s) => {
     const aiReadyModels = { ...s.aiReadyModels };
     delete aiReadyModels[provider];
@@ -39,5 +65,5 @@ export const useLiveQAHealthStore = create<LiveQAHealthState>((set) => ({
     you: s.audio.you?.status ? s.audio.you : { error },
     them: s.audio.them?.status ? s.audio.them : { error },
   } })),
-  reset: () => set({ audio: { you: null, them: null }, stt: { you: null, them: null }, aiReadyModels: {} }),
+  reset: () => set({ audio: { you: null, them: null }, stt: { you: null, them: null }, aiReadyModels: {}, aiFailures: {} }),
 }));
